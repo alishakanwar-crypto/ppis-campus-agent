@@ -1,0 +1,1280 @@
+"""
+PPIS Campus Agent — Local Windows application that connects to Hikvision DVRs
+on the school LAN and communicates with the cloud bot via WebSocket.
+
+Features:
+- Web-based local UI for DVR configuration, Excel upload, camera mapping
+- Hikvision ISAPI integration for snapshot capture
+- WebSocket client to cloud bot for receiving snapshot requests
+- On-demand child photo capture and delivery
+"""
+
+import asyncio
+import base64
+import io
+import json
+import logging
+import os
+import sys
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import httpx
+import websockets
+from fastapi import FastAPI, File, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("ppis-agent")
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CLOUD_API_BASE = "https://app-ukmjfzku.fly.dev"
+CONFIG_FILE = Path(__file__).parent / "config.json"
+SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
+SNAPSHOT_DIR.mkdir(exist_ok=True)
+
+
+async def fetch_config_from_cloud() -> dict | None:
+    """Fetch full config from the cloud-hosted SQLite database.
+    Returns None if cloud is unreachable."""
+    url = f"{CLOUD_API_BASE}/api/agent-config/full"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                logger.info(
+                    f"Fetched config from cloud: "
+                    f"{len(data.get('dvrs', []))} DVRs, "
+                    f"{len(data.get('camera_mapping', {}))} camera mappings"
+                )
+                return data
+            logger.warning(f"Cloud config API returned {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Could not fetch cloud config: {e}")
+    return None
+
+
+def load_config_local() -> dict:
+    """Load config from local config.json (fallback)."""
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    return {
+        "cloud_bot_url": "wss://app-ukmjfzku.fly.dev/ws/agent",
+        "agent_secret": os.environ.get("AGENT_SECRET", ""),
+        "dvrs": [],
+        "camera_mapping": {},
+        "snapshot_dir": "snapshots",
+        "local_port": 8899,
+    }
+
+
+def save_config(cfg: dict):
+    """Save config to local config.json (cache for offline use)."""
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+async def load_config() -> dict:
+    """Load config: try cloud first, fall back to local config.json."""
+    cloud_cfg = await fetch_config_from_cloud()
+    if cloud_cfg and cloud_cfg.get("dvrs"):
+        # Merge cloud data into a usable config dict
+        cfg = {
+            "cloud_bot_url": cloud_cfg.get("cloud_bot_url", "wss://app-ukmjfzku.fly.dev/ws/agent"),
+            "agent_secret": cloud_cfg.get("agent_secret", os.environ.get("AGENT_SECRET", "")),
+            "dvrs": cloud_cfg.get("dvrs", []),
+            "camera_mapping": cloud_cfg.get("camera_mapping", {}),
+            "local_port": int(cloud_cfg.get("settings", {}).get("local_port", 8899)),
+        }
+        # Cache locally for offline fallback
+        save_config(cfg)
+        logger.info("Config loaded from cloud DB (cached locally)")
+        return cfg
+    # Fallback to local
+    logger.info("Using local config.json (cloud unavailable or empty)")
+    return load_config_local()
+
+
+# Config will be loaded async in lifespan; use local as placeholder
+config = load_config_local()
+
+# ---------------------------------------------------------------------------
+# Hikvision ISAPI — Snapshot capture
+# ---------------------------------------------------------------------------
+
+def compress_jpeg(data: bytes, max_bytes: int = 200_000, quality_start: int = 70) -> bytes:
+    """Compress a JPEG image to fit within max_bytes.
+    
+    Uses Pillow if available, otherwise returns original data.
+    """
+    if Image is None or len(data) <= max_bytes:
+        return data
+    try:
+        img = Image.open(io.BytesIO(data))
+        # Resize if very large (>1920px on any side)
+        max_dim = 1920
+        if img.width > max_dim or img.height > max_dim:
+            ratio = min(max_dim / img.width, max_dim / img.height)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+        # Try decreasing quality until it fits
+        quality = quality_start
+        while quality >= 20:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            result = buf.getvalue()
+            if len(result) <= max_bytes:
+                logger.info(f"Compressed image: {len(data)} -> {len(result)} bytes (q={quality})")
+                return result
+            quality -= 10
+        # Return best effort
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=20, optimize=True)
+        return buf.getvalue()
+    except Exception as e:
+        logger.warning(f"Image compression failed: {e}, using original")
+        return data
+
+
+async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
+    """Capture a JPEG snapshot from a Hikvision NVR via ISAPI.
+
+    Hikvision DS-9664NI-ST supports:
+      GET /ISAPI/Streaming/channels/{channel}01/picture
+    where channel is 1-based (1..64 per NVR).
+
+    Returns JPEG bytes or None on failure.
+    """
+    ip = dvr["ip"]
+    port = dvr.get("port", 80)
+    user = dvr["username"]
+    pwd = dvr["password"]
+
+    # Hikvision uses channelNo * 100 + 1 for main stream snapshot
+    stream_channel = channel * 100 + 1
+    url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+
+    logger.info(f"Capturing snapshot from {ip} channel {channel} (stream {stream_channel})")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Try digest auth first (Hikvision default), then basic
+            resp = await client.get(url, auth=httpx.DigestAuth(user, pwd))
+            if resp.status_code == 401:
+                resp = await client.get(url, auth=httpx.BasicAuth(user, pwd))
+
+            if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+                logger.info(f"Snapshot captured: {len(resp.content)} bytes from {ip} ch{channel}")
+                return resp.content
+            else:
+                logger.error(
+                    f"Snapshot failed from {ip} ch{channel}: "
+                    f"HTTP {resp.status_code}, content-type={resp.headers.get('content-type', 'unknown')}"
+                )
+                # Try alternate URL format
+                alt_url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{channel}01/picture"
+                resp2 = await client.get(alt_url, auth=httpx.DigestAuth(user, pwd))
+                if resp2.status_code == 200 and resp2.headers.get("content-type", "").startswith("image"):
+                    logger.info(f"Snapshot captured (alt URL): {len(resp2.content)} bytes")
+                    return resp2.content
+
+                # Try yet another format: /Streaming/channels/101/picture
+                alt_url2 = f"http://{ip}:{port}/Streaming/channels/{channel}01/picture"
+                resp3 = await client.get(alt_url2, auth=httpx.DigestAuth(user, pwd))
+                if resp3.status_code == 200 and resp3.headers.get("content-type", "").startswith("image"):
+                    logger.info(f"Snapshot captured (alt2 URL): {len(resp3.content)} bytes")
+                    return resp3.content
+
+                return None
+    except Exception as e:
+        logger.error(f"Snapshot error from {ip} ch{channel}: {e}")
+        return None
+
+
+async def test_dvr_connection(dvr: dict) -> dict:
+    """Test connection to a DVR and return status info."""
+    ip = dvr["ip"]
+    port = dvr.get("port", 80)
+    user = dvr["username"]
+    pwd = dvr["password"]
+
+    url = f"http://{ip}:{port}/ISAPI/System/deviceInfo"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, auth=httpx.DigestAuth(user, pwd))
+            if resp.status_code == 200:
+                return {"status": "connected", "ip": ip, "response": resp.text[:500]}
+            elif resp.status_code == 401:
+                return {"status": "auth_failed", "ip": ip, "error": "Invalid username/password"}
+            else:
+                return {"status": "error", "ip": ip, "error": f"HTTP {resp.status_code}"}
+    except httpx.ConnectError:
+        return {"status": "unreachable", "ip": ip, "error": "Cannot connect — DVR may be offline or IP is wrong"}
+    except Exception as e:
+        return {"status": "error", "ip": ip, "error": str(e)}
+
+
+def find_camera_for_classroom(classroom: str) -> tuple[dict, int] | None:
+    """Look up the DVR and channel number for a given classroom (returns best/first camera)."""
+    result = find_all_cameras_for_classroom(classroom)
+    if result:
+        return result[0]  # Return first (best) camera
+    return None
+
+
+def find_all_cameras_for_classroom(classroom: str) -> list[tuple[dict, int, str]] | None:
+    """Look up ALL DVR cameras for a given classroom.
+
+    Returns a list of (dvr_dict, channel, description) tuples for all cameras
+    (C1 and C2) mapped to this classroom. Returns None if no cameras found.
+
+    camera_mapping structure:
+    {
+        "GRADE 3C": {
+            "dvr_index": 1, "channel": 17, "description": "G3C C1",
+            "all_cameras": [
+                {"dvr_index": 1, "channel": 17, "description": "G3C C1", "cam_type": "C1"},
+                {"dvr_index": 1, "channel": 13, "description": "G3C C2", "cam_type": "C2"}
+            ]
+        }
+    }
+    """
+    import re
+    mapping = config.get("camera_mapping", {})
+    classroom_upper = classroom.strip().upper()
+    dvrs = config.get("dvrs", [])
+
+    def _resolve_entry(val: dict) -> list[tuple[dict, int, str]]:
+        """Resolve a mapping entry to a list of (dvr, channel, description) tuples."""
+        results = []
+        all_cams = val.get("all_cameras", [])
+        if all_cams:
+            for cam in all_cams:
+                dvr_idx = cam.get("dvr_index", 0)
+                channel = cam.get("channel", 1)
+                desc = cam.get("description", "")
+                if 0 <= dvr_idx < len(dvrs):
+                    results.append((dvrs[dvr_idx], channel, desc))
+        else:
+            # Single camera entry (no all_cameras field)
+            dvr_idx = val.get("dvr_index", 0)
+            channel = val.get("channel", 1)
+            desc = val.get("description", "")
+            if 0 <= dvr_idx < len(dvrs):
+                results.append((dvrs[dvr_idx], channel, desc))
+        return results or None
+
+    def _find_val(target: str) -> dict | None:
+        """Find the mapping value using fuzzy matching."""
+        # 1. Direct match (case-insensitive)
+        for key, val in mapping.items():
+            if key.strip().upper() == target:
+                return val
+        # 2. Whitespace-normalized match
+        clean = re.sub(r'\s+', '', target)
+        for key, val in mapping.items():
+            key_clean = re.sub(r'\s+', '', key.strip().upper())
+            if key_clean == clean:
+                return val
+        # 3. Strip section letter: "GRADE 6A" → "GRADE 6"
+        m = re.match(r'^(GRADE\s*\d{1,2})\s*[A-D]$', target)
+        if m:
+            grade_no_section_clean = re.sub(r'\s+', '', m.group(1).strip())
+            for key, val in mapping.items():
+                key_clean = re.sub(r'\s+', '', key.strip().upper())
+                if key_clean == grade_no_section_clean:
+                    logger.info(f"Fuzzy camera match: {target} -> {key} (section stripped)")
+                    return val
+        # 4. Strip number from Nursery/Prep: "NURSERY 4" → "NURSERY"
+        m2 = re.match(r'^(NURSERY|NUR|PREP)\s*[-]?\s*\d+$', target)
+        if m2:
+            base_name = m2.group(1)
+            for key, val in mapping.items():
+                if key.strip().upper() == base_name:
+                    logger.info(f"Fuzzy camera match: {target} -> {key} (number stripped)")
+                    return val
+        return None
+
+    val = _find_val(classroom_upper)
+    if val:
+        resolved = _resolve_entry(val)
+        if resolved:
+            return resolved
+
+    logger.warning(f"No camera mapping found for: {classroom!r}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# WebSocket client — connects to cloud bot
+# ---------------------------------------------------------------------------
+
+ws_connection = None
+ws_task = None
+
+async def websocket_client():
+    """Persistent WebSocket connection to the cloud bot.
+    Receives snapshot requests and sends back images."""
+    global ws_connection
+    url = config.get("cloud_bot_url", "wss://app-ukmjfzku.fly.dev/ws/agent")
+    secret = config.get("agent_secret", os.environ.get("AGENT_SECRET", ""))
+
+    while True:
+        try:
+            logger.info(f"Connecting to cloud bot WebSocket: {url}")
+            async with websockets.connect(
+                url,
+                extra_headers={"X-Agent-Secret": secret},
+                ping_interval=30,
+                ping_timeout=10,
+                max_size=10 * 1024 * 1024,  # 10 MB max message size
+            ) as ws:
+                ws_connection = ws
+                logger.info("Connected to cloud bot WebSocket")
+
+                # Send hello
+                await ws.send(json.dumps({
+                    "type": "agent_hello",
+                    "dvr_count": len(config.get("dvrs", [])),
+                    "camera_count": len(config.get("camera_mapping", {})),
+                }))
+
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        msg_type = data.get("type", "")
+
+                        if msg_type == "snapshot_request":
+                            classroom = data.get("classroom", "")
+                            request_id = data.get("request_id", "")
+                            logger.info(f"Snapshot request for classroom: {classroom} (req: {request_id})")
+                            await handle_snapshot_request(ws, classroom, request_id)
+
+                        elif msg_type == "ping":
+                            await ws.send(json.dumps({"type": "pong"}))
+
+                        elif msg_type == "test_connection":
+                            dvr_idx = data.get("dvr_index", 0)
+                            dvrs = config.get("dvrs", [])
+                            if 0 <= dvr_idx < len(dvrs):
+                                result = await test_dvr_connection(dvrs[dvr_idx])
+                                await ws.send(json.dumps({"type": "test_result", **result}))
+
+                        elif msg_type == "update_camera_mapping":
+                            new_mapping = data.get("camera_mapping", {})
+                            if new_mapping:
+                                config["camera_mapping"] = new_mapping
+                                save_config(config)
+                                logger.info(f"Camera mapping updated remotely: {len(new_mapping)} entries")
+                                await ws.send(json.dumps({
+                                    "type": "mapping_updated",
+                                    "success": True,
+                                    "count": len(new_mapping),
+                                }))
+                            else:
+                                await ws.send(json.dumps({
+                                    "type": "mapping_updated",
+                                    "success": False,
+                                    "error": "Empty mapping data",
+                                }))
+
+                        elif msg_type == "update_dvrs":
+                            new_dvrs = data.get("dvrs", [])
+                            if new_dvrs:
+                                config["dvrs"] = new_dvrs
+                                save_config(config)
+                                logger.info(f"DVRs updated remotely: {len(new_dvrs)} entries")
+                                await ws.send(json.dumps({
+                                    "type": "dvrs_updated",
+                                    "success": True,
+                                    "count": len(new_dvrs),
+                                }))
+                            else:
+                                await ws.send(json.dumps({
+                                    "type": "dvrs_updated",
+                                    "success": False,
+                                    "error": "Empty DVR data",
+                                }))
+
+                        else:
+                            logger.warning(f"Unknown WS message type: {msg_type}")
+
+                    except json.JSONDecodeError:
+                        logger.error(f"Invalid JSON from cloud bot: {message[:200]}")
+
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(f"WebSocket closed: {e}. Reconnecting in 5s...")
+            ws_connection = None
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}. Reconnecting in 10s...")
+            ws_connection = None
+
+        await asyncio.sleep(5)
+
+
+async def handle_snapshot_request(ws, classroom: str, request_id: str):
+    """Handle a snapshot request from the cloud bot.
+
+    Captures from ALL cameras (C1 and C2) for the classroom.
+    Sends each image as a separate WebSocket message to avoid size limits.
+    Protocol:
+      1. snapshot_image  (one per captured image, sent individually)
+      2. snapshot_complete (final message with total count)
+    Falls back to legacy single-message format if only 1 image captured.
+    """
+    all_cameras = find_all_cameras_for_classroom(classroom)
+
+    if not all_cameras:
+        await ws.send(json.dumps({
+            "type": "snapshot_response",
+            "request_id": request_id,
+            "success": False,
+            "error": f"No camera mapped for classroom: {classroom}",
+        }))
+        return
+
+    logger.info(f"Capturing from {len(all_cameras)} camera(s) for {classroom}")
+
+    MIN_IMAGES = 3  # Always try to send at least 3 images
+
+    # Capture from ALL cameras
+    raw_images = []  # list of (bytes, filename, description)
+    for dvr, channel, desc in all_cameras:
+        snapshot = await capture_snapshot(dvr, channel)
+        if snapshot:
+            ts = int(time.time())
+            cam_label = desc.split()[-1] if desc else f"ch{channel}"
+            filename = f"{classroom.replace(' ', '_')}_{cam_label}_{ts}.jpg"
+            filepath = SNAPSHOT_DIR / filename
+            with open(filepath, "wb") as f:
+                f.write(snapshot)
+            raw_images.append((snapshot, filename, desc))
+            logger.info(f"Snapshot captured: {filename} ({len(snapshot)} bytes) - {desc}")
+        else:
+            logger.warning(f"Failed to capture from DVR {dvr['ip']} channel {channel} ({desc})")
+
+    # If we have fewer than MIN_IMAGES, take extra shots from available cameras
+    # (with a brief delay to get slightly different frames)
+    if 0 < len(raw_images) < MIN_IMAGES:
+        extra_needed = MIN_IMAGES - len(raw_images)
+        logger.info(f"Only {len(raw_images)} image(s) captured, taking {extra_needed} extra shot(s)")
+        cam_idx = 0
+        for _ in range(extra_needed):
+            dvr, channel, desc = all_cameras[cam_idx % len(all_cameras)]
+            await asyncio.sleep(1.5)  # Brief delay for a different frame
+            snapshot = await capture_snapshot(dvr, channel)
+            if snapshot:
+                ts = int(time.time())
+                shot_num = len(raw_images) + 1
+                cam_label = desc.split()[-1] if desc else f"ch{channel}"
+                filename = f"{classroom.replace(' ', '_')}_{cam_label}_extra{shot_num}_{ts}.jpg"
+                filepath = SNAPSHOT_DIR / filename
+                with open(filepath, "wb") as f:
+                    f.write(snapshot)
+                raw_images.append((snapshot, filename, f"{desc} (angle {shot_num})"))
+                logger.info(f"Extra snapshot captured: {filename} ({len(snapshot)} bytes)")
+            cam_idx += 1
+
+    if not raw_images:
+        await ws.send(json.dumps({
+            "type": "snapshot_response",
+            "request_id": request_id,
+            "success": False,
+            "error": f"Failed to capture snapshot from any camera for {classroom}",
+        }))
+        return
+
+    total = len(raw_images)
+    logger.info(f"Sending {total} snapshot(s) for {classroom} individually")
+
+    # Send each image as a separate message (avoids WebSocket size limits)
+    for idx, (raw_data, filename, desc) in enumerate(raw_images):
+        compressed = compress_jpeg(raw_data)
+        b64 = base64.b64encode(compressed).decode("ascii")
+        await ws.send(json.dumps({
+            "type": "snapshot_image",
+            "request_id": request_id,
+            "classroom": classroom,
+            "image_index": idx,
+            "image_total": total,
+            "filename": filename,
+            "image_base64": b64,
+            "size_bytes": len(compressed),
+            "description": desc,
+        }))
+        logger.info(f"Sent image {idx+1}/{total}: {filename} ({len(compressed)} bytes) - {desc}")
+
+    # Send completion message
+    await ws.send(json.dumps({
+        "type": "snapshot_complete",
+        "request_id": request_id,
+        "success": True,
+        "classroom": classroom,
+        "image_count": total,
+    }))
+    logger.info(f"Sent snapshot_complete for {classroom}: {total} image(s)")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI — Local web UI
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global ws_task, config
+    # Load config from cloud DB (falls back to local config.json)
+    config = await load_config()
+    logger.info(
+        f"Config loaded: {len(config.get('dvrs', []))} DVRs, "
+        f"{len(config.get('camera_mapping', {}))} camera mappings"
+    )
+    # Start WebSocket client in background
+    ws_task = asyncio.create_task(websocket_client())
+    logger.info("PPIS Campus Agent started")
+    yield
+    # Shutdown
+    if ws_task:
+        ws_task.cancel()
+    logger.info("PPIS Campus Agent stopped")
+
+
+app = FastAPI(title="PPIS Campus Agent", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
+app.mount("/snapshots", StaticFiles(directory=str(SNAPSHOT_DIR)), name="snapshots")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    """Main dashboard page."""
+    return get_dashboard_html()
+
+
+@app.get("/api/config")
+async def get_config():
+    """Return current config (without passwords)."""
+    safe_dvrs = []
+    for d in config.get("dvrs", []):
+        safe_dvrs.append({
+            "name": d.get("name", ""),
+            "ip": d.get("ip", ""),
+            "port": d.get("port", 80),
+            "username": d.get("username", ""),
+            "channels": d.get("channels", 64),
+        })
+    return {
+        "dvrs": safe_dvrs,
+        "camera_mapping": config.get("camera_mapping", {}),
+        "cloud_bot_url": config.get("cloud_bot_url", ""),
+        "config_source": "cloud" if config.get("_from_cloud") else "local",
+        "ws_connected": ws_connection is not None and ws_connection.open if ws_connection else False,
+    }
+
+
+@app.post("/api/dvr/save")
+async def save_dvr_config(request: Request):
+    """Save DVR configuration locally and sync to cloud."""
+    body = await request.json()
+    dvrs = body.get("dvrs", [])
+    config["dvrs"] = dvrs
+    save_config(config)
+    # Sync to cloud DB
+    cloud_synced = False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{CLOUD_API_BASE}/api/agent-config/dvrs",
+                json={"dvrs": dvrs},
+            )
+            cloud_synced = resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"Failed to sync DVRs to cloud: {e}")
+    return {"status": "ok", "dvr_count": len(dvrs), "cloud_synced": cloud_synced}
+
+
+@app.post("/api/dvr/test/{dvr_index}")
+async def test_dvr(dvr_index: int):
+    """Test connection to a specific DVR."""
+    cfg = load_config()
+    dvrs = cfg.get("dvrs", [])
+    if dvr_index < 0 or dvr_index >= len(dvrs):
+        return JSONResponse({"status": "error", "error": "Invalid DVR index"}, status_code=400)
+    result = await test_dvr_connection(dvrs[dvr_index])
+    return result
+
+
+@app.post("/api/snapshot/{classroom}")
+async def take_snapshot(classroom: str):
+    """Manually capture a snapshot for a classroom."""
+    result = find_camera_for_classroom(classroom)
+    if not result:
+        return JSONResponse(
+            {"status": "error", "error": f"No camera mapped for: {classroom}"},
+            status_code=404,
+        )
+
+    dvr, channel = result
+    snapshot = await capture_snapshot(dvr, channel)
+    if not snapshot:
+        return JSONResponse(
+            {"status": "error", "error": "Failed to capture snapshot"},
+            status_code=500,
+        )
+
+    ts = int(time.time())
+    filename = f"{classroom.replace(' ', '_')}_{ts}.jpg"
+    filepath = SNAPSHOT_DIR / filename
+    with open(filepath, "wb") as f:
+        f.write(snapshot)
+
+    return {"status": "ok", "filename": filename, "size_bytes": len(snapshot)}
+
+
+def _parse_camera_xls(file_path: str | Path) -> dict:
+    """Parse the PPIS camera Excel (.xls) with side-by-side NVR layout.
+
+    The Excel has this structure:
+      Cols A-D: NVR 1 data (S.NO, CAMERA NAME, CAMERA LOCATION, SOUND)
+      Col E: empty separator
+      Cols F-I: NVR 2 data (S.NO, CAMERA NAME, CAMERA LOCATION, SOUND)
+    NVR 3 starts further down in cols A-D after NVR 1 ends.
+
+    Returns a dict mapping camera_name -> {dvr_index, channel, location, sound}.
+    """
+    import re
+    import xlrd
+
+    wb = xlrd.open_workbook(str(file_path))
+    ws = wb.sheet_by_index(0)
+
+    mapping = {}
+    current_nvr = None  # Will be set when we encounter "NVR NUMBER" rows
+    nvr_sections = []  # list of (nvr_number, start_col, header_row)
+
+    # First pass: find NVR section headers
+    for r in range(ws.nrows):
+        for c in range(ws.ncols):
+            val = str(ws.cell_value(r, c)).strip().upper()
+            if "NVR NUMBER" in val or "DVR NUMBER" in val:
+                # Extract NVR number (e.g. "NVR NUMBER:- 1" -> 1)
+                nums = re.findall(r'\d+', val)
+                nvr_num = int(nums[0]) if nums else len(nvr_sections) + 1
+                nvr_sections.append({"nvr": nvr_num, "col": c, "header_row": r})
+
+    logger.info(f"Found {len(nvr_sections)} NVR sections: {nvr_sections}")
+
+    # Second pass: for each NVR section, find the data header row and parse cameras
+    for section in nvr_sections:
+        start_col = section["col"]
+        nvr_num = section["nvr"]
+        header_row = section["header_row"]
+
+        # Find the header row with "S.NO" / "CAMERA NAME" below the NVR header
+        sno_col = None
+        name_col = None
+        loc_col = None
+        sound_col = None
+
+        for r in range(header_row, min(header_row + 5, ws.nrows)):
+            for c in range(max(0, start_col - 1), min(ws.ncols, start_col + 5)):
+                val = str(ws.cell_value(r, c)).strip().upper()
+                if val in ("S.NO.", "S.NO", "SNO", "SR.NO"):
+                    sno_col = c
+                elif "CAMERA NAME" in val:
+                    name_col = c
+                elif "CAMERA LOCATION" in val or "LOCATION" in val:
+                    loc_col = c
+                elif "SOUND" in val:
+                    sound_col = c
+
+            if sno_col is not None and name_col is not None:
+                data_start_row = r + 1
+                break
+        else:
+            logger.warning(f"Could not find data headers for NVR {nvr_num}")
+            continue
+
+        # Parse camera rows
+        for r in range(data_start_row, ws.nrows):
+            sno_val = str(ws.cell_value(r, sno_col)).strip()
+            if not sno_val or sno_val == "":
+                # Check if we hit a new NVR section header
+                row_text = " ".join(str(ws.cell_value(r, c)).strip() for c in range(max(0, start_col - 1), min(ws.ncols, start_col + 5)))
+                if "NVR NUMBER" in row_text.upper() or "DVR NUMBER" in row_text.upper():
+                    break
+                continue
+
+            # Extract channel number from S.NO
+            try:
+                channel = int(float(sno_val))
+            except (ValueError, TypeError):
+                continue
+
+            cam_name = str(ws.cell_value(r, name_col)).strip() if name_col is not None else ""
+            if not cam_name:
+                continue
+
+            location = str(ws.cell_value(r, loc_col)).strip() if loc_col is not None else ""
+            sound = str(ws.cell_value(r, sound_col)).strip().upper() if sound_col is not None else ""
+
+            mapping[cam_name] = {
+                "dvr_index": nvr_num - 1,  # 0-based (NVR 1 -> index 0)
+                "channel": channel,
+                "location": location,
+                "sound": sound == "YES",
+                "description": f"{cam_name} ({location})",
+            }
+
+    return mapping
+
+
+def _build_classroom_mapping(raw_mapping: dict) -> dict:
+    """Convert raw camera mapping to classroom-focused mapping.
+
+    Extracts classroom names from camera names like 'GRADE 10  CAM 2' -> 'Grade 10'.
+    Groups multiple cameras per classroom and picks the best one (prefers CAM 1, with sound).
+    """
+    import re
+
+    classroom_cameras = {}  # classroom -> list of camera entries
+
+    for cam_name, info in raw_mapping.items():
+        upper = cam_name.upper().strip()
+
+        # Remove "CAM X" suffix first to isolate the classroom part
+        classroom_part = re.sub(r'\s*CAM\s*\d+\s*$', '', upper).strip()
+        # Collapse multiple spaces
+        classroom_part = re.sub(r'\s+', ' ', classroom_part)
+
+        # Check if this is a classroom camera
+        match = re.match(
+            r'((?:GRADE|NURSERY|NUR|PREP|POPSICLE)\s+\d+\s*[A-C]?)$',
+            classroom_part,
+        )
+
+        if match:
+            classroom = match.group(1).strip()
+            # Normalize: "GRADE 10" -> "Grade 10", "NURSERY 3" -> "Nursery 3"
+            classroom = classroom.title()
+        else:
+            # Not a classroom camera (library, sports room, etc.)
+            # Still include it with the cleaned camera name as key
+            classroom = classroom_part.title()
+
+        if classroom not in classroom_cameras:
+            classroom_cameras[classroom] = []
+        classroom_cameras[classroom].append({
+            "cam_name": cam_name,
+            **info,
+        })
+
+    # Pick the best camera per classroom
+    final_mapping = {}
+    for classroom, cameras in classroom_cameras.items():
+        # Prefer: CAM 1 > CAM 2, with sound > without sound
+        best = sorted(cameras, key=lambda c: (
+            "CAM 1" in c["cam_name"].upper(),  # True sorts after False, so negate
+            c.get("sound", False),
+        ), reverse=True)[0]
+
+        final_mapping[classroom] = {
+            "dvr_index": best["dvr_index"],
+            "channel": best["channel"],
+            "description": best["description"],
+            "all_cameras": [
+                {"name": c["cam_name"], "channel": c["channel"], "dvr_index": c["dvr_index"]}
+                for c in cameras
+            ],
+        }
+
+    return final_mapping
+
+
+@app.post("/api/mapping/upload")
+async def upload_mapping(file: UploadFile = File(...)):
+    """Upload an Excel file with camera-to-classroom mapping.
+
+    Supports both .xls (old format) and .xlsx (new format).
+    Auto-detects PPIS camera Excel layout with side-by-side NVR sections.
+    """
+    fname = file.filename or ""
+    if not fname.endswith((".xlsx", ".xls")):
+        return JSONResponse(
+            {"status": "error", "error": "Please upload an .xlsx or .xls file"},
+            status_code=400,
+        )
+
+    content = await file.read()
+    ext = ".xls" if fname.endswith(".xls") else ".xlsx"
+    upload_path = Path(__file__).parent / f"camera_mapping{ext}"
+    with open(upload_path, "wb") as f:
+        f.write(content)
+
+    try:
+        if ext == ".xls":
+            # Use xlrd for old .xls format — auto-detect PPIS NVR layout
+            raw_mapping = _parse_camera_xls(upload_path)
+            mapping = _build_classroom_mapping(raw_mapping)
+        else:
+            # Use openpyxl for .xlsx
+            import openpyxl
+            wb = openpyxl.load_workbook(upload_path, data_only=True)
+            ws = wb.active
+            mapping = {}
+            headers = [str(cell.value or "").strip().lower() for cell in ws[1]]
+            classroom_col = None
+            dvr_col = None
+            channel_col = None
+            desc_col = None
+
+            for i, h in enumerate(headers):
+                if "class" in h or "room" in h:
+                    classroom_col = i
+                elif "dvr" in h or "nvr" in h:
+                    dvr_col = i
+                elif "channel" in h or "camera" in h or "ch" == h:
+                    channel_col = i
+                elif "desc" in h or "note" in h or "label" in h:
+                    desc_col = i
+
+            if classroom_col is None or channel_col is None:
+                # Fallback: try PPIS format detection on .xlsx too
+                return JSONResponse(
+                    {"status": "error", "error": "Excel must have columns: Classroom/Room and Channel/Camera. Or use the PPIS .xls format."},
+                    status_code=400,
+                )
+
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                classroom = str(row[classroom_col] or "").strip()
+                if not classroom:
+                    continue
+                dvr_num = int(row[dvr_col] or 1) if dvr_col is not None else 1
+                channel = int(row[channel_col] or 1)
+                desc = str(row[desc_col] or "") if desc_col is not None else ""
+                mapping[classroom] = {
+                    "dvr_index": dvr_num - 1,
+                    "channel": channel,
+                    "description": desc or classroom,
+                }
+
+        cfg = load_config()
+        cfg["camera_mapping"] = mapping
+        save_config(cfg)
+        global config
+        config = cfg
+
+        # Separate classroom cameras from non-classroom cameras for display
+        classroom_keys = [k for k in mapping if any(
+            kw in k.upper() for kw in ("GRADE", "NURSERY", "NUR", "PREP", "POPSICLE")
+        )]
+        other_keys = [k for k in mapping if k not in classroom_keys]
+
+        return {
+            "status": "ok",
+            "mappings_loaded": len(mapping),
+            "classroom_cameras": len(classroom_keys),
+            "other_cameras": len(other_keys),
+            "classrooms": sorted(classroom_keys),
+            "other_locations": sorted(other_keys),
+        }
+    except Exception as e:
+        logger.exception(f"Failed to parse camera mapping Excel: {e}")
+        return JSONResponse(
+            {"status": "error", "error": f"Failed to parse Excel: {str(e)}"},
+            status_code=400,
+        )
+
+
+@app.post("/api/mapping/save")
+async def save_mapping(request: Request):
+    """Save camera mapping locally and sync to cloud."""
+    body = await request.json()
+    mapping = body.get("mapping", {})
+    config["camera_mapping"] = mapping
+    save_config(config)
+    # Sync to cloud DB
+    cloud_synced = False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{CLOUD_API_BASE}/api/agent-config/camera-mapping",
+                json={"camera_mapping": mapping},
+            )
+            cloud_synced = resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"Failed to sync camera mapping to cloud: {e}")
+    return {"status": "ok", "mappings_saved": len(mapping), "cloud_synced": cloud_synced}
+
+
+@app.get("/api/snapshots")
+async def list_snapshots():
+    """List recent snapshots."""
+    files = sorted(SNAPSHOT_DIR.glob("*.jpg"), key=os.path.getmtime, reverse=True)[:50]
+    return [{"filename": f.name, "size": f.stat().st_size, "time": f.stat().st_mtime} for f in files]
+
+
+# ---------------------------------------------------------------------------
+# Dashboard HTML (embedded for simplicity — no external templates needed)
+# ---------------------------------------------------------------------------
+
+def get_dashboard_html() -> str:
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PPIS Campus Agent</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #f0f2f5; color: #333; }
+.header { background: linear-gradient(135deg, #1a237e, #283593); color: white; padding: 20px 30px; display: flex; align-items: center; gap: 15px; }
+.header h1 { font-size: 24px; font-weight: 600; }
+.header .status { margin-left: auto; padding: 6px 16px; border-radius: 20px; font-size: 13px; font-weight: 500; }
+.status.connected { background: #43a047; }
+.status.disconnected { background: #e53935; }
+.container { max-width: 1200px; margin: 20px auto; padding: 0 20px; }
+.tabs { display: flex; gap: 4px; margin-bottom: 20px; }
+.tab { padding: 10px 24px; background: white; border: 1px solid #ddd; border-radius: 8px 8px 0 0; cursor: pointer; font-weight: 500; }
+.tab.active { background: #1a237e; color: white; border-color: #1a237e; }
+.panel { display: none; background: white; border-radius: 0 8px 8px 8px; padding: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+.panel.active { display: block; }
+.card { border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.card h3 { margin-bottom: 12px; color: #1a237e; }
+.form-row { display: flex; gap: 12px; margin-bottom: 12px; align-items: center; }
+.form-row label { min-width: 100px; font-weight: 500; }
+.form-row input, .form-row select { flex: 1; padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+button { padding: 8px 20px; background: #1a237e; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; }
+button:hover { background: #283593; }
+button.test { background: #43a047; }
+button.test:hover { background: #388e3c; }
+button.danger { background: #e53935; }
+.mapping-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+.mapping-table th, .mapping-table td { padding: 8px 12px; border: 1px solid #e0e0e0; text-align: left; }
+.mapping-table th { background: #f5f5f5; font-weight: 600; }
+.upload-zone { border: 2px dashed #ccc; border-radius: 8px; padding: 40px; text-align: center; cursor: pointer; transition: all 0.2s; }
+.upload-zone:hover { border-color: #1a237e; background: #f8f9ff; }
+.snapshot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin-top: 12px; }
+.snapshot-card { border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden; }
+.snapshot-card img { width: 100%; height: 150px; object-fit: cover; }
+.snapshot-card .info { padding: 8px; font-size: 12px; color: #666; }
+.alert { padding: 12px 16px; border-radius: 6px; margin-bottom: 12px; }
+.alert.success { background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; }
+.alert.error { background: #ffebee; color: #c62828; border: 1px solid #ef9a9a; }
+.alert.info { background: #e3f2fd; color: #1565c0; border: 1px solid #90caf9; }
+#alert-box { position: fixed; top: 20px; right: 20px; z-index: 1000; min-width: 300px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+    <div>🏫</div>
+    <h1>PPIS Campus Agent</h1>
+    <div class="status disconnected" id="ws-status">Disconnected</div>
+</div>
+
+<div id="alert-box"></div>
+
+<div class="container">
+    <div class="tabs">
+        <div class="tab active" onclick="switchTab('dvr')">DVR Configuration</div>
+        <div class="tab" onclick="switchTab('mapping')">Camera Mapping</div>
+        <div class="tab" onclick="switchTab('snapshots')">Snapshots</div>
+        <div class="tab" onclick="switchTab('logs')">Logs</div>
+    </div>
+
+    <!-- DVR Configuration Panel -->
+    <div class="panel active" id="panel-dvr">
+        <h2 style="margin-bottom:16px">DVR Configuration</h2>
+        <div id="dvr-list"></div>
+        <button onclick="addDvr()" style="margin-top:12px">+ Add DVR</button>
+        <button onclick="saveDvrs()" style="margin-top:12px; margin-left:8px">Save Configuration</button>
+    </div>
+
+    <!-- Camera Mapping Panel -->
+    <div class="panel" id="panel-mapping">
+        <h2 style="margin-bottom:16px">Camera-to-Classroom Mapping</h2>
+
+        <div class="card">
+            <h3>Upload Excel Mapping</h3>
+            <p style="margin-bottom:12px; color:#666">Upload an Excel file with columns: <b>Classroom</b>, <b>DVR</b> (1/2/3), <b>Channel</b>, <b>Description</b> (optional)</p>
+            <div class="upload-zone" onclick="document.getElementById('excel-upload').click()">
+                <p>📁 Click to upload Excel file (.xlsx)</p>
+                <p style="font-size:12px; color:#999; margin-top:8px">or drag and drop here</p>
+            </div>
+            <input type="file" id="excel-upload" accept=".xlsx,.xls" style="display:none" onchange="uploadExcel(this)">
+        </div>
+
+        <div class="card">
+            <h3>Current Mapping</h3>
+            <div id="mapping-table-container">
+                <p style="color:#999">No mapping loaded. Upload an Excel file above.</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Add Manual Entry</h3>
+            <div class="form-row">
+                <label>Classroom:</label>
+                <input type="text" id="map-classroom" placeholder="e.g. Grade 3C">
+            </div>
+            <div class="form-row">
+                <label>DVR #:</label>
+                <select id="map-dvr"><option value="1">DVR 1</option><option value="2">DVR 2</option><option value="3">DVR 3</option></select>
+            </div>
+            <div class="form-row">
+                <label>Channel:</label>
+                <input type="number" id="map-channel" min="1" max="64" value="1">
+            </div>
+            <div class="form-row">
+                <label>Description:</label>
+                <input type="text" id="map-desc" placeholder="Optional description">
+            </div>
+            <button onclick="addMapping()">Add Mapping</button>
+        </div>
+    </div>
+
+    <!-- Snapshots Panel -->
+    <div class="panel" id="panel-snapshots">
+        <h2 style="margin-bottom:16px">Snapshots</h2>
+        <div class="form-row">
+            <label>Classroom:</label>
+            <input type="text" id="snap-classroom" placeholder="e.g. Grade 3C">
+            <button onclick="takeSnapshot()">📷 Capture Snapshot</button>
+        </div>
+        <div class="snapshot-grid" id="snapshot-grid"></div>
+    </div>
+
+    <!-- Logs Panel -->
+    <div class="panel" id="panel-logs">
+        <h2 style="margin-bottom:16px">Activity Logs</h2>
+        <div id="log-container" style="background:#1e1e1e; color:#d4d4d4; padding:16px; border-radius:8px; height:400px; overflow-y:auto; font-family:monospace; font-size:13px;">
+            <p>Agent started. Waiting for events...</p>
+        </div>
+    </div>
+</div>
+
+<script>
+let currentMapping = {};
+let dvrs = [];
+
+function switchTab(tab) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    event.target.classList.add('active');
+    document.getElementById('panel-' + tab).classList.add('active');
+    if (tab === 'snapshots') loadSnapshots();
+}
+
+function showAlert(msg, type) {
+    const box = document.getElementById('alert-box');
+    const el = document.createElement('div');
+    el.className = 'alert ' + type;
+    el.textContent = msg;
+    box.appendChild(el);
+    setTimeout(() => el.remove(), 5000);
+}
+
+function addLog(msg) {
+    const container = document.getElementById('log-container');
+    const ts = new Date().toLocaleTimeString();
+    container.innerHTML += `<p>[${ts}] ${msg}</p>`;
+    container.scrollTop = container.scrollHeight;
+}
+
+// --- DVR ---
+function renderDvrs() {
+    const list = document.getElementById('dvr-list');
+    list.innerHTML = '';
+    dvrs.forEach((d, i) => {
+        list.innerHTML += `
+        <div class="card">
+            <h3>${d.name || 'DVR ' + (i+1)}</h3>
+            <div class="form-row"><label>Name:</label><input value="${d.name||''}" onchange="dvrs[${i}].name=this.value"></div>
+            <div class="form-row"><label>IP Address:</label><input value="${d.ip||''}" onchange="dvrs[${i}].ip=this.value"></div>
+            <div class="form-row"><label>Port:</label><input type="number" value="${d.port||80}" onchange="dvrs[${i}].port=parseInt(this.value)"></div>
+            <div class="form-row"><label>Username:</label><input value="${d.username||''}" onchange="dvrs[${i}].username=this.value"></div>
+            <div class="form-row"><label>Password:</label><input type="password" value="${d.password||''}" onchange="dvrs[${i}].password=this.value"></div>
+            <div class="form-row"><label>Channels:</label><input type="number" value="${d.channels||64}" onchange="dvrs[${i}].channels=parseInt(this.value)"></div>
+            <button class="test" onclick="testDvr(${i})">Test Connection</button>
+            <button class="danger" onclick="dvrs.splice(${i},1);renderDvrs()" style="margin-left:8px">Remove</button>
+            <span id="dvr-test-${i}" style="margin-left:12px;font-size:13px"></span>
+        </div>`;
+    });
+}
+
+function addDvr() {
+    dvrs.push({name:'DVR '+(dvrs.length+1), ip:'192.168.0.11', port:80, username:'admin', password:'', channels:64});
+    renderDvrs();
+}
+
+async function saveDvrs() {
+    const resp = await fetch('/api/dvr/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({dvrs})});
+    const data = await resp.json();
+    showAlert('DVR configuration saved (' + data.dvr_count + ' DVRs)', 'success');
+    addLog('DVR configuration saved');
+}
+
+async function testDvr(i) {
+    const el = document.getElementById('dvr-test-' + i);
+    el.textContent = 'Testing...';
+    el.style.color = '#666';
+    // Need to save first so backend has the password
+    await fetch('/api/dvr/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({dvrs})});
+    const resp = await fetch('/api/dvr/test/' + i, {method:'POST'});
+    const data = await resp.json();
+    if (data.status === 'connected') {
+        el.textContent = '✓ Connected';
+        el.style.color = 'green';
+        addLog('DVR ' + (i+1) + ' (' + dvrs[i].ip + '): Connected');
+    } else {
+        el.textContent = '✗ ' + (data.error || data.status);
+        el.style.color = 'red';
+        addLog('DVR ' + (i+1) + ' (' + dvrs[i].ip + '): ' + data.error);
+    }
+}
+
+// --- Mapping ---
+function renderMapping() {
+    const container = document.getElementById('mapping-table-container');
+    const keys = Object.keys(currentMapping);
+    if (keys.length === 0) {
+        container.innerHTML = '<p style="color:#999">No mapping loaded.</p>';
+        return;
+    }
+    let html = '<table class="mapping-table"><thead><tr><th>Classroom</th><th>DVR</th><th>Channel</th><th>Description</th><th>Action</th></tr></thead><tbody>';
+    keys.forEach(k => {
+        const m = currentMapping[k];
+        html += `<tr><td>${k}</td><td>DVR ${(m.dvr_index||0)+1}</td><td>${m.channel}</td><td>${m.description||''}</td><td><button class="danger" onclick="deleteMapping('${k}')">Delete</button></td></tr>`;
+    });
+    html += '</tbody></table>';
+    container.innerHTML = html;
+}
+
+function addMapping() {
+    const classroom = document.getElementById('map-classroom').value.trim();
+    const dvrNum = parseInt(document.getElementById('map-dvr').value);
+    const channel = parseInt(document.getElementById('map-channel').value);
+    const desc = document.getElementById('map-desc').value.trim();
+    if (!classroom) { showAlert('Please enter a classroom name', 'error'); return; }
+    currentMapping[classroom] = {dvr_index: dvrNum-1, channel, description: desc || classroom};
+    renderMapping();
+    saveMapping();
+    document.getElementById('map-classroom').value = '';
+    document.getElementById('map-desc').value = '';
+    showAlert('Mapping added: ' + classroom + ' → DVR ' + dvrNum + ' Ch' + channel, 'success');
+}
+
+async function deleteMapping(key) {
+    delete currentMapping[key];
+    renderMapping();
+    await saveMapping();
+    showAlert('Mapping removed: ' + key, 'info');
+}
+
+async function saveMapping() {
+    await fetch('/api/mapping/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mapping: currentMapping})});
+}
+
+async function uploadExcel(input) {
+    const file = input.files[0];
+    if (!file) return;
+    const form = new FormData();
+    form.append('file', file);
+    const resp = await fetch('/api/mapping/upload', {method:'POST', body: form});
+    const data = await resp.json();
+    if (data.status === 'ok') {
+        showAlert('Loaded ' + data.mappings_loaded + ' camera mappings from Excel', 'success');
+        addLog('Camera mapping uploaded: ' + data.mappings_loaded + ' entries');
+        await loadConfig();
+    } else {
+        showAlert('Error: ' + data.error, 'error');
+    }
+}
+
+// --- Snapshots ---
+async function takeSnapshot() {
+    const classroom = document.getElementById('snap-classroom').value.trim();
+    if (!classroom) { showAlert('Enter a classroom name', 'error'); return; }
+    showAlert('Capturing snapshot for ' + classroom + '...', 'info');
+    const resp = await fetch('/api/snapshot/' + encodeURIComponent(classroom), {method:'POST'});
+    const data = await resp.json();
+    if (data.status === 'ok') {
+        showAlert('Snapshot captured: ' + data.filename, 'success');
+        addLog('Snapshot: ' + classroom + ' → ' + data.filename);
+        loadSnapshots();
+    } else {
+        showAlert('Error: ' + data.error, 'error');
+    }
+}
+
+async function loadSnapshots() {
+    const resp = await fetch('/api/snapshots');
+    const data = await resp.json();
+    const grid = document.getElementById('snapshot-grid');
+    grid.innerHTML = '';
+    data.forEach(s => {
+        const date = new Date(s.time * 1000).toLocaleString();
+        grid.innerHTML += `<div class="snapshot-card"><img src="/snapshots/${s.filename}" alt="${s.filename}"><div class="info">${s.filename}<br>${date}<br>${Math.round(s.size/1024)}KB</div></div>`;
+    });
+}
+
+// --- Init ---
+async function loadConfig() {
+    const resp = await fetch('/api/config');
+    const data = await resp.json();
+    dvrs = data.dvrs.map(d => ({...d, password: ''}));
+    currentMapping = data.camera_mapping || {};
+    renderDvrs();
+    renderMapping();
+    const statusEl = document.getElementById('ws-status');
+    if (data.ws_connected) {
+        statusEl.textContent = 'Connected to Cloud Bot';
+        statusEl.className = 'status connected';
+    } else {
+        statusEl.textContent = 'Disconnected';
+        statusEl.className = 'status disconnected';
+    }
+}
+
+// Load config and refresh WS status periodically
+loadConfig();
+setInterval(async () => {
+    try {
+        const resp = await fetch('/api/config');
+        const data = await resp.json();
+        const statusEl = document.getElementById('ws-status');
+        if (data.ws_connected) {
+            statusEl.textContent = 'Connected to Cloud Bot';
+            statusEl.className = 'status connected';
+        } else {
+            statusEl.textContent = 'Disconnected';
+            statusEl.className = 'status disconnected';
+        }
+    } catch(e) {}
+}, 5000);
+</script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = config.get("local_port", 8899)
+    logger.info(f"Starting PPIS Campus Agent on http://localhost:{port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)

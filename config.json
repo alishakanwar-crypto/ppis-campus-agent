@@ -1,0 +1,8 @@
+{
+  "cloud_bot_url": "wss://app-ukmjfzku.fly.dev/ws/agent",
+  "agent_secret": "",
+  "dvrs": [],
+  "camera_mapping": {},
+  "snapshot_dir": "snapshots",
+  "local_port": 8899
+}
