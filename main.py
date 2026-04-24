@@ -449,7 +449,7 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
 
     logger.info(f"Capturing from {len(all_cameras)} camera(s) for {classroom}")
 
-    MIN_IMAGES = 3  # Always try to send at least 3 images
+    MIN_IMAGES = 2  # Send exactly 2 images: 1 from C1 + 1 from C2
 
     # Capture from ALL cameras
     raw_images = []  # list of (bytes, filename, description)
