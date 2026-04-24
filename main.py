@@ -44,6 +44,8 @@ CLOUD_API_BASE = "https://app-ukmjfzku.fly.dev"
 CONFIG_FILE = Path(__file__).parent / "config.json"
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 SNAPSHOT_DIR.mkdir(exist_ok=True)
+STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR.mkdir(exist_ok=True)
 
 
 async def fetch_config_from_cloud() -> dict | None:
