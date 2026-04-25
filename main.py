@@ -22,9 +22,12 @@ from pathlib import Path
 
 import httpx
 import websockets
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+
+from attendance_engine import engine as attendance_engine
+import face_db
 
 try:
     from PIL import Image
@@ -86,6 +89,63 @@ def save_config(cfg: dict):
     """Save config to local config.json (cache for offline use)."""
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
+
+
+async def sync_faces_from_cloud() -> int:
+    """Download registered face images from cloud and register locally.
+
+    Returns the number of faces synced.
+    """
+    url = f"{CLOUD_API_BASE}/api/face/images"
+    agent_secret = os.environ.get("AGENT_SECRET", "")
+    headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                logger.warning(f"Cloud face sync: API returned {resp.status_code}")
+                return 0
+            faces = resp.json()
+            if not faces:
+                logger.info("Cloud face sync: no faces registered in cloud")
+                return 0
+
+            import database as db_mod
+            synced = 0
+            # Fetch existing faces once before the loop (avoid N+1 queries)
+            existing = db_mod.get_all_face_encodings()
+            existing_keys = {
+                (r["person_id"], r.get("angle", ""))
+                for r in existing
+            }
+            for face_data in faces:
+                person_id = face_data["person_id"]
+                angle = face_data["angle"]
+                if (person_id, angle) in existing_keys:
+                    continue
+
+                # Decode image and register locally
+                image_bytes = base64.b64decode(face_data["image_base64"])
+                result = face_db.register_face(
+                    person_id=person_id,
+                    name=face_data["name"],
+                    role=face_data["role"],
+                    phone=face_data["phone"],
+                    angle=angle,
+                    image_bytes=image_bytes,
+                )
+                if result.get("success"):
+                    synced += 1
+                    existing_keys.add((person_id, angle))
+                    logger.info(f"Cloud face sync: registered {face_data['name']} ({person_id}) angle={angle}")
+                else:
+                    logger.warning(f"Cloud face sync: failed to register {person_id}: {result.get('error')}")
+
+            logger.info(f"Cloud face sync complete: {synced} new face(s) synced")
+            return synced
+    except Exception as e:
+        logger.warning(f"Cloud face sync failed: {e}")
+        return 0
 
 
 async def load_config() -> dict:
@@ -513,6 +573,9 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ws_task, config
+    # Initialize database (creates tables including attendance tables)
+    import database as db_mod
+    db_mod.init_db()
     # Load config from cloud DB (falls back to local config.json)
     config = await load_config()
     # ALWAYS enforce the correct cloud bot URL (prevents stale config.json issues)
@@ -521,19 +584,32 @@ async def lifespan(app: FastAPI):
         f"Config loaded: {len(config.get('dvrs', []))} DVRs, "
         f"{len(config.get('camera_mapping', {}))} camera mappings"
     )
+    # Sync face registrations from cloud DB (downloads images, computes encodings)
+    await sync_faces_from_cloud()
+    # Pre-load registered faces into attendance engine
+    attendance_engine.reload_faces()
     # Start WebSocket client in background
     ws_task = asyncio.create_task(websocket_client())
-    logger.info("PPIS Campus Agent started")
+    logger.info("PPIS Campus Agent started (with Face Recognition Attendance)")
     yield
     # Shutdown
+    attendance_engine.stop()
     if ws_task:
         ws_task.cancel()
     logger.info("PPIS Campus Agent stopped")
 
 
 app = FastAPI(title="PPIS Campus Agent", lifespan=lifespan)
+
+# Ensure static directories exist
+(Path(__file__).parent / "static").mkdir(exist_ok=True)
+(Path(__file__).parent / "face_images").mkdir(exist_ok=True)
+(Path(__file__).parent / "attendance_snapshots").mkdir(exist_ok=True)
+
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 app.mount("/snapshots", StaticFiles(directory=str(SNAPSHOT_DIR)), name="snapshots")
+app.mount("/face_images", StaticFiles(directory=str(Path(__file__).parent / "face_images")), name="face_images")
+app.mount("/attendance_snapshots", StaticFiles(directory=str(Path(__file__).parent / "attendance_snapshots")), name="attendance_snapshots")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -906,6 +982,136 @@ async def list_snapshots():
 
 
 # ---------------------------------------------------------------------------
+# Face Recognition Attendance API
+# ---------------------------------------------------------------------------
+
+@app.post("/api/face/register")
+async def register_face(
+    image: UploadFile = File(...),
+    person_id: str = Form(...),
+    name: str = Form(...),
+    role: str = Form(""),
+    phone: str = Form(""),
+    angle: str = Form("front"),
+):
+    """Register a face from an uploaded image."""
+    image_bytes = await image.read()
+    result = face_db.register_face(
+        person_id=person_id,
+        name=name,
+        role=role,
+        phone=phone,
+        angle=angle,
+        image_bytes=image_bytes,
+    )
+    if not result["success"]:
+        return JSONResponse(result, status_code=400)
+    # Reload known faces in the engine
+    attendance_engine.reload_faces()
+    # Sync to cloud DB
+    cloud_synced = False
+    try:
+        agent_secret = os.environ.get("AGENT_SECRET", "")
+        headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{CLOUD_API_BASE}/api/face/register",
+                data={"person_id": person_id, "name": name, "role": role, "phone": phone, "angle": angle},
+                files={"image": ("face.jpg", image_bytes, "image/jpeg")},
+                headers=headers,
+            )
+            cloud_synced = resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"Failed to sync face to cloud: {e}")
+    result["cloud_synced"] = cloud_synced
+    return result
+
+
+@app.get("/api/face/registered")
+async def list_registered_faces():
+    """List all registered persons."""
+    return face_db.get_registered_list()
+
+
+@app.delete("/api/face/{person_id}")
+async def delete_registered_face(person_id: str):
+    """Delete all face encodings for a person."""
+    deleted = face_db.delete_person(person_id)
+    attendance_engine.reload_faces()
+    return {"deleted": deleted, "person_id": person_id}
+
+
+@app.post("/api/attendance/start")
+async def start_attendance_monitoring(request: Request):
+    """Start the face recognition attendance monitoring loop."""
+    body = await request.json() if (request.headers.get("content-type") or "").startswith("application/json") else {}
+
+    if attendance_engine.running:
+        return {"status": "already_running"}
+
+    # Configure engine
+    attendance_engine.test_mode = body.get("test_mode", True)
+    attendance_engine.test_person_id = body.get("test_person_id", "TEST001")
+    attendance_engine.confidence_threshold = body.get("confidence_threshold", 0.85)
+    attendance_engine.scan_interval = body.get("scan_interval", 3.0)
+    attendance_engine.whatsapp_phone = body.get("whatsapp_phone", "")
+
+    entrance = body.get("entrance_camera", None)
+    dvrs = config.get("dvrs", [])
+
+    attendance_engine.reload_faces()
+    attendance_engine.running = True  # Set immediately to prevent duplicate starts
+    attendance_engine._task = asyncio.create_task(
+        attendance_engine.monitoring_loop(dvrs, entrance)
+    )
+
+    return {
+        "status": "started",
+        "config": attendance_engine.get_status(),
+    }
+
+
+@app.post("/api/attendance/stop")
+async def stop_attendance_monitoring():
+    """Stop attendance monitoring."""
+    attendance_engine.stop()
+    return {"status": "stopped"}
+
+
+@app.get("/api/attendance/status")
+async def get_attendance_status():
+    """Get attendance engine status."""
+    return attendance_engine.get_status()
+
+
+@app.get("/api/attendance/logs")
+async def get_attendance_logs(limit: int = 100, person_id: str | None = None):
+    """Get attendance log entries from database."""
+    import database as db_mod
+    return db_mod.get_attendance_log(limit=limit, person_id=person_id)
+
+
+@app.get("/api/attendance/debug")
+async def get_debug_logs(limit: int = 100):
+    """Get real-time debug logs from the attendance engine."""
+    return attendance_engine.get_debug_logs(limit)
+
+
+@app.post("/api/attendance/recognize")
+async def recognize_single_image(image: UploadFile = File(...)):
+    """Run face recognition on a single uploaded image (manual test)."""
+    image_bytes = await image.read()
+    attendance_engine.reload_faces()
+    results = attendance_engine.recognize_faces_in_image(
+        image_bytes, camera_source="manual_upload"
+    )
+    return {
+        "results": results,
+        "debug_logs": attendance_engine.get_debug_logs(20),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dashboard HTML (embedded for simplicity — no external templates needed)
 # ---------------------------------------------------------------------------
 
@@ -968,14 +1174,118 @@ button.danger { background: #e53935; }
 
 <div class="container">
     <div class="tabs">
-        <div class="tab active" onclick="switchTab('dvr')">DVR Configuration</div>
+        <div class="tab active" onclick="switchTab('attendance')">Attendance</div>
+        <div class="tab" onclick="switchTab('register')">Face Registration</div>
+        <div class="tab" onclick="switchTab('dvr')">DVR Configuration</div>
         <div class="tab" onclick="switchTab('mapping')">Camera Mapping</div>
         <div class="tab" onclick="switchTab('snapshots')">Snapshots</div>
         <div class="tab" onclick="switchTab('logs')">Logs</div>
     </div>
 
+    <!-- Attendance Panel -->
+    <div class="panel active" id="panel-attendance">
+        <h2 style="margin-bottom:16px">Face Recognition Attendance</h2>
+
+        <div class="card">
+            <h3>Monitoring Controls</h3>
+            <div class="form-row">
+                <label>Status:</label>
+                <span id="att-status" style="font-weight:bold;color:#e53935">Stopped</span>
+            </div>
+            <div class="form-row">
+                <label>Test Mode:</label>
+                <select id="att-test-mode"><option value="true" selected>ON (TEST001 only)</option><option value="false">OFF (All persons)</option></select>
+            </div>
+            <div class="form-row">
+                <label>Test Person ID:</label>
+                <input type="text" id="att-test-pid" value="TEST001">
+            </div>
+            <div class="form-row">
+                <label>Confidence:</label>
+                <input type="number" id="att-threshold" value="85" min="50" max="100" step="1">%
+            </div>
+            <div class="form-row">
+                <label>Scan Interval:</label>
+                <input type="number" id="att-interval" value="3" min="1" max="30" step="1">s
+            </div>
+            <div class="form-row">
+                <label>WhatsApp #:</label>
+                <input type="text" id="att-phone" placeholder="e.g. +91XXXXXXXXXX">
+            </div>
+            <div class="form-row">
+                <label>DVR Index:</label>
+                <input type="number" id="att-dvr-idx" value="0" min="0">
+            </div>
+            <div class="form-row">
+                <label>Channel:</label>
+                <input type="number" id="att-channel" value="1" min="1">
+            </div>
+            <button onclick="startAttendance()" style="background:#43a047">Start Monitoring</button>
+            <button onclick="stopAttendance()" class="danger" style="margin-left:8px">Stop</button>
+            <button onclick="refreshAttStatus()" style="margin-left:8px">Refresh Status</button>
+        </div>
+
+        <div class="card">
+            <h3>Manual Test - Upload Image</h3>
+            <p style="margin-bottom:12px;color:#666">Upload an image to test face recognition without live camera feed.</p>
+            <input type="file" id="test-image-upload" accept="image/*">
+            <button onclick="testRecognize()" style="margin-top:8px">Recognize Faces</button>
+            <div id="recognize-result" style="margin-top:12px;font-family:monospace;font-size:13px;white-space:pre-wrap"></div>
+        </div>
+
+        <div class="card">
+            <h3>Attendance Log</h3>
+            <button onclick="loadAttendanceLogs()">Refresh Logs</button>
+            <table class="mapping-table" style="margin-top:12px" id="att-log-table">
+                <thead><tr><th>Name</th><th>ID</th><th>Time</th><th>Status</th><th>Confidence</th><th>Camera</th><th>WhatsApp</th></tr></thead>
+                <tbody id="att-log-body"></tbody>
+            </table>
+        </div>
+
+        <div class="card">
+            <h3>Debug Logs</h3>
+            <button onclick="loadDebugLogs()">Refresh</button>
+            <div id="debug-log-container" style="background:#1e1e1e;color:#d4d4d4;padding:16px;border-radius:8px;height:300px;overflow-y:auto;font-family:monospace;font-size:12px;margin-top:12px">
+                <p>No debug logs yet. Start monitoring to see real-time events.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Face Registration Panel -->
+    <div class="panel" id="panel-register">
+        <h2 style="margin-bottom:16px">Face Registration</h2>
+
+        <div class="card">
+            <h3>Register New Face</h3>
+            <p style="margin-bottom:12px;color:#666">Upload face images from multiple angles (front, left, right) for better recognition accuracy.</p>
+            <div class="form-row"><label>Person ID:</label><input type="text" id="reg-pid" value="TEST001" placeholder="e.g. TEST001"></div>
+            <div class="form-row"><label>Name:</label><input type="text" id="reg-name" placeholder="Your Name"></div>
+            <div class="form-row"><label>Role:</label><input type="text" id="reg-role" value="Test User" placeholder="e.g. Student, Teacher"></div>
+            <div class="form-row"><label>Phone:</label><input type="text" id="reg-phone" placeholder="+91XXXXXXXXXX"></div>
+            <div class="form-row"><label>Angle:</label>
+                <select id="reg-angle">
+                    <option value="front">Front</option>
+                    <option value="left">Left</option>
+                    <option value="right">Right</option>
+                </select>
+            </div>
+            <div class="form-row"><label>Image:</label><input type="file" id="reg-image" accept="image/*"></div>
+            <button onclick="registerFace()">Register Face</button>
+            <div id="reg-result" style="margin-top:12px"></div>
+        </div>
+
+        <div class="card">
+            <h3>Registered Persons</h3>
+            <button onclick="loadRegistered()">Refresh</button>
+            <table class="mapping-table" style="margin-top:12px">
+                <thead><tr><th>Person ID</th><th>Name</th><th>Role</th><th>Phone</th><th>Faces</th><th>Angles</th><th>Action</th></tr></thead>
+                <tbody id="registered-body"></tbody>
+            </table>
+        </div>
+    </div>
+
     <!-- DVR Configuration Panel -->
-    <div class="panel active" id="panel-dvr">
+    <div class="panel" id="panel-dvr">
         <h2 style="margin-bottom:16px">DVR Configuration</h2>
         <div id="dvr-list"></div>
         <button onclick="addDvr()" style="margin-top:12px">+ Add DVR</button>
@@ -1055,6 +1365,8 @@ function switchTab(tab) {
     event.target.classList.add('active');
     document.getElementById('panel-' + tab).classList.add('active');
     if (tab === 'snapshots') loadSnapshots();
+    if (tab === 'attendance') { refreshAttStatus(); loadAttendanceLogs(); }
+    if (tab === 'register') loadRegistered();
 }
 
 function showAlert(msg, type) {
@@ -1210,6 +1522,144 @@ async function loadSnapshots() {
     });
 }
 
+// --- Face Registration ---
+async function registerFace() {
+    const pid = document.getElementById('reg-pid').value.trim();
+    const name = document.getElementById('reg-name').value.trim();
+    const role = document.getElementById('reg-role').value.trim();
+    const phone = document.getElementById('reg-phone').value.trim();
+    const angle = document.getElementById('reg-angle').value;
+    const fileInput = document.getElementById('reg-image');
+    if (!pid || !name) { showAlert('Person ID and Name are required', 'error'); return; }
+    if (!fileInput.files[0]) { showAlert('Please select an image', 'error'); return; }
+    const form = new FormData();
+    form.append('person_id', pid);
+    form.append('name', name);
+    form.append('role', role);
+    form.append('phone', phone);
+    form.append('angle', angle);
+    form.append('image', fileInput.files[0]);
+    const resp = await fetch('/api/face/register', {method:'POST', body: form});
+    const data = await resp.json();
+    const el = document.getElementById('reg-result');
+    if (data.success) {
+        el.innerHTML = '<div class="alert success">Face registered: ' + name + ' (' + angle + ')</div>';
+        showAlert('Face registered for ' + name + ' (' + angle + ')', 'success');
+        loadRegistered();
+    } else {
+        el.innerHTML = '<div class="alert error">Error: ' + data.error + '</div>';
+        showAlert('Registration failed: ' + data.error, 'error');
+    }
+}
+
+async function loadRegistered() {
+    const resp = await fetch('/api/face/registered');
+    const data = await resp.json();
+    const tbody = document.getElementById('registered-body');
+    tbody.innerHTML = '';
+    data.forEach(p => {
+        tbody.innerHTML += '<tr><td>' + p.person_id + '</td><td>' + p.name + '</td><td>' + p.role + '</td><td>' + p.phone + '</td><td>' + p.face_count + '</td><td>' + (p.angles||'') + '</td><td><button class="danger" onclick="deletePerson(\'' + p.person_id + '\')">Delete</button></td></tr>';
+    });
+}
+
+async function deletePerson(pid) {
+    if (!confirm('Delete all face data for ' + pid + '?')) return;
+    await fetch('/api/face/' + pid, {method:'DELETE'});
+    showAlert('Deleted face data for ' + pid, 'info');
+    loadRegistered();
+}
+
+// --- Attendance Monitoring ---
+async function startAttendance() {
+    const body = {
+        test_mode: document.getElementById('att-test-mode').value === 'true',
+        test_person_id: document.getElementById('att-test-pid').value.trim(),
+        confidence_threshold: parseInt(document.getElementById('att-threshold').value) / 100.0,
+        scan_interval: parseFloat(document.getElementById('att-interval').value),
+        whatsapp_phone: document.getElementById('att-phone').value.trim(),
+        entrance_camera: {
+            dvr_index: parseInt(document.getElementById('att-dvr-idx').value),
+            channel: parseInt(document.getElementById('att-channel').value),
+            label: 'Entrance'
+        }
+    };
+    const resp = await fetch('/api/attendance/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const data = await resp.json();
+    showAlert('Attendance monitoring: ' + data.status, data.status === 'started' ? 'success' : 'info');
+    refreshAttStatus();
+}
+
+async function stopAttendance() {
+    await fetch('/api/attendance/stop', {method:'POST'});
+    showAlert('Attendance monitoring stopped', 'info');
+    refreshAttStatus();
+}
+
+async function refreshAttStatus() {
+    try {
+        const resp = await fetch('/api/attendance/status');
+        const data = await resp.json();
+        const el = document.getElementById('att-status');
+        if (data.running) {
+            el.textContent = 'Running (' + data.registered_persons + ' persons, ' + data.total_encodings + ' encodings)';
+            el.style.color = '#43a047';
+        } else {
+            el.textContent = 'Stopped';
+            el.style.color = '#e53935';
+        }
+    } catch(e) {}
+}
+
+async function loadAttendanceLogs() {
+    const resp = await fetch('/api/attendance/logs?limit=50');
+    const data = await resp.json();
+    const tbody = document.getElementById('att-log-body');
+    tbody.innerHTML = '';
+    data.forEach(l => {
+        tbody.innerHTML += '<tr><td>' + l.name + '</td><td>' + l.person_id + '</td><td>' + l.logged_at + '</td><td>' + l.status + '</td><td>' + (l.confidence * 100).toFixed(1) + '%</td><td>' + l.camera_source + '</td><td>' + (l.whatsapp_sent ? 'Sent' : '-') + '</td></tr>';
+    });
+}
+
+async function loadDebugLogs() {
+    const resp = await fetch('/api/attendance/debug?limit=100');
+    const data = await resp.json();
+    const container = document.getElementById('debug-log-container');
+    container.innerHTML = '';
+    data.forEach(l => {
+        let color = '#d4d4d4';
+        if (l.event === 'face_matched' || l.event === 'attendance_marked') color = '#4caf50';
+        else if (l.event === 'error' || l.event === 'whatsapp_error') color = '#ef5350';
+        else if (l.event === 'face_detected') color = '#42a5f5';
+        else if (l.event === 'low_confidence') color = '#ffa726';
+        container.innerHTML += '<p style="color:' + color + '">[' + l.timestamp + '] <b>' + l.event + '</b>: ' + l.details + (l.person_id ? ' (ID: ' + l.person_id + ')' : '') + (l.confidence > 0 ? ' [' + (l.confidence * 100).toFixed(1) + '%]' : '') + '</p>';
+    });
+    container.scrollTop = container.scrollHeight;
+}
+
+async function testRecognize() {
+    const fileInput = document.getElementById('test-image-upload');
+    if (!fileInput.files[0]) { showAlert('Select an image first', 'error'); return; }
+    const form = new FormData();
+    form.append('image', fileInput.files[0]);
+    const el = document.getElementById('recognize-result');
+    el.textContent = 'Processing...';
+    const resp = await fetch('/api/attendance/recognize', {method:'POST', body: form});
+    const data = await resp.json();
+    let output = '=== Recognition Results ===\\n';
+    if (data.results && data.results.length > 0) {
+        data.results.forEach(r => {
+            output += 'MATCH: ' + r.name + ' (ID: ' + r.person_id + ') - Confidence: ' + (r.confidence * 100).toFixed(1) + '% - Status: ' + r.status + '\\n';
+        });
+    } else {
+        output += 'No matching faces found.\\n';
+    }
+    output += '\\n=== Debug Logs ===\\n';
+    (data.debug_logs || []).forEach(l => {
+        output += '[' + l.event + '] ' + l.details + '\\n';
+    });
+    el.textContent = output;
+}
+
 // --- Init ---
 async function loadConfig() {
     const resp = await fetch('/api/config');
@@ -1228,8 +1678,11 @@ async function loadConfig() {
     }
 }
 
-// Load config and refresh WS status periodically
+// Load config, attendance status, and refresh periodically
 loadConfig();
+refreshAttStatus();
+loadAttendanceLogs();
+loadRegistered();
 setInterval(async () => {
     try {
         const resp = await fetch('/api/config');
@@ -1243,6 +1696,8 @@ setInterval(async () => {
             statusEl.className = 'status disconnected';
         }
     } catch(e) {}
+    // Auto-refresh attendance status
+    refreshAttStatus();
 }, 5000);
 </script>
 </body>

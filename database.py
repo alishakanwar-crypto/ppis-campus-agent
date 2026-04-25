@@ -60,6 +60,35 @@ def init_db():
                 size_bytes INTEGER NOT NULL DEFAULT 0,
                 captured_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS registered_faces (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id  TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                role       TEXT NOT NULL DEFAULT '',
+                phone      TEXT NOT NULL DEFAULT '',
+                angle      TEXT NOT NULL DEFAULT 'front',
+                encoding   BLOB NOT NULL,
+                image_path TEXT NOT NULL DEFAULT '',
+                registered_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS attendance_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id    TEXT NOT NULL,
+                name         TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'Present',
+                confidence   REAL NOT NULL DEFAULT 0.0,
+                snapshot_path TEXT NOT NULL DEFAULT '',
+                camera_source TEXT NOT NULL DEFAULT '',
+                logged_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                whatsapp_sent INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS attendance_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         """)
         conn.commit()
         logger.info(f"Database initialized at {DB_PATH}")
@@ -313,3 +342,155 @@ def load_config_from_db() -> dict:
         "dvrs": get_dvrs(),
         "camera_mapping": get_camera_mapping(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Registered faces helpers
+# ---------------------------------------------------------------------------
+
+def save_face_encoding(person_id: str, name: str, role: str, phone: str,
+                       angle: str, encoding_bytes: bytes, image_path: str) -> int:
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO registered_faces "
+            "(person_id, name, role, phone, angle, encoding, image_path) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (person_id, name, role, phone, angle, encoding_bytes, image_path),
+        )
+        conn.commit()
+        logger.info(f"Saved face encoding for {name} ({person_id}), angle={angle}")
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_all_face_encodings() -> list[dict]:
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, person_id, name, role, phone, angle, encoding, image_path "
+            "FROM registered_faces ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_registered_persons() -> list[dict]:
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT person_id, name, role, phone, "
+            "COUNT(*) as face_count, "
+            "GROUP_CONCAT(angle) as angles, "
+            "MIN(registered_at) as registered_at "
+            "FROM registered_faces GROUP BY person_id ORDER BY name"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def delete_person_faces(person_id: str) -> int:
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM registered_faces WHERE person_id = ?", (person_id,)
+        )
+        conn.commit()
+        deleted = cursor.rowcount
+        logger.info(f"Deleted {deleted} face encoding(s) for person_id={person_id}")
+        return deleted
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Attendance log helpers
+# ---------------------------------------------------------------------------
+
+def log_attendance(person_id: str, name: str, status: str, confidence: float,
+                   snapshot_path: str, camera_source: str) -> int:
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO attendance_log "
+            "(person_id, name, status, confidence, snapshot_path, camera_source) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (person_id, name, status, confidence, snapshot_path, camera_source),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def update_whatsapp_sent(attendance_id: int):
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE attendance_log SET whatsapp_sent = 1 WHERE id = ?",
+            (attendance_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_attendance_log(limit: int = 100, person_id: str | None = None) -> list[dict]:
+    conn = get_conn()
+    try:
+        if person_id:
+            rows = conn.execute(
+                "SELECT id, person_id, name, status, confidence, snapshot_path, "
+                "camera_source, logged_at, whatsapp_sent "
+                "FROM attendance_log WHERE person_id = ? ORDER BY id DESC LIMIT ?",
+                (person_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, person_id, name, status, confidence, snapshot_path, "
+                "camera_source, logged_at, whatsapp_sent "
+                "FROM attendance_log ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_last_attendance(person_id: str) -> dict | None:
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT id, person_id, name, status, confidence, logged_at "
+            "FROM attendance_log WHERE person_id = ? ORDER BY id DESC LIMIT 1",
+            (person_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_attendance_setting(key: str, default: str = "") -> str:
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT value FROM attendance_settings WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else default
+    finally:
+        conn.close()
+
+
+def set_attendance_setting(key: str, value: str):
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO attendance_settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
