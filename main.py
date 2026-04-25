@@ -112,16 +112,16 @@ async def sync_faces_from_cloud() -> int:
 
             import database as db_mod
             synced = 0
+            # Fetch existing faces once before the loop (avoid N+1 queries)
+            existing = db_mod.get_all_face_encodings()
+            existing_keys = {
+                (r["person_id"], r.get("angle", ""))
+                for r in existing
+            }
             for face_data in faces:
                 person_id = face_data["person_id"]
                 angle = face_data["angle"]
-                # Check if this face already exists locally
-                existing = db_mod.get_all_face_encodings()
-                already_exists = any(
-                    r["person_id"] == person_id and r.get("angle", "") == angle
-                    for r in existing
-                )
-                if already_exists:
+                if (person_id, angle) in existing_keys:
                     continue
 
                 # Decode image and register locally
@@ -136,6 +136,7 @@ async def sync_faces_from_cloud() -> int:
                 )
                 if result.get("success"):
                     synced += 1
+                    existing_keys.add((person_id, angle))
                     logger.info(f"Cloud face sync: registered {face_data['name']} ({person_id}) angle={angle}")
                 else:
                     logger.warning(f"Cloud face sync: failed to register {person_id}: {result.get('error')}")

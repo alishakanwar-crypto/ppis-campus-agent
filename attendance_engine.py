@@ -60,6 +60,7 @@ class AttendanceEngine:
         self.whatsapp_api_url = ""
         self.whatsapp_phone = ""
         self._task: asyncio.Task | None = None
+        self._background_tasks: set[asyncio.Task] = set()
 
     def add_debug_log(self, event: str, details: str = "",
                       person_id: str = "", confidence: float = 0.0):
@@ -242,7 +243,7 @@ class AttendanceEngine:
 
         # Trigger WhatsApp notification asynchronously
         if phone:
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._send_whatsapp_notification(
                     attendance_id=attendance_id,
                     name=name,
@@ -250,6 +251,8 @@ class AttendanceEngine:
                     phone=phone,
                 )
             )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
         return result
 
