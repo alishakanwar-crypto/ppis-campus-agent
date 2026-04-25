@@ -336,7 +336,7 @@ def get_snapshot_history(limit: int = 50) -> list[dict]:
 def load_config_from_db() -> dict:
     """Load full config from database (same structure as config.json)."""
     return {
-        "cloud_bot_url": get_setting("cloud_bot_url", "wss://app-reykyihf.fly.dev/ws/agent"),
+        "cloud_bot_url": get_setting("cloud_bot_url", "wss://app-itszlsnn.fly.dev/ws/agent"),
         "agent_secret": get_setting("agent_secret", os.environ.get("AGENT_SECRET", "")),
         "local_port": int(get_setting("local_port", "8899")),
         "dvrs": get_dvrs(),

@@ -263,7 +263,7 @@ class AttendanceEngine:
         message = f"[Attendance] {name} has arrived at {time_str}."
 
         # Try cloud bot WhatsApp API
-        api_url = self.whatsapp_api_url or "https://app-reykyihf.fly.dev"
+        api_url = self.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
         agent_secret = os.environ.get("AGENT_SECRET", "")
         headers = {}
         if agent_secret:
