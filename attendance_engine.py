@@ -197,7 +197,7 @@ class AttendanceEngine:
         if now - last < COOLDOWN_SECONDS:
             remaining = int(COOLDOWN_SECONDS - (now - last))
             self.add_debug_log("cooldown_active",
-                               f"{name} already marked {remaining}s ago",
+                               f"{name} on cooldown, {remaining}s remaining",
                                person_id=person_id,
                                confidence=confidence)
             return None
@@ -339,22 +339,24 @@ class AttendanceEngine:
                            f"interval={self.scan_interval}s, "
                            f"test_mode={'ON' if self.test_mode else 'OFF'}")
 
-        while self.running:
-            try:
-                if dvr_idx < len(dvrs):
-                    await self.scan_camera(dvrs[dvr_idx], channel, label)
-                else:
-                    self.add_debug_log("error",
-                                       f"DVR index {dvr_idx} out of range "
-                                       f"(have {len(dvrs)} DVRs)")
-                    await asyncio.sleep(30)
-                    continue
-            except Exception as e:
-                self.add_debug_log("scan_error", f"Error in scan loop: {e}")
+        try:
+            while self.running:
+                try:
+                    if dvr_idx < len(dvrs):
+                        await self.scan_camera(dvrs[dvr_idx], channel, label)
+                    else:
+                        self.add_debug_log("error",
+                                           f"DVR index {dvr_idx} out of range "
+                                           f"(have {len(dvrs)} DVRs)")
+                        await asyncio.sleep(30)
+                        continue
+                except Exception as e:
+                    self.add_debug_log("scan_error", f"Error in scan loop: {e}")
 
-            await asyncio.sleep(self.scan_interval)
-
-        self.add_debug_log("monitoring_stopped", "Attendance monitoring stopped")
+                await asyncio.sleep(self.scan_interval)
+        finally:
+            self.running = False
+            self.add_debug_log("monitoring_stopped", "Attendance monitoring stopped")
 
     def stop(self):
         """Stop the monitoring loop."""
