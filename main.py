@@ -40,12 +40,10 @@ logger = logging.getLogger("ppis-agent")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-CLOUD_API_BASE = "https://app-ukmjfzku.fly.dev"
+CLOUD_API_BASE = "https://app-reykyihf.fly.dev"
 CONFIG_FILE = Path(__file__).parent / "config.json"
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 SNAPSHOT_DIR.mkdir(exist_ok=True)
-STATIC_DIR = Path(__file__).parent / "static"
-STATIC_DIR.mkdir(exist_ok=True)
 
 
 async def fetch_config_from_cloud() -> dict | None:
@@ -75,7 +73,7 @@ def load_config_local() -> dict:
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
     return {
-        "cloud_bot_url": "wss://app-ukmjfzku.fly.dev/ws/agent",
+        "cloud_bot_url": "wss://app-reykyihf.fly.dev/ws/agent",
         "agent_secret": os.environ.get("AGENT_SECRET", ""),
         "dvrs": [],
         "camera_mapping": {},
@@ -96,7 +94,7 @@ async def load_config() -> dict:
     if cloud_cfg and cloud_cfg.get("dvrs"):
         # Merge cloud data into a usable config dict
         cfg = {
-            "cloud_bot_url": cloud_cfg.get("cloud_bot_url", "wss://app-ukmjfzku.fly.dev/ws/agent"),
+            "cloud_bot_url": cloud_cfg.get("cloud_bot_url", "wss://app-reykyihf.fly.dev/ws/agent"),
             "agent_secret": cloud_cfg.get("agent_secret", os.environ.get("AGENT_SECRET", "")),
             "dvrs": cloud_cfg.get("dvrs", []),
             "camera_mapping": cloud_cfg.get("camera_mapping", {}),
@@ -332,7 +330,7 @@ async def websocket_client():
     """Persistent WebSocket connection to the cloud bot.
     Receives snapshot requests and sends back images."""
     global ws_connection
-    url = config.get("cloud_bot_url", "wss://app-ukmjfzku.fly.dev/ws/agent")
+    url = config.get("cloud_bot_url", "wss://app-reykyihf.fly.dev/ws/agent")
     secret = config.get("agent_secret", os.environ.get("AGENT_SECRET", ""))
 
     while True:
@@ -451,11 +449,9 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
 
     logger.info(f"Capturing from {len(all_cameras)} camera(s) for {classroom}")
 
-    MIN_IMAGES = 2  # Send exactly 2 images: 1 from C1 + 1 from C2
-
-    # Capture from ALL cameras
+    # Capture exactly 2 photos: one from C1, one from C2 (no extras)
     raw_images = []  # list of (bytes, filename, description)
-    for dvr, channel, desc in all_cameras:
+    for dvr, channel, desc in all_cameras[:2]:  # Max 2 cameras (C1 + C2)
         snapshot = await capture_snapshot(dvr, channel)
         if snapshot:
             ts = int(time.time())
@@ -468,28 +464,6 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
             logger.info(f"Snapshot captured: {filename} ({len(snapshot)} bytes) - {desc}")
         else:
             logger.warning(f"Failed to capture from DVR {dvr['ip']} channel {channel} ({desc})")
-
-    # If we have fewer than MIN_IMAGES, take extra shots from available cameras
-    # (with a brief delay to get slightly different frames)
-    if 0 < len(raw_images) < MIN_IMAGES:
-        extra_needed = MIN_IMAGES - len(raw_images)
-        logger.info(f"Only {len(raw_images)} image(s) captured, taking {extra_needed} extra shot(s)")
-        cam_idx = 0
-        for _ in range(extra_needed):
-            dvr, channel, desc = all_cameras[cam_idx % len(all_cameras)]
-            await asyncio.sleep(1.5)  # Brief delay for a different frame
-            snapshot = await capture_snapshot(dvr, channel)
-            if snapshot:
-                ts = int(time.time())
-                shot_num = len(raw_images) + 1
-                cam_label = desc.split()[-1] if desc else f"ch{channel}"
-                filename = f"{classroom.replace(' ', '_')}_{cam_label}_extra{shot_num}_{ts}.jpg"
-                filepath = SNAPSHOT_DIR / filename
-                with open(filepath, "wb") as f:
-                    f.write(snapshot)
-                raw_images.append((snapshot, filename, f"{desc} (angle {shot_num})"))
-                logger.info(f"Extra snapshot captured: {filename} ({len(snapshot)} bytes)")
-            cam_idx += 1
 
     if not raw_images:
         await ws.send(json.dumps({
@@ -540,6 +514,8 @@ async def lifespan(app: FastAPI):
     global ws_task, config
     # Load config from cloud DB (falls back to local config.json)
     config = await load_config()
+    # ALWAYS enforce the correct cloud bot URL (prevents stale config.json issues)
+    config["cloud_bot_url"] = "wss://app-reykyihf.fly.dev/ws/agent"
     logger.info(
         f"Config loaded: {len(config.get('dvrs', []))} DVRs, "
         f"{len(config.get('camera_mapping', {}))} camera mappings"
