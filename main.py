@@ -91,6 +91,62 @@ def save_config(cfg: dict):
         json.dump(cfg, f, indent=2)
 
 
+async def sync_faces_from_cloud() -> int:
+    """Download registered face images from cloud and register locally.
+
+    Returns the number of faces synced.
+    """
+    url = f"{CLOUD_API_BASE}/api/face/images"
+    agent_secret = os.environ.get("AGENT_SECRET", "")
+    headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                logger.warning(f"Cloud face sync: API returned {resp.status_code}")
+                return 0
+            faces = resp.json()
+            if not faces:
+                logger.info("Cloud face sync: no faces registered in cloud")
+                return 0
+
+            import database as db_mod
+            synced = 0
+            for face_data in faces:
+                person_id = face_data["person_id"]
+                angle = face_data["angle"]
+                # Check if this face already exists locally
+                existing = db_mod.get_all_face_encodings()
+                already_exists = any(
+                    r["person_id"] == person_id and r.get("angle", "") == angle
+                    for r in existing
+                )
+                if already_exists:
+                    continue
+
+                # Decode image and register locally
+                image_bytes = base64.b64decode(face_data["image_base64"])
+                result = face_db.register_face(
+                    person_id=person_id,
+                    name=face_data["name"],
+                    role=face_data["role"],
+                    phone=face_data["phone"],
+                    angle=angle,
+                    image_bytes=image_bytes,
+                )
+                if result.get("success"):
+                    synced += 1
+                    logger.info(f"Cloud face sync: registered {face_data['name']} ({person_id}) angle={angle}")
+                else:
+                    logger.warning(f"Cloud face sync: failed to register {person_id}: {result.get('error')}")
+
+            logger.info(f"Cloud face sync complete: {synced} new face(s) synced")
+            return synced
+    except Exception as e:
+        logger.warning(f"Cloud face sync failed: {e}")
+        return 0
+
+
 async def load_config() -> dict:
     """Load config: try cloud first, fall back to local config.json."""
     cloud_cfg = await fetch_config_from_cloud()
@@ -527,6 +583,8 @@ async def lifespan(app: FastAPI):
         f"Config loaded: {len(config.get('dvrs', []))} DVRs, "
         f"{len(config.get('camera_mapping', {}))} camera mappings"
     )
+    # Sync face registrations from cloud DB (downloads images, computes encodings)
+    await sync_faces_from_cloud()
     # Pre-load registered faces into attendance engine
     attendance_engine.reload_faces()
     # Start WebSocket client in background
@@ -949,6 +1007,22 @@ async def register_face(
         return JSONResponse(result, status_code=400)
     # Reload known faces in the engine
     attendance_engine.reload_faces()
+    # Sync to cloud DB
+    cloud_synced = False
+    try:
+        agent_secret = os.environ.get("AGENT_SECRET", "")
+        headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{CLOUD_API_BASE}/api/face/register",
+                data={"person_id": person_id, "name": name, "role": role, "phone": phone, "angle": angle},
+                files={"image": ("face.jpg", image_bytes, "image/jpeg")},
+                headers=headers,
+            )
+            cloud_synced = resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"Failed to sync face to cloud: {e}")
+    result["cloud_synced"] = cloud_synced
     return result
 
 
