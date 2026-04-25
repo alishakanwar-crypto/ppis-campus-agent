@@ -9,6 +9,7 @@ Supports a test mode that only tracks a single person_id.
 import asyncio
 import io
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -260,6 +261,10 @@ class AttendanceEngine:
 
         # Try cloud bot WhatsApp API
         api_url = self.whatsapp_api_url or "https://app-reykyihf.fly.dev"
+        agent_secret = os.environ.get("AGENT_SECRET", "")
+        headers = {}
+        if agent_secret:
+            headers["X-Agent-Secret"] = agent_secret
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.post(
@@ -269,6 +274,7 @@ class AttendanceEngine:
                         "message": message,
                         "type": "attendance_notification",
                     },
+                    headers=headers,
                 )
                 if resp.status_code == 200:
                     db.update_whatsapp_sent(attendance_id)
