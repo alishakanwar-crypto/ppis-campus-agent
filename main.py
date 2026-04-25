@@ -969,7 +969,7 @@ async def delete_registered_face(person_id: str):
 @app.post("/api/attendance/start")
 async def start_attendance_monitoring(request: Request):
     """Start the face recognition attendance monitoring loop."""
-    body = await request.json() if request.headers.get("content-type") == "application/json" else {}
+    body = await request.json() if (request.headers.get("content-type") or "").startswith("application/json") else {}
 
     if attendance_engine.running:
         return {"status": "already_running"}
@@ -985,6 +985,7 @@ async def start_attendance_monitoring(request: Request):
     dvrs = config.get("dvrs", [])
 
     attendance_engine.reload_faces()
+    attendance_engine.running = True  # Set immediately to prevent duplicate starts
     attendance_engine._task = asyncio.create_task(
         attendance_engine.monitoring_loop(dvrs, entrance)
     )
