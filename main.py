@@ -185,15 +185,16 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
                     f"Snapshot failed from {ip} ch{channel}: "
                     f"HTTP {resp.status_code}, content-type={resp.headers.get('content-type', 'unknown')}"
                 )
-                # Try alternate URL format
-                alt_url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{channel}01/picture"
+                # Try alternate URL format (sub-stream: channel*100 + 2)
+                alt_stream = channel * 100 + 2
+                alt_url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{alt_stream}/picture"
                 resp2 = await client.get(alt_url, auth=httpx.DigestAuth(user, pwd))
                 if resp2.status_code == 200 and resp2.headers.get("content-type", "").startswith("image"):
-                    logger.info(f"Snapshot captured (alt URL): {len(resp2.content)} bytes")
+                    logger.info(f"Snapshot captured (sub-stream): {len(resp2.content)} bytes")
                     return resp2.content
 
-                # Try yet another format: /Streaming/channels/101/picture
-                alt_url2 = f"http://{ip}:{port}/Streaming/channels/{channel}01/picture"
+                # Try without /ISAPI prefix
+                alt_url2 = f"http://{ip}:{port}/Streaming/channels/{stream_channel}/picture"
                 resp3 = await client.get(alt_url2, auth=httpx.DigestAuth(user, pwd))
                 if resp3.status_code == 200 and resp3.headers.get("content-type", "").startswith("image"):
                     logger.info(f"Snapshot captured (alt2 URL): {len(resp3.content)} bytes")
