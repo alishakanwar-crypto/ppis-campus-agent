@@ -279,30 +279,54 @@ class AttendanceEngine:
     async def _send_whatsapp_notification(self, attendance_id: int,
                                            name: str, time_str: str,
                                            phone: str):
-        """Send WhatsApp attendance notification via cloud bot API."""
-        message = f"[Attendance] {name} has arrived at {time_str}."
+        """Send WhatsApp attendance notification via cloud bot API.
 
-        # Try cloud bot WhatsApp API
+        Tries template message first (works without 24-hour window),
+        falls back to plain text message.
+        """
         api_url = self.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
         agent_secret = os.environ.get("AGENT_SECRET", "")
         headers = {}
         if agent_secret:
             headers["X-Agent-Secret"] = agent_secret
+
+        sent = False
         try:
             async with httpx.AsyncClient(timeout=15) as client:
+                # Try template message first (no 24-hour window needed)
                 resp = await client.post(
                     f"{api_url}/api/send-whatsapp",
                     json={
                         "phone": phone,
-                        "message": message,
-                        "type": "attendance_notification",
+                        "template_name": "ppis_attendance_alert",
+                        "template_params": [name, time_str],
                     },
                     headers=headers,
                 )
                 if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("status") == "ok":
+                        sent = True
+
+                # Fallback to plain text if template failed
+                if not sent:
+                    message = f"[Attendance] {name} has arrived at {time_str}."
+                    resp = await client.post(
+                        f"{api_url}/api/send-whatsapp",
+                        json={
+                            "phone": phone,
+                            "message": message,
+                            "type": "attendance_notification",
+                        },
+                        headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        sent = True
+
+                if sent:
                     db.update_whatsapp_sent(attendance_id)
                     self.add_debug_log("whatsapp_sent",
-                                       f"Notification sent to {phone}: {message}")
+                                       f"Notification sent to {phone} for {name} at {time_str}")
                 else:
                     self.add_debug_log("whatsapp_failed",
                                        f"API returned {resp.status_code}: {resp.text[:200]}")
