@@ -104,9 +104,6 @@ class AttendanceEngine:
         try:
             if Image is not None and dlib is not None:
                 pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                max_dim = 800
-                if max(pil_img.size) > max_dim:
-                    pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
                     pil_img.save(f, format="JPEG", quality=95)
                     tmp_path = f.name
@@ -120,11 +117,13 @@ class AttendanceEngine:
             if tmp_path:
                 Path(tmp_path).unlink(missing_ok=True)
 
-        face_locations = face_recognition.face_locations(img_array, model="hog")
+        # Upsample 2x to detect smaller/distant faces from security cameras
+        face_locations = face_recognition.face_locations(
+            img_array, model="hog", number_of_times_to_upsample=2)
 
         if not face_locations:
             self.add_debug_log("no_face_detected",
-                               f"No faces in frame from {camera_source}")
+                               f"No faces in frame ({img_array.shape[1]}x{img_array.shape[0]}) from {camera_source}")
             return []
 
         self.add_debug_log("face_detected",
