@@ -481,7 +481,7 @@ async def websocket_client():
             logger.warning(f"WebSocket closed: {e}. Reconnecting in 5s...")
             ws_connection = None
         except Exception as e:
-            logger.error(f"WebSocket error: {e}. Reconnecting in 10s...")
+            logger.error(f"WebSocket error: {e}. Reconnecting in 5s...")
             ws_connection = None
 
         await asyncio.sleep(5)
@@ -649,10 +649,13 @@ async def save_dvr_config(request: Request):
     # Sync to cloud DB
     cloud_synced = False
     try:
+        agent_secret = os.environ.get("AGENT_SECRET", "")
+        headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 f"{CLOUD_API_BASE}/api/agent-config/dvrs",
                 json={"dvrs": dvrs},
+                headers=headers,
             )
             cloud_synced = resp.status_code == 200
     except Exception as e:
@@ -849,7 +852,7 @@ def _build_classroom_mapping(raw_mapping: dict) -> dict:
             "channel": best["channel"],
             "description": best["description"],
             "all_cameras": [
-                {"name": c["cam_name"], "channel": c["channel"], "dvr_index": c["dvr_index"]}
+                {"name": c["cam_name"], "channel": c["channel"], "dvr_index": c["dvr_index"], "description": c.get("description", "")}
                 for c in cameras
             ],
         }
@@ -959,10 +962,13 @@ async def save_mapping(request: Request):
     # Sync to cloud DB
     cloud_synced = False
     try:
+        agent_secret = os.environ.get("AGENT_SECRET", "")
+        headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
                 f"{CLOUD_API_BASE}/api/agent-config/camera-mapping",
                 json={"camera_mapping": mapping},
+                headers=headers,
             )
             cloud_synced = resp.status_code == 200
     except Exception as e:
