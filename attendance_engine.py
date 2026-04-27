@@ -299,6 +299,15 @@ class AttendanceEngine:
                     self.add_debug_log("face_unknown",
                                        f"Unregistered face in {camera_source}",
                                        confidence=0.0)
+                    # Save snapshot for manual review
+                    try:
+                        ts = int(time.time())
+                        snap_path = str(ATTENDANCE_SNAPSHOTS_DIR / f"unknown_{ts}_{i}.jpg")
+                        with open(snap_path, "wb") as f:
+                            f.write(image_bytes)
+                        db.log_unrecognized_face(camera_source, 0.0, snap_path)
+                    except Exception:
+                        pass
 
         return results
 

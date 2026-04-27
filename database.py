@@ -89,6 +89,15 @@ def init_db():
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS unrecognized_faces (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                camera_source TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                snapshot_path TEXT NOT NULL DEFAULT '',
+                reviewed   INTEGER NOT NULL DEFAULT 0,
+                detected_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
         """)
         conn.commit()
         logger.info(f"Database initialized at {DB_PATH}")
@@ -510,6 +519,41 @@ def get_today_attendance_summary() -> list[dict]:
             "FROM attendance_log WHERE date(logged_at) = date('now') "
             "GROUP BY camera_source ORDER BY student_count DESC"
         ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def log_unrecognized_face(camera_source: str, confidence: float,
+                          snapshot_path: str) -> int:
+    conn = get_conn()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO unrecognized_faces "
+            "(camera_source, confidence, snapshot_path) VALUES (?, ?, ?)",
+            (camera_source, confidence, snapshot_path),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_unrecognized_faces(limit: int = 50, unreviewed_only: bool = True) -> list[dict]:
+    conn = get_conn()
+    try:
+        if unreviewed_only:
+            rows = conn.execute(
+                "SELECT id, camera_source, confidence, snapshot_path, reviewed, detected_at "
+                "FROM unrecognized_faces WHERE reviewed = 0 ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, camera_source, confidence, snapshot_path, reviewed, detected_at "
+                "FROM unrecognized_faces ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()

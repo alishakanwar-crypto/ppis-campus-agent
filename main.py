@@ -1201,6 +1201,13 @@ async def get_today_summary():
     }
 
 
+@app.get("/api/attendance/unrecognized")
+async def get_unrecognized_faces(limit: int = 50, all: bool = False):
+    """Get unrecognized faces flagged for manual review."""
+    import database as db_mod
+    return db_mod.get_unrecognized_faces(limit=limit, unreviewed_only=not all)
+
+
 # ---------------------------------------------------------------------------
 # Dashboard HTML (embedded for simplicity — no external templates needed)
 # ---------------------------------------------------------------------------
