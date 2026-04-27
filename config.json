@@ -1,8 +1,8 @@
 {
-  "cloud_bot_url": "wss://app-reykyihf.fly.dev/ws/agent",
+  "cloud_bot_url": "wss://app-atbudhiw.fly.dev/ws/agent",
   "agent_secret": "",
   "dvrs": [],
   "camera_mapping": {},
   "snapshot_dir": "snapshots",
-  "local_port": 8899
+  "local_port": 8898
 }
