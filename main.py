@@ -1073,6 +1073,84 @@ async def start_attendance_monitoring(request: Request):
     }
 
 
+@app.post("/api/attendance/start-classwise")
+async def start_classwise_monitoring(request: Request):
+    """Start classroom-wise face recognition on ALL classroom cameras.
+
+    Each camera only checks students assigned to that class.
+    Entry gate cameras check ALL registered faces.
+    """
+    body = await request.json() if (request.headers.get("content-type") or "").startswith("application/json") else {}
+
+    if attendance_engine.classwise_running:
+        return {"status": "already_running"}
+    if attendance_engine.running:
+        return {"status": "error", "error": "Single-camera monitoring is running. Stop it first."}
+
+    attendance_engine.test_mode = False  # Classwise mode is always production
+    attendance_engine.confidence_threshold = body.get("confidence_threshold", 0.40)
+    attendance_engine.scan_interval = body.get("scan_interval", 3.0)
+
+    dvrs = config.get("dvrs", [])
+    camera_mapping = config.get("camera_mapping", {})
+
+    if not dvrs:
+        return {"status": "error", "error": "No DVRs configured"}
+    if not camera_mapping:
+        return {"status": "error", "error": "No camera mapping loaded"}
+
+    cameras = attendance_engine.build_classroom_camera_list(camera_mapping, dvrs)
+    classroom_cams = [c for c in cameras if c["grade"] is not None]
+    gate_cams = [c for c in cameras if c["grade"] is None]
+
+    attendance_engine.reload_faces()
+    attendance_engine.classwise_running = True
+    attendance_engine._classwise_task = asyncio.create_task(
+        attendance_engine.classwise_monitoring_loop(dvrs, camera_mapping)
+    )
+
+    return {
+        "status": "started",
+        "classroom_cameras": len(classroom_cams),
+        "gate_cameras": len(gate_cams),
+        "total_faces": len(attendance_engine.known_faces),
+        "grades_with_faces": len(attendance_engine._grade_face_cache),
+        "config": attendance_engine.get_status(),
+    }
+
+
+@app.get("/api/attendance/classwise-cameras")
+async def list_classwise_cameras():
+    """List all classroom cameras with their grade assignments."""
+    dvrs = config.get("dvrs", [])
+    camera_mapping = config.get("camera_mapping", {})
+    cameras = attendance_engine.build_classroom_camera_list(camera_mapping, dvrs)
+
+    grade_face_counts = {
+        g: len(v) for g, v in attendance_engine._grade_face_cache.items()
+    }
+
+    result = []
+    for cam in cameras:
+        grade = cam["grade"]
+        result.append({
+            "location": cam["location"],
+            "grade": grade,
+            "dvr_index": cam["dvr_index"],
+            "channel": cam["channel"],
+            "label": cam["label"],
+            "faces_for_grade": grade_face_counts.get(grade, 0) if grade else len(attendance_engine.known_faces),
+            "is_gate": grade is None,
+        })
+
+    return {
+        "cameras": result,
+        "total_classroom": sum(1 for c in result if not c["is_gate"]),
+        "total_gate": sum(1 for c in result if c["is_gate"]),
+        "grades_with_faces": grade_face_counts,
+    }
+
+
 @app.post("/api/attendance/stop")
 async def stop_attendance_monitoring():
     """Stop attendance monitoring."""
@@ -1110,6 +1188,16 @@ async def recognize_single_image(image: UploadFile = File(...)):
     return {
         "results": results,
         "debug_logs": attendance_engine.get_debug_logs(20),
+    }
+
+
+@app.get("/api/attendance/today-summary")
+async def get_today_summary():
+    """Get today's attendance summary grouped by classroom."""
+    import database as db_mod
+    return {
+        "total_marked": db_mod.get_today_attendance_count(),
+        "by_classroom": db_mod.get_today_attendance_summary(),
     }
 
 
@@ -1225,6 +1313,30 @@ button.danger { background: #e53935; }
             <button onclick="startAttendance()" style="background:#43a047">Start Monitoring</button>
             <button onclick="stopAttendance()" class="danger" style="margin-left:8px">Stop</button>
             <button onclick="refreshAttStatus()" style="margin-left:8px">Refresh Status</button>
+        </div>
+
+        <div class="card" style="border-left:4px solid #1565c0;background:#e3f2fd">
+            <h3 style="color:#1565c0">Classroom-wise Attendance (All Cameras)</h3>
+            <p style="margin-bottom:12px;color:#555">
+                Scan ALL classroom cameras simultaneously. Each camera only checks students assigned to that class.
+                Entry gate cameras check all registered faces.
+            </p>
+            <div class="form-row">
+                <label>Confidence:</label>
+                <input type="number" id="cw-threshold" value="40" min="20" max="100" step="1">%
+            </div>
+            <button onclick="startClasswise()" style="background:#1565c0;color:white">
+                Start All Classrooms
+            </button>
+            <button onclick="stopAttendance()" class="danger" style="margin-left:8px">Stop All</button>
+            <button onclick="loadClasswiseCameras()" style="margin-left:8px">View Camera List</button>
+            <div id="classwise-status" style="margin-top:12px;font-family:monospace;font-size:13px;white-space:pre-wrap;background:#fff;padding:12px;border-radius:6px;display:none"></div>
+            <div id="classwise-cameras" style="margin-top:12px;display:none">
+                <table class="mapping-table">
+                    <thead><tr><th>Location</th><th>Grade</th><th>DVR</th><th>Channel</th><th>Faces</th><th>Type</th></tr></thead>
+                    <tbody id="cw-cameras-body"></tbody>
+                </table>
+            </div>
         </div>
 
         <div class="card">
@@ -1602,12 +1714,28 @@ async function refreshAttStatus() {
         const resp = await fetch('/api/attendance/status');
         const data = await resp.json();
         const el = document.getElementById('att-status');
-        if (data.running) {
+        if (data.classwise_running) {
+            el.textContent = 'CLASSWISE RUNNING (' + data.registered_persons + ' persons, ' + data.grades_with_faces + ' grades, ' + data.attendance_marked_today + ' marked today)';
+            el.style.color = '#1565c0';
+            // Update classwise status panel
+            const cwEl = document.getElementById('classwise-status');
+            cwEl.style.display = 'block';
+            const s = data.classwise_stats || {};
+            cwEl.innerHTML = '<b>Status:</b> RUNNING<br>' +
+                '<b>Cameras:</b> ' + s.total_cameras + '<br>' +
+                '<b>Current:</b> ' + (s.current_camera || '-') + '<br>' +
+                '<b>Cycle:</b> #' + s.cycle_count + ' (' + s.last_cycle_duration + 's)<br>' +
+                '<b>Faces detected:</b> ' + s.faces_detected_total + '<br>' +
+                '<b>Attendance today:</b> ' + s.attendance_marked_today + '<br>' +
+                '<b>Errors:</b> ' + s.errors;
+        } else if (data.running) {
             el.textContent = 'Running (' + data.registered_persons + ' persons, ' + data.total_encodings + ' encodings)';
             el.style.color = '#43a047';
+            document.getElementById('classwise-status').style.display = 'none';
         } else {
             el.textContent = 'Stopped';
             el.style.color = '#e53935';
+            document.getElementById('classwise-status').style.display = 'none';
         }
     } catch(e) {}
 }
@@ -1660,6 +1788,33 @@ async function testRecognize() {
         output += '[' + l.event + '] ' + l.details + '\\n';
     });
     el.textContent = output;
+}
+
+// --- Classwise Monitoring ---
+async function startClasswise() {
+    const body = {
+        confidence_threshold: parseInt(document.getElementById('cw-threshold').value) / 100.0,
+    };
+    const resp = await fetch('/api/attendance/start-classwise', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const data = await resp.json();
+    if (data.status === 'started') {
+        showAlert('Classwise monitoring started: ' + data.classroom_cameras + ' classrooms + ' + data.gate_cameras + ' gates, ' + data.total_faces + ' faces', 'success');
+    } else {
+        showAlert('Classwise: ' + (data.error || data.status), 'error');
+    }
+    refreshAttStatus();
+}
+
+async function loadClasswiseCameras() {
+    const resp = await fetch('/api/attendance/classwise-cameras');
+    const data = await resp.json();
+    const tbody = document.getElementById('cw-cameras-body');
+    tbody.innerHTML = '';
+    (data.cameras || []).forEach(c => {
+        tbody.innerHTML += '<tr><td>' + c.location + '</td><td>' + (c.grade || 'ALL') + '</td><td>DVR ' + (c.dvr_index + 1) + '</td><td>' + c.channel + '</td><td>' + c.faces_for_grade + '</td><td>' + (c.is_gate ? 'Entry Gate' : 'Classroom') + '</td></tr>';
+    });
+    document.getElementById('classwise-cameras').style.display = 'block';
+    showAlert('Found ' + data.total_classroom + ' classroom cameras + ' + data.total_gate + ' entry gate cameras', 'info');
 }
 
 // --- Init ---

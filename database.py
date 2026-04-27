@@ -473,6 +473,48 @@ def get_last_attendance(person_id: str) -> dict | None:
         conn.close()
 
 
+def is_attendance_marked_today(person_id: str) -> bool:
+    """Check if a student already has attendance for today."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT id FROM attendance_log "
+            "WHERE person_id = ? AND date(logged_at) = date('now') LIMIT 1",
+            (person_id,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def get_today_attendance_count() -> int:
+    """Get count of unique students marked today."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT person_id) as cnt "
+            "FROM attendance_log WHERE date(logged_at) = date('now')"
+        ).fetchone()
+        return row["cnt"] if row else 0
+    finally:
+        conn.close()
+
+
+def get_today_attendance_summary() -> list[dict]:
+    """Get attendance summary for today grouped by camera/classroom."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT camera_source, COUNT(DISTINCT person_id) as student_count, "
+            "MIN(logged_at) as first_at, MAX(logged_at) as last_at "
+            "FROM attendance_log WHERE date(logged_at) = date('now') "
+            "GROUP BY camera_source ORDER BY student_count DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def get_attendance_setting(key: str, default: str = "") -> str:
     conn = get_conn()
     try:
