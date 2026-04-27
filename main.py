@@ -81,7 +81,7 @@ def load_config_local() -> dict:
         "dvrs": [],
         "camera_mapping": {},
         "snapshot_dir": "snapshots",
-        "local_port": 8899,
+        "local_port": 8897,
     }
 
 
@@ -158,7 +158,7 @@ async def load_config() -> dict:
             "agent_secret": cloud_cfg.get("agent_secret", os.environ.get("AGENT_SECRET", "")),
             "dvrs": cloud_cfg.get("dvrs", []),
             "camera_mapping": cloud_cfg.get("camera_mapping", {}),
-            "local_port": int(cloud_cfg.get("settings", {}).get("local_port", 8899)),
+            "local_port": int(cloud_cfg.get("settings", {}).get("local_port", 8897)),
         }
         # Cache locally for offline fallback
         save_config(cfg)
@@ -1709,6 +1709,6 @@ setInterval(async () => {
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    port = config.get("local_port", 8899)
+    port = config.get("local_port", 8897)
     logger.info(f"Starting PPIS Campus Agent on http://localhost:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)

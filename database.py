@@ -338,7 +338,7 @@ def load_config_from_db() -> dict:
     return {
         "cloud_bot_url": get_setting("cloud_bot_url", "wss://app-itszlsnn.fly.dev/ws/agent"),
         "agent_secret": get_setting("agent_secret", os.environ.get("AGENT_SECRET", "")),
-        "local_port": int(get_setting("local_port", "8899")),
+        "local_port": int(get_setting("local_port", "8897")),
         "dvrs": get_dvrs(),
         "camera_mapping": get_camera_mapping(),
     }
