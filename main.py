@@ -663,8 +663,7 @@ async def save_dvr_config(request: Request):
 @app.post("/api/dvr/test/{dvr_index}")
 async def test_dvr(dvr_index: int):
     """Test connection to a specific DVR."""
-    cfg = load_config()
-    dvrs = cfg.get("dvrs", [])
+    dvrs = config.get("dvrs", [])
     if dvr_index < 0 or dvr_index >= len(dvrs):
         return JSONResponse({"status": "error", "error": "Invalid DVR index"}, status_code=400)
     result = await test_dvr_connection(dvrs[dvr_index])
@@ -925,11 +924,8 @@ async def upload_mapping(file: UploadFile = File(...)):
                     "description": desc or classroom,
                 }
 
-        cfg = load_config()
-        cfg["camera_mapping"] = mapping
-        save_config(cfg)
-        global config
-        config = cfg
+        config["camera_mapping"] = mapping
+        save_config(config)
 
         # Separate classroom cameras from non-classroom cameras for display
         classroom_keys = [k for k in mapping if any(
