@@ -1558,7 +1558,7 @@ async function loadRegistered() {
     const tbody = document.getElementById('registered-body');
     tbody.innerHTML = '';
     data.forEach(p => {
-        tbody.innerHTML += '<tr><td>' + p.person_id + '</td><td>' + p.name + '</td><td>' + p.role + '</td><td>' + p.phone + '</td><td>' + p.face_count + '</td><td>' + (p.angles||'') + '</td><td><button class="danger" onclick="deletePerson(\'' + p.person_id + '\')">Delete</button></td></tr>';
+        tbody.innerHTML += '<tr><td>' + p.person_id + '</td><td>' + p.name + '</td><td>' + p.role + '</td><td>' + p.phone + '</td><td>' + p.face_count + '</td><td>' + (p.angles||'') + '</td><td><button class="danger" onclick="deletePerson(\\'' + p.person_id + '\\')">Delete</button></td></tr>';
     });
 }
 
