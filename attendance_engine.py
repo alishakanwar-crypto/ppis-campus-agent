@@ -10,12 +10,18 @@ import asyncio
 import io
 import logging
 import os
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
 import numpy as np
+
+try:
+    import dlib
+except ImportError:
+    dlib = None
 
 try:
     import cv2
@@ -93,11 +99,26 @@ class AttendanceEngine:
             self.add_debug_log("error", "face_recognition library not available")
             return []
 
+        # Use dlib native file loader to avoid numpy ABI issues on Windows
+        tmp_path = None
         try:
-            img_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
+            if Image is not None and dlib is not None:
+                pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                max_dim = 800
+                if max(pil_img.size) > max_dim:
+                    pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                    pil_img.save(f, format="JPEG", quality=95)
+                    tmp_path = f.name
+                img_array = dlib.load_rgb_image(tmp_path)
+            else:
+                img_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
         except Exception as e:
             self.add_debug_log("error", f"Failed to load image: {e}")
             return []
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
 
         face_locations = face_recognition.face_locations(img_array, model="hog")
 
