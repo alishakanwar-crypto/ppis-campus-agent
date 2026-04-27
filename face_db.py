@@ -39,14 +39,23 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
         logger.error("face_recognition library not installed")
         return None
 
-    # Use PIL to force RGB conversion and ensure C-contiguous array for dlib
+    # Use PIL to force RGB conversion, resize large images, and ensure
+    # C-contiguous uint8 array (some Windows dlib builds reject large images)
     if Image is not None:
         pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        max_dim = 800
+        if max(pil_img.size) > max_dim:
+            pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
         img_array = np.ascontiguousarray(np.array(pil_img, dtype=np.uint8))
     else:
         img_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
-    logger.info(f"Image loaded: shape={img_array.shape}, dtype={img_array.dtype}, contiguous={img_array.flags['C_CONTIGUOUS']}")
-    face_locations = face_recognition.face_locations(img_array, model="hog")
+    logger.info(f"Image ready: shape={img_array.shape}, dtype={img_array.dtype}")
+    try:
+        face_locations = face_recognition.face_locations(img_array, model="hog")
+    except Exception as e:
+        logger.error(f"face_locations failed: {e}")
+        raise
+    logger.info(f"face_locations found: {len(face_locations)}")
 
     if not face_locations:
         logger.warning("No face detected in image")
