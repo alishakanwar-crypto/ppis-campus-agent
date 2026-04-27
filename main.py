@@ -289,8 +289,8 @@ async def test_dvr_connection(dvr: dict) -> dict:
         return {"status": "error", "ip": ip, "error": str(e)}
 
 
-def find_camera_for_classroom(classroom: str) -> tuple[dict, int] | None:
-    """Look up the DVR and channel number for a given classroom (returns best/first camera)."""
+def find_camera_for_classroom(classroom: str) -> tuple[dict, int, str] | None:
+    """Look up the DVR, channel number, and description for a given classroom (returns best/first camera)."""
     result = find_all_cameras_for_classroom(classroom)
     if result:
         return result[0]  # Return first (best) camera
@@ -680,7 +680,7 @@ async def take_snapshot(classroom: str):
             status_code=404,
         )
 
-    dvr, channel = result
+    dvr, channel, _desc = result
     snapshot = await capture_snapshot(dvr, channel)
     if not snapshot:
         return JSONResponse(
