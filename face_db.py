@@ -39,12 +39,13 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
         logger.error("face_recognition library not installed")
         return None
 
-    # Use PIL to force RGB conversion (avoids dlib format issues on some platforms)
+    # Use PIL to force RGB conversion and ensure C-contiguous array for dlib
     if Image is not None:
         pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_array = np.array(pil_img)
+        img_array = np.ascontiguousarray(np.array(pil_img, dtype=np.uint8))
     else:
         img_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
+    logger.info(f"Image loaded: shape={img_array.shape}, dtype={img_array.dtype}, contiguous={img_array.flags['C_CONTIGUOUS']}")
     face_locations = face_recognition.face_locations(img_array, model="hog")
 
     if not face_locations:
