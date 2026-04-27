@@ -39,10 +39,12 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
         logger.error("face_recognition library not installed")
         return None
 
-    img_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
-    # Convert RGBA to RGB if needed (dlib requires 8-bit gray or RGB)
-    if img_array.ndim == 3 and img_array.shape[2] == 4:
-        img_array = img_array[:, :, :3]
+    # Use PIL to force RGB conversion (avoids dlib format issues on some platforms)
+    if Image is not None:
+        pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img_array = np.array(pil_img)
+    else:
+        img_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
     face_locations = face_recognition.face_locations(img_array, model="hog")
 
     if not face_locations:
