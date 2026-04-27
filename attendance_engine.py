@@ -411,18 +411,21 @@ class AttendanceEngine:
             "camera_source": camera_source,
         }
 
-        # Trigger WhatsApp notification asynchronously
+        # Trigger WhatsApp notification to ALL parent phones asynchronously
         if phone:
-            task = asyncio.create_task(
-                self._send_whatsapp_notification(
-                    attendance_id=attendance_id,
-                    name=name,
-                    time_str=time_str,
-                    phone=phone,
+            # phone may be comma-separated (e.g. "91XXXXXXXXXX,91YYYYYYYYYY")
+            phone_list = [p.strip() for p in phone.split(",") if p.strip()]
+            for parent_phone in phone_list:
+                task = asyncio.create_task(
+                    self._send_whatsapp_notification(
+                        attendance_id=attendance_id,
+                        name=name,
+                        time_str=time_str,
+                        phone=parent_phone,
+                    )
                 )
-            )
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
 
         return result
 
