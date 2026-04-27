@@ -576,6 +576,9 @@ class AttendanceEngine:
                                      dvrs: list[dict]) -> list[dict]:
         """Build list of classroom cameras with their DVR configs and grade.
 
+        Each classroom may have multiple cameras (C1, C2). This includes
+        ALL camera feeds per classroom from the all_cameras field.
+
         Returns list of dicts:
             {
                 "location": "GRADE 3C",
@@ -584,44 +587,77 @@ class AttendanceEngine:
                 "channel": 13,
                 "dvr": {...},
                 "label": "GRADE 3C (DVR 2 Ch 13)",
+                "is_gate": False,
             }
         """
         cameras = []
+        seen = set()  # (dvr_index, channel) to avoid duplicates
+
         for location, cam_data in camera_mapping.items():
             grade = _extract_grade_from_location(location)
             if grade is None:
                 continue  # Not a classroom camera
 
-            dvr_idx = cam_data.get("dvr_index", 0)
-            channel = cam_data.get("channel", 1)
-
-            if dvr_idx >= len(dvrs):
-                logger.warning(f"DVR index {dvr_idx} out of range for {location}")
-                continue
-
-            cameras.append({
-                "location": location,
-                "grade": grade,
-                "dvr_index": dvr_idx,
-                "channel": channel,
-                "dvr": dvrs[dvr_idx],
-                "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
-            })
-
-        # Also include entry gate cameras (check ALL faces)
-        for location, cam_data in camera_mapping.items():
-            loc_upper = location.upper()
-            if "ENTRY" in loc_upper or "GATE" in loc_upper or "ENTRANCE" in loc_upper:
-                dvr_idx = cam_data.get("dvr_index", 0)
-                channel = cam_data.get("channel", 1)
-                if dvr_idx < len(dvrs):
+            # Add ALL cameras for this classroom (C1, C2, etc.)
+            all_cams = cam_data.get("all_cameras", [])
+            if all_cams:
+                for ac in all_cams:
+                    dvr_idx = ac.get("dvr_index", 0)
+                    channel = ac.get("channel", 1)
+                    key = (dvr_idx, channel)
+                    if key in seen or dvr_idx >= len(dvrs):
+                        continue
+                    seen.add(key)
+                    desc = ac.get("description", location)
                     cameras.append({
                         "location": location,
-                        "grade": None,  # Check ALL faces
+                        "grade": grade,
                         "dvr_index": dvr_idx,
                         "channel": channel,
                         "dvr": dvrs[dvr_idx],
                         "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
+                        "is_gate": False,
+                    })
+            else:
+                dvr_idx = cam_data.get("dvr_index", 0)
+                channel = cam_data.get("channel", 1)
+                key = (dvr_idx, channel)
+                if key in seen or dvr_idx >= len(dvrs):
+                    continue
+                seen.add(key)
+                cameras.append({
+                    "location": location,
+                    "grade": grade,
+                    "dvr_index": dvr_idx,
+                    "channel": channel,
+                    "dvr": dvrs[dvr_idx],
+                    "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
+                    "is_gate": False,
+                })
+
+        # Also include entry gate cameras (check ALL faces)
+        _GATE_KEYWORDS = {"ENTRY", "ENTRANCE", "DISPERSAL"}
+        for location, cam_data in camera_mapping.items():
+            loc_upper = location.upper()
+            # Only match actual entry gates, not PARK GATE or other park cameras
+            if any(kw in loc_upper for kw in _GATE_KEYWORDS):
+                all_cams = cam_data.get("all_cameras", [])
+                cams_to_add = all_cams if all_cams else [cam_data]
+                for ac in cams_to_add:
+                    dvr_idx = ac.get("dvr_index", 0)
+                    channel = ac.get("channel", 1)
+                    key = (dvr_idx, channel)
+                    if key in seen or dvr_idx >= len(dvrs):
+                        continue
+                    seen.add(key)
+                    cameras.append({
+                        "location": location,
+                        "grade": None,  # Check ALL faces at gates
+                        "dvr_index": dvr_idx,
+                        "channel": channel,
+                        "dvr": dvrs[dvr_idx],
+                        "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
+                        "is_gate": True,
                     })
 
         return cameras

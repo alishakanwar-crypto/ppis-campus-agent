@@ -1140,7 +1140,7 @@ async def list_classwise_cameras():
             "channel": cam["channel"],
             "label": cam["label"],
             "faces_for_grade": grade_face_counts.get(grade, 0) if grade else len(attendance_engine.known_faces),
-            "is_gate": grade is None,
+            "is_gate": cam.get("is_gate", grade is None),
         })
 
     return {
