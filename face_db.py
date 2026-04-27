@@ -40,6 +40,9 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
         return None
 
     img_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
+    # Convert RGBA to RGB if needed (dlib requires 8-bit gray or RGB)
+    if img_array.ndim == 3 and img_array.shape[2] == 4:
+        img_array = img_array[:, :, :3]
     face_locations = face_recognition.face_locations(img_array, model="hog")
 
     if not face_locations:
