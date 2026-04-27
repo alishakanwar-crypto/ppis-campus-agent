@@ -62,6 +62,9 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
                 f.write(image_bytes)
                 tmp_path = f.name
             img_array = face_recognition.load_image_file(tmp_path)
+    except Exception as e:
+        logger.error(f"Failed to load image: {e}")
+        return None
     finally:
         if tmp_path:
             Path(tmp_path).unlink(missing_ok=True)
