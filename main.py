@@ -589,7 +589,7 @@ async def _auto_start_classwise():
         return
 
     attendance_engine.test_mode = False
-    attendance_engine.confidence_threshold = 0.10
+    attendance_engine.confidence_threshold = 0.30
     attendance_engine.reload_faces()
     attendance_engine.classwise_running = True
     attendance_engine._classwise_task = asyncio.create_task(
@@ -620,7 +620,7 @@ async def _health_watchdog():
                         logger.warning("WATCHDOG: Classwise monitoring stopped — restarting")
                         attendance_engine._health["total_recoveries"] += 1
                         attendance_engine.test_mode = False
-                        attendance_engine.confidence_threshold = 0.10
+                        attendance_engine.confidence_threshold = 0.30
                         attendance_engine.reload_faces()
                         attendance_engine.classwise_running = True
                         attendance_engine._classwise_task = asyncio.create_task(
@@ -1168,7 +1168,7 @@ async def start_attendance_monitoring(request: Request):
     # Configure engine
     attendance_engine.test_mode = body.get("test_mode", True)
     attendance_engine.test_person_id = body.get("test_person_id", "TEST001")
-    attendance_engine.confidence_threshold = body.get("confidence_threshold", 0.10)
+    attendance_engine.confidence_threshold = body.get("confidence_threshold", 0.30)
     attendance_engine.scan_interval = body.get("scan_interval", 3.0)
     attendance_engine.whatsapp_phone = body.get("whatsapp_phone", "")
 
@@ -1202,7 +1202,7 @@ async def start_classwise_monitoring(request: Request):
         return {"status": "error", "error": "Single-camera monitoring is running. Stop it first."}
 
     attendance_engine.test_mode = False  # Classwise mode is always production
-    attendance_engine.confidence_threshold = body.get("confidence_threshold", 0.10)
+    attendance_engine.confidence_threshold = body.get("confidence_threshold", 0.30)
     attendance_engine.scan_interval = body.get("scan_interval", 3.0)
 
     dvrs = config.get("dvrs", [])
