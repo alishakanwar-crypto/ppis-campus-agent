@@ -54,6 +54,12 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Attendance time window (7:15 AM to 8:00 AM)
+ATTENDANCE_START_HOUR = 7
+ATTENDANCE_START_MINUTE = 15
+ATTENDANCE_END_HOUR = 8
+ATTENDANCE_END_MINUTE = 0
+
 # Grade pattern to extract grade from camera location names
 _GRADE_RE = re.compile(
     r"(?:GRADE\s*(\d+[A-Z]?))"
@@ -125,6 +131,7 @@ class AttendanceEngine:
         self.known_faces: dict = {}
         self.last_attendance: dict[str, float] = {}  # person_id -> timestamp
         self.daily_marked: dict[str, str] = {}  # person_id -> date string
+        self._notification_sent: dict[str, str] = {}  # person_id -> date (dedup notifications)
         self.debug_logs: list[dict] = []
         self.max_debug_logs = 500
         self.scan_interval = 3.0  # seconds between scans
@@ -361,12 +368,34 @@ class AttendanceEngine:
 
         return best_match
 
+    def _is_within_attendance_window(self) -> bool:
+        """Check if the current time is within the attendance window."""
+        now = datetime.now()
+        start = now.replace(hour=ATTENDANCE_START_HOUR, minute=ATTENDANCE_START_MINUTE,
+                            second=0, microsecond=0)
+        end = now.replace(hour=ATTENDANCE_END_HOUR, minute=ATTENDANCE_END_MINUTE,
+                          second=0, microsecond=0)
+        return start <= now <= end
+
+    def _is_notification_sent_today(self, person_id: str) -> bool:
+        """Check if notification was already sent for this person today."""
+        today = date.today().isoformat()
+        return self._notification_sent.get(person_id) == today
+
+    def _mark_notification_sent(self, person_id: str):
+        """Record that notification was sent for this person today."""
+        self._notification_sent[person_id] = date.today().isoformat()
+
     def _process_attendance(self, person_id: str, name: str, phone: str,
                             confidence: float, image_bytes: bytes,
                             face_location: tuple,
                             camera_source: str) -> dict | None:
-        """Process an attendance detection: check cooldown/daily dedup, log, and notify."""
+        """Process an attendance detection: check time window, cooldown/daily dedup, log, and notify."""
         now = time.time()
+
+        # Time window check: only mark attendance between 7:15 AM and 8:00 AM
+        if not self._is_within_attendance_window():
+            return None
 
         # Daily dedup: one entry per student per day
         if self._is_already_marked_today(person_id):
@@ -424,9 +453,9 @@ class AttendanceEngine:
             "camera_source": camera_source,
         }
 
-        # Trigger WhatsApp notification to ALL parent phones asynchronously
-        if phone:
-            # phone may be comma-separated (e.g. "91XXXXXXXXXX,91YYYYYYYYYY")
+        # Send WhatsApp notification ONCE per student per day
+        if phone and not self._is_notification_sent_today(person_id):
+            self._mark_notification_sent(person_id)
             phone_list = [p.strip() for p in phone.split(",") if p.strip()]
             for parent_phone in phone_list:
                 task = asyncio.create_task(
@@ -476,7 +505,7 @@ class AttendanceEngine:
 
                 # Fallback to plain text if template failed
                 if not sent:
-                    message = f"[Attendance] {name} has arrived at {time_str}."
+                    message = f"Your child {name} has been marked present today at {time_str}."
                     resp = await client.post(
                         f"{api_url}/api/send-whatsapp",
                         json={
@@ -744,10 +773,11 @@ class AttendanceEngine:
                 if new_today != today:
                     today = new_today
                     self.daily_marked.clear()
+                    self._notification_sent.clear()
                     self._camera_errors.clear()
                     self._admin_alerted.clear()
                     self.add_debug_log("daily_reset",
-                                       f"New day {today}: cleared attendance marks")
+                                       f"New day {today}: cleared attendance marks and notifications")
 
                 # Periodically reload faces (picks up new registrations)
                 if cycle % 20 == 0:
