@@ -293,6 +293,13 @@ def load_known_faces(encoding_type: str = "face_recognition_128d") -> dict:
                 "phone": row["phone"],
                 "encodings": [],
             }
+        else:
+            # Keep the phone field with the most numbers (later registrations
+            # may include both parents while the first only had one)
+            existing = persons[pid]["phone"] or ""
+            incoming = row["phone"] or ""
+            if incoming.count(",") > existing.count(","):
+                persons[pid]["phone"] = incoming
         persons[pid]["encodings"].append(encoding)
 
     logger.info(f"Loaded {len(persons)} person(s) with "
