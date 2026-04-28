@@ -39,9 +39,18 @@ except ImportError:
     face_recognition = None
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageEnhance, ImageFilter
 except ImportError:
     Image = None
+    ImageEnhance = None
+    ImageFilter = None
+
+try:
+    from insightface.app import FaceAnalysis
+    _INSIGHTFACE_AVAILABLE = True
+except ImportError:
+    FaceAnalysis = None
+    _INSIGHTFACE_AVAILABLE = False
 
 import database as db
 import face_db
@@ -119,6 +128,44 @@ def _grade_from_person_id(person_id: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _preprocess_image(image_bytes: bytes) -> bytes:
+    """Enhance image quality for better face recognition.
+
+    Applies contrast enhancement, sharpening, and upscaling to
+    improve face detection on low-quality DVR snapshots.
+    """
+    if Image is None or ImageEnhance is None:
+        return image_bytes
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        # Upscale small images (DVR snapshots may be low-res)
+        min_dim = 1280
+        if img.width < min_dim and img.height < min_dim:
+            scale = min_dim / min(img.width, img.height)
+            new_w = int(img.width * scale)
+            new_h = int(img.height * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+
+        # Enhance contrast (helps with washed-out DVR images)
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.3)
+
+        # Enhance sharpness (compensates for JPEG compression)
+        enhancer = ImageEnhance.Sharpness(img)
+        img = enhancer.enhance(1.5)
+
+        # Slight brightness boost for dark indoor scenes
+        enhancer = ImageEnhance.Brightness(img)
+        img = enhancer.enhance(1.1)
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=95)
+        return buf.getvalue()
+    except Exception:
+        return image_bytes
+
+
 class AttendanceEngine:
     """Runs face recognition attendance monitoring."""
 
@@ -129,6 +176,7 @@ class AttendanceEngine:
         self.test_person_id = "TEST001"
         self.confidence_threshold = 0.10  # Match confidence > 10%
         self.known_faces: dict = {}
+        self.known_faces_insightface: dict = {}  # person_id -> {name, phone, embeddings: [...]}
         self.last_attendance: dict[str, float] = {}  # person_id -> timestamp
         self.daily_marked: dict[str, str] = {}  # person_id -> date string
         self._notification_sent: dict[str, str] = {}  # person_id -> date (dedup notifications)
@@ -140,6 +188,8 @@ class AttendanceEngine:
         self._task: asyncio.Task | None = None
         self._classwise_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
+        self.use_insightface = _INSIGHTFACE_AVAILABLE
+        self._insightface_app: "FaceAnalysis | None" = None
 
         # Classwise monitoring state
         self._classwise_stats: dict = {
@@ -155,6 +205,7 @@ class AttendanceEngine:
 
         # Cache: grade -> list of (person_id, person_data)
         self._grade_face_cache: dict[str, dict] = {}
+        self._grade_face_cache_insightface: dict[str, dict] = {}
 
         # Auto-recovery tracking
         self._camera_errors: dict[str, int] = {}  # cam_key -> consecutive errors
@@ -166,8 +217,31 @@ class AttendanceEngine:
             "uptime_start": datetime.now().isoformat(),
             "total_recoveries": 0,
             "auto_start_enabled": True,
+            "face_engine": "insightface" if _INSIGHTFACE_AVAILABLE else "face_recognition",
         }
         self._admin_alerted: set = set()  # Track which issues already alerted
+
+        # Initialize InsightFace if available
+        if self.use_insightface:
+            self._init_insightface()
+
+    def _init_insightface(self):
+        """Initialize the InsightFace face analysis engine."""
+        if not _INSIGHTFACE_AVAILABLE:
+            return
+        try:
+            self._insightface_app = FaceAnalysis(
+                name="buffalo_l",
+                providers=["CPUExecutionProvider"],
+            )
+            self._insightface_app.prepare(ctx_id=-1, det_size=(640, 640))
+            logger.info("InsightFace engine initialized (buffalo_l model)")
+            self._health["face_engine"] = "insightface"
+        except Exception as e:
+            logger.warning(f"InsightFace init failed, falling back to face_recognition: {e}")
+            self._insightface_app = None
+            self.use_insightface = False
+            self._health["face_engine"] = "face_recognition"
 
     def add_debug_log(self, event: str, details: str = "",
                       person_id: str = "", confidence: float = 0.0):
@@ -187,9 +261,16 @@ class AttendanceEngine:
     def reload_faces(self):
         """Reload registered faces from database."""
         self.known_faces = face_db.load_known_faces()
+        if self.use_insightface and self._insightface_app:
+            self.known_faces_insightface = face_db.load_known_faces(
+                encoding_type="insightface_512d")
         self._rebuild_grade_cache()
+        engine_label = "insightface" if self.use_insightface else "face_recognition"
+        n_legacy = len(self.known_faces)
+        n_insight = len(self.known_faces_insightface)
         self.add_debug_log("faces_reloaded",
-                           f"{len(self.known_faces)} person(s) loaded")
+                           f"{n_legacy} legacy + {n_insight} insightface person(s) loaded "
+                           f"(engine={engine_label})")
 
     def _rebuild_grade_cache(self):
         """Build per-grade face lookup for classwise monitoring."""
@@ -200,6 +281,15 @@ class AttendanceEngine:
                 if grade not in self._grade_face_cache:
                     self._grade_face_cache[grade] = {}
                 self._grade_face_cache[grade][person_id] = person_data
+
+        self._grade_face_cache_insightface.clear()
+        for person_id, person_data in self.known_faces_insightface.items():
+            grade = _grade_from_person_id(person_id)
+            if grade:
+                if grade not in self._grade_face_cache_insightface:
+                    self._grade_face_cache_insightface[grade] = {}
+                self._grade_face_cache_insightface[grade][person_id] = person_data
+
         grades_with_faces = {g: len(v) for g, v in self._grade_face_cache.items()}
         logger.info(f"Grade face cache: {grades_with_faces}")
 
@@ -212,6 +302,12 @@ class AttendanceEngine:
             return self.known_faces
         return self._grade_face_cache.get(grade, {})
 
+    def get_insightface_for_grade(self, grade: str | None) -> dict:
+        """Return InsightFace embeddings filtered to a specific grade."""
+        if grade is None:
+            return self.known_faces_insightface
+        return self._grade_face_cache_insightface.get(grade, {})
+
     def _is_already_marked_today(self, person_id: str) -> bool:
         """Check if attendance already marked for this person today."""
         today = date.today().isoformat()
@@ -223,7 +319,8 @@ class AttendanceEngine:
 
     def recognize_faces_in_image(self, image_bytes: bytes,
                                  camera_source: str = "",
-                                 faces_subset: dict | None = None) -> list[dict]:
+                                 faces_subset: dict | None = None,
+                                 insightface_subset: dict | None = None) -> list[dict]:
         """Detect and recognize faces in a single image.
 
         Args:
@@ -231,9 +328,19 @@ class AttendanceEngine:
             camera_source: Label for the camera
             faces_subset: If provided, only match against these faces
                           (for classwise filtering). If None, uses all known faces.
+            insightface_subset: InsightFace embeddings subset for classwise.
 
         Returns list of recognition results.
         """
+        # Preprocess image for better face detection
+        enhanced_bytes = _preprocess_image(image_bytes)
+
+        # Use InsightFace if available
+        if self.use_insightface and self._insightface_app:
+            return self._recognize_insightface(
+                enhanced_bytes, camera_source, faces_subset,
+                insightface_subset)
+
         if face_recognition is None:
             self.add_debug_log("error", "face_recognition library not available")
             return []
@@ -244,13 +351,13 @@ class AttendanceEngine:
         tmp_path = None
         try:
             if Image is not None and dlib is not None:
-                pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                pil_img = Image.open(io.BytesIO(enhanced_bytes)).convert("RGB")
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
                     pil_img.save(f, format="JPEG", quality=95)
                     tmp_path = f.name
                 img_array = dlib.load_rgb_image(tmp_path)
             else:
-                img_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
+                img_array = face_recognition.load_image_file(io.BytesIO(enhanced_bytes))
         except Exception as e:
             self.add_debug_log("error", f"Failed to load image: {e}")
             return []
@@ -367,6 +474,160 @@ class AttendanceEngine:
                 }
 
         return best_match
+
+    def _recognize_insightface(self, image_bytes: bytes,
+                                camera_source: str = "",
+                                legacy_subset: dict | None = None,
+                                insightface_subset: dict | None = None) -> list[dict]:
+        """Detect and recognize faces using InsightFace (ArcFace).
+
+        Uses RetinaFace for detection and ArcFace for recognition.
+        Much more accurate than face_recognition, especially for
+        non-frontal faces and low-resolution images.
+        """
+        if not self._insightface_app:
+            return []
+
+        faces_if = (insightface_subset if insightface_subset is not None
+                    else self.known_faces_insightface)
+        faces_legacy = (legacy_subset if legacy_subset is not None
+                        else self.known_faces)
+
+        try:
+            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            img_array = np.array(img)
+            # InsightFace expects BGR
+            img_bgr = img_array[:, :, ::-1].copy()
+        except Exception as e:
+            self.add_debug_log("error", f"Failed to load image for InsightFace: {e}")
+            return []
+
+        detected = self._insightface_app.get(img_bgr)
+        if not detected:
+            if not self.classwise_running:
+                self.add_debug_log("no_face_detected",
+                                   f"No faces in frame ({img_array.shape[1]}x{img_array.shape[0]}) "
+                                   f"from {camera_source} [InsightFace]")
+            return []
+
+        self.add_debug_log("face_detected",
+                           f"{len(detected)} face(s) detected from {camera_source} [InsightFace]")
+
+        results = []
+        for i, face_obj in enumerate(detected):
+            embedding = face_obj.normed_embedding  # 512-d normalized embedding
+
+            match_result = self._match_insightface(embedding, faces_if)
+
+            # Fallback: try legacy face_recognition encodings via cosine similarity
+            if not match_result and faces_legacy and face_recognition is not None:
+                match_result = self._match_face_from_insightface_detection(
+                    img_array, face_obj, faces_legacy)
+
+            if match_result:
+                person_id = match_result["person_id"]
+                confidence = match_result["confidence"]
+
+                if self.test_mode and person_id != self.test_person_id:
+                    self.add_debug_log("test_mode_skip",
+                                       f"Ignoring non-test person {person_id}",
+                                       person_id=person_id,
+                                       confidence=confidence)
+                    continue
+
+                self.add_debug_log("face_matched",
+                                   f"Matched {match_result['name']} "
+                                   f"(confidence: {confidence:.1%}) [InsightFace]",
+                                   person_id=person_id,
+                                   confidence=confidence)
+
+                if confidence >= self.confidence_threshold:
+                    result = self._process_attendance(
+                        person_id=person_id,
+                        name=match_result["name"],
+                        phone=match_result["phone"],
+                        confidence=confidence,
+                        image_bytes=image_bytes,
+                        face_location=(0, 0, 0, 0),
+                        camera_source=camera_source,
+                    )
+                    if result:
+                        results.append(result)
+                else:
+                    self.add_debug_log("low_confidence",
+                                       f"Confidence {confidence:.1%} < "
+                                       f"{self.confidence_threshold:.0%} threshold [InsightFace]",
+                                       person_id=person_id,
+                                       confidence=confidence)
+            else:
+                if not self.test_mode:
+                    self.add_debug_log("face_unknown",
+                                       f"Unregistered face in {camera_source} [InsightFace]",
+                                       confidence=0.0)
+                    try:
+                        ts = int(time.time())
+                        snap_path = str(ATTENDANCE_SNAPSHOTS_DIR / f"unknown_{ts}_{i}.jpg")
+                        with open(snap_path, "wb") as f:
+                            f.write(image_bytes)
+                        db.log_unrecognized_face(camera_source, 0.0, snap_path)
+                    except Exception:
+                        pass
+
+        return results
+
+    def _match_insightface(self, embedding: np.ndarray,
+                           faces: dict) -> dict | None:
+        """Match a 512-d InsightFace embedding against known faces.
+
+        Uses cosine similarity (embeddings are already normalized).
+        """
+        best_match = None
+        best_sim = 0.0
+
+        for person_id, person_data in faces.items():
+            known_embeddings = person_data["encodings"]
+            if not known_embeddings:
+                continue
+
+            for known_emb in known_embeddings:
+                sim = float(np.dot(embedding, known_emb))
+                if sim > best_sim:
+                    best_sim = sim
+                    best_match = {
+                        "person_id": person_id,
+                        "name": person_data["name"],
+                        "phone": person_data["phone"],
+                        "confidence": sim,
+                        "distance": 1.0 - sim,
+                    }
+
+        return best_match
+
+    def _match_face_from_insightface_detection(
+            self, img_array: np.ndarray, face_obj,
+            legacy_faces: dict) -> dict | None:
+        """Use InsightFace detection + face_recognition encoding for matching.
+
+        When InsightFace embeddings aren't available for a person but
+        legacy 128-d encodings are, extract the face region detected by
+        InsightFace and compute a face_recognition encoding for matching.
+        """
+        if face_recognition is None:
+            return None
+        try:
+            bbox = face_obj.bbox.astype(int)
+            x1, y1, x2, y2 = bbox
+            h, w = img_array.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            # face_recognition uses (top, right, bottom, left) format
+            face_loc = [(y1, x2, y2, x1)]
+            encodings = face_recognition.face_encodings(img_array, face_loc)
+            if not encodings:
+                return None
+            return self._match_face(encodings[0], legacy_faces)
+        except Exception:
+            return None
 
     def _is_within_attendance_window(self) -> bool:
         """Check if the current time is within the attendance window."""
@@ -541,7 +802,9 @@ class AttendanceEngine:
         pwd = dvr["password"]
 
         stream_channel = channel * 100 + 1
-        url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+        # Request highest quality JPEG for face recognition
+        url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+               f"?snapShotImageType=JPEG&videoResolutionWidth=1920&videoResolutionHeight=1080")
 
         for attempt in range(max_retries):
             try:
@@ -569,7 +832,8 @@ class AttendanceEngine:
 
     async def scan_camera(self, dvr: dict, channel: int,
                           camera_label: str = "",
-                          faces_subset: dict | None = None) -> list[dict]:
+                          faces_subset: dict | None = None,
+                          insightface_subset: dict | None = None) -> list[dict]:
         """Capture a frame from a camera and run face recognition on it."""
         frame = await self.capture_frame_from_dvr(dvr, channel)
         if frame is None:
@@ -577,7 +841,8 @@ class AttendanceEngine:
 
         source = camera_label or f"{dvr['ip']}:ch{channel}"
         return self.recognize_faces_in_image(
-            frame, camera_source=source, faces_subset=faces_subset)
+            frame, camera_source=source, faces_subset=faces_subset,
+            insightface_subset=insightface_subset)
 
     # ------------------------------------------------------------------
     # Single-camera monitoring (existing test mode)
@@ -792,6 +1057,7 @@ class AttendanceEngine:
                         results = await self.scan_camera(
                             cam["dvr"], cam["channel"], cam["label"],
                             faces_subset=None,
+                            insightface_subset=None,
                         )
                         scanned += 1
                         faces_in_cycle += len(results)
@@ -808,8 +1074,9 @@ class AttendanceEngine:
                     try:
                         grade = cam["grade"]
                         grade_faces = self.get_faces_for_grade(grade)
+                        grade_faces_if = self.get_insightface_for_grade(grade)
 
-                        if not grade_faces:
+                        if not grade_faces and not grade_faces_if:
                             scanned += 1
                             continue
 
@@ -817,6 +1084,7 @@ class AttendanceEngine:
                         results = await self.scan_camera(
                             cam["dvr"], cam["channel"], cam["label"],
                             faces_subset=grade_faces,
+                            insightface_subset=grade_faces_if,
                         )
                         scanned += 1
                         faces_in_cycle += len(results)
@@ -889,6 +1157,8 @@ class AttendanceEngine:
 
     def get_status(self) -> dict:
         """Return current engine status."""
+        n_legacy = sum(len(p["encodings"]) for p in self.known_faces.values())
+        n_insight = sum(len(p["encodings"]) for p in self.known_faces_insightface.values())
         status = {
             "running": self.running,
             "classwise_running": self.classwise_running,
@@ -897,9 +1167,10 @@ class AttendanceEngine:
             "confidence_threshold": self.confidence_threshold,
             "scan_interval": self.scan_interval,
             "registered_persons": len(self.known_faces),
-            "total_encodings": sum(
-                len(p["encodings"]) for p in self.known_faces.values()
-            ),
+            "registered_persons_insightface": len(self.known_faces_insightface),
+            "total_encodings": n_legacy,
+            "total_encodings_insightface": n_insight,
+            "face_engine": self._health.get("face_engine", "face_recognition"),
             "cooldown_seconds": COOLDOWN_SECONDS,
             "attendance_marked_today": sum(
                 1 for d in self.daily_marked.values()

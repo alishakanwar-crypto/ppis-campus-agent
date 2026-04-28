@@ -213,7 +213,7 @@ def compress_jpeg(data: bytes, max_bytes: int = 200_000, quality_start: int = 70
 async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
     """Capture a JPEG snapshot from a Hikvision NVR via ISAPI.
 
-    Hikvision DS-9664NI-ST supports:
+    Hikvision DS-9664NI-ST / DS-7632NXI-K2 supports:
       GET /ISAPI/Streaming/channels/{channel}01/picture
     where channel is 1-based (1..64 per NVR).
 
@@ -226,7 +226,9 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
 
     # Hikvision uses channelNo * 100 + 1 for main stream snapshot
     stream_channel = channel * 100 + 1
-    url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+    # Request highest quality JPEG via ISAPI params
+    url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+           f"?snapShotImageType=JPEG&videoResolutionWidth=1920&videoResolutionHeight=1080")
 
     logger.info(f"Capturing snapshot from {ip} channel {channel} (stream {stream_channel})")
 
@@ -1128,6 +1130,20 @@ async def delete_registered_face(person_id: str):
     deleted = face_db.delete_person(person_id)
     attendance_engine.reload_faces()
     return {"deleted": deleted, "person_id": person_id}
+
+
+@app.post("/api/face/migrate-insightface")
+async def migrate_faces_to_insightface():
+    """Re-encode all existing face photos with InsightFace (512-d ArcFace).
+
+    Reads saved face images from disk and creates InsightFace embeddings
+    alongside existing face_recognition encodings. Safe to run multiple
+    times — skips faces that already have InsightFace encodings.
+    """
+    result = face_db.migrate_to_insightface()
+    if result.get("success"):
+        attendance_engine.reload_faces()
+    return result
 
 
 @app.post("/api/attendance/start")

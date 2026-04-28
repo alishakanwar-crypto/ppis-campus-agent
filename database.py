@@ -100,6 +100,18 @@ def init_db():
             );
         """)
         conn.commit()
+
+        # Migration: add encoding_type column to registered_faces
+        try:
+            conn.execute(
+                "ALTER TABLE registered_faces ADD COLUMN "
+                "encoding_type TEXT NOT NULL DEFAULT 'face_recognition_128d'"
+            )
+            conn.commit()
+            logger.info("Added encoding_type column to registered_faces")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         logger.info(f"Database initialized at {DB_PATH}")
     finally:
         conn.close()
@@ -358,29 +370,41 @@ def load_config_from_db() -> dict:
 # ---------------------------------------------------------------------------
 
 def save_face_encoding(person_id: str, name: str, role: str, phone: str,
-                       angle: str, encoding_bytes: bytes, image_path: str) -> int:
+                       angle: str, encoding_bytes: bytes, image_path: str,
+                       encoding_type: str = "face_recognition_128d") -> int:
     conn = get_conn()
     try:
         cursor = conn.execute(
             "INSERT INTO registered_faces "
-            "(person_id, name, role, phone, angle, encoding, image_path) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (person_id, name, role, phone, angle, encoding_bytes, image_path),
+            "(person_id, name, role, phone, angle, encoding, image_path, encoding_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (person_id, name, role, phone, angle, encoding_bytes, image_path,
+             encoding_type),
         )
         conn.commit()
-        logger.info(f"Saved face encoding for {name} ({person_id}), angle={angle}")
+        logger.info(f"Saved face encoding for {name} ({person_id}), "
+                    f"angle={angle}, type={encoding_type}")
         return cursor.lastrowid
     finally:
         conn.close()
 
 
-def get_all_face_encodings() -> list[dict]:
+def get_all_face_encodings(encoding_type: str | None = None) -> list[dict]:
     conn = get_conn()
     try:
-        rows = conn.execute(
-            "SELECT id, person_id, name, role, phone, angle, encoding, image_path "
-            "FROM registered_faces ORDER BY id"
-        ).fetchall()
+        if encoding_type:
+            rows = conn.execute(
+                "SELECT id, person_id, name, role, phone, angle, encoding, "
+                "image_path, encoding_type "
+                "FROM registered_faces WHERE encoding_type = ? ORDER BY id",
+                (encoding_type,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, person_id, name, role, phone, angle, encoding, "
+                "image_path, encoding_type "
+                "FROM registered_faces ORDER BY id"
+            ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
