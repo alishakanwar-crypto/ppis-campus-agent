@@ -764,12 +764,12 @@ class AttendanceEngine:
 
         # Send WhatsApp notification ONCE per student per day
         if phone and not self._is_notification_sent_today(person_id):
-            self._mark_notification_sent(person_id)
             phone_list = [p.strip() for p in phone.split(",") if p.strip()]
             for parent_phone in phone_list:
                 task = asyncio.create_task(
                     self._send_whatsapp_notification(
                         attendance_id=attendance_id,
+                        person_id=person_id,
                         name=name,
                         time_str=time_str,
                         phone=parent_phone,
@@ -781,6 +781,7 @@ class AttendanceEngine:
         return result
 
     async def _send_whatsapp_notification(self, attendance_id: int,
+                                           person_id: str,
                                            name: str, time_str: str,
                                            phone: str):
         """Send WhatsApp attendance notification via cloud bot API.
@@ -829,6 +830,7 @@ class AttendanceEngine:
 
                 if sent:
                     db.update_whatsapp_sent(attendance_id)
+                    self._mark_notification_sent(person_id)
                     self.add_debug_log("whatsapp_sent",
                                        f"Notification sent to {phone}: "
                                        f"[Attendance] {name} has arrived at {time_str}.")

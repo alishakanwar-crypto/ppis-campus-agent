@@ -512,7 +512,7 @@ def is_attendance_marked_today(person_id: str) -> bool:
     try:
         row = conn.execute(
             "SELECT id FROM attendance_log "
-            "WHERE person_id = ? AND date(logged_at) = date('now') LIMIT 1",
+            "WHERE person_id = ? AND date(logged_at) = date('now', 'localtime') LIMIT 1",
             (person_id,),
         ).fetchone()
         return row is not None
@@ -526,7 +526,7 @@ def get_today_attendance_count() -> int:
     try:
         row = conn.execute(
             "SELECT COUNT(DISTINCT person_id) as cnt "
-            "FROM attendance_log WHERE date(logged_at) = date('now')"
+            "FROM attendance_log WHERE date(logged_at) = date('now', 'localtime')"
         ).fetchone()
         return row["cnt"] if row else 0
     finally:
@@ -540,7 +540,7 @@ def get_today_attendance_summary() -> list[dict]:
         rows = conn.execute(
             "SELECT camera_source, COUNT(DISTINCT person_id) as student_count, "
             "MIN(logged_at) as first_at, MAX(logged_at) as last_at "
-            "FROM attendance_log WHERE date(logged_at) = date('now') "
+            "FROM attendance_log WHERE date(logged_at) = date('now', 'localtime') "
             "GROUP BY camera_source ORDER BY student_count DESC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -589,7 +589,7 @@ def is_notification_sent_today(person_id: str) -> bool:
     try:
         row = conn.execute(
             "SELECT id FROM attendance_log "
-            "WHERE person_id = ? AND date(logged_at) = date('now') "
+            "WHERE person_id = ? AND date(logged_at) = date('now', 'localtime') "
             "AND whatsapp_sent = 1 LIMIT 1",
             (person_id,),
         ).fetchone()
@@ -608,7 +608,7 @@ def get_today_marked_person_ids() -> set[str]:
     try:
         rows = conn.execute(
             "SELECT DISTINCT person_id FROM attendance_log "
-            "WHERE date(logged_at) = date('now')"
+            "WHERE date(logged_at) = date('now', 'localtime')"
         ).fetchall()
         return {row["person_id"] for row in rows}
     finally:
@@ -625,7 +625,7 @@ def get_today_notified_person_ids() -> set[str]:
     try:
         rows = conn.execute(
             "SELECT DISTINCT person_id FROM attendance_log "
-            "WHERE date(logged_at) = date('now') AND whatsapp_sent = 1"
+            "WHERE date(logged_at) = date('now', 'localtime') AND whatsapp_sent = 1"
         ).fetchall()
         return {row["person_id"] for row in rows}
     finally:
