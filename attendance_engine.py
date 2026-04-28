@@ -818,6 +818,23 @@ class AttendanceEngine:
                         cam_key = f"{ip}:{channel}"
                         self._camera_errors.pop(cam_key, None)
                         return resp.content
+                    # Non-exception failure: log and track like exceptions
+                    cam_key = f"{ip}:{channel}"
+                    self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
+                    ct = resp.headers.get("content-type", "unknown")
+                    if attempt < max_retries - 1:
+                        backoff = 2 ** attempt
+                        self.add_debug_log(
+                            "dvr_http_error",
+                            f"{ip} ch{channel}: HTTP {resp.status_code} "
+                            f"(content-type={ct}), retrying in {backoff}s")
+                        await asyncio.sleep(backoff)
+                    else:
+                        self.add_debug_log(
+                            "dvr_error",
+                            f"Capture failed from {ip} ch{channel} after "
+                            f"{max_retries} attempts: HTTP {resp.status_code} "
+                            f"(content-type={ct})")
             except Exception as e:
                 cam_key = f"{ip}:{channel}"
                 self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
@@ -1144,14 +1161,20 @@ class AttendanceEngine:
                                "Classwise attendance monitoring stopped")
 
     def stop(self):
-        """Stop the monitoring loop."""
+        """Stop the monitoring loop.
+
+        Also disables auto_start so the health watchdog does not
+        silently restart monitoring within the next 60 seconds.
+        """
         self.running = False
         self.classwise_running = False
+        self._health["auto_start_enabled"] = False
         if self._task and not self._task.done():
             self._task.cancel()
         if self._classwise_task and not self._classwise_task.done():
             self._classwise_task.cancel()
-        self.add_debug_log("monitoring_stopped", "Stop requested")
+        self.add_debug_log("monitoring_stopped",
+                           "Stop requested — auto_start disabled")
 
     def get_status(self) -> dict:
         """Return current engine status."""

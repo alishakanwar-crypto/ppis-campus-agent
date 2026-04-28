@@ -1267,9 +1267,9 @@ async def list_classwise_cameras():
 
 @app.post("/api/attendance/stop")
 async def stop_attendance_monitoring():
-    """Stop attendance monitoring."""
+    """Stop attendance monitoring and disable auto-restart by the watchdog."""
     attendance_engine.stop()
-    return {"status": "stopped"}
+    return {"status": "stopped", "auto_start_enabled": False}
 
 
 @app.get("/api/attendance/status")
