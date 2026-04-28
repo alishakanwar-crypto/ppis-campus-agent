@@ -583,6 +583,55 @@ def get_unrecognized_faces(limit: int = 50, unreviewed_only: bool = True) -> lis
         conn.close()
 
 
+def is_notification_sent_today(person_id: str) -> bool:
+    """Check if a WhatsApp notification was already sent for this person today."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT id FROM attendance_log "
+            "WHERE person_id = ? AND date(logged_at) = date('now') "
+            "AND whatsapp_sent = 1 LIMIT 1",
+            (person_id,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def get_today_marked_person_ids() -> set[str]:
+    """Return set of person_ids that already have attendance logged today.
+
+    Used to pre-populate the in-memory daily_marked cache on startup
+    so that dedup survives process restarts.
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT person_id FROM attendance_log "
+            "WHERE date(logged_at) = date('now')"
+        ).fetchall()
+        return {row["person_id"] for row in rows}
+    finally:
+        conn.close()
+
+
+def get_today_notified_person_ids() -> set[str]:
+    """Return set of person_ids that already had WhatsApp sent today.
+
+    Used to pre-populate the in-memory _notification_sent cache on startup
+    so that notification dedup survives process restarts.
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT person_id FROM attendance_log "
+            "WHERE date(logged_at) = date('now') AND whatsapp_sent = 1"
+        ).fetchall()
+        return {row["person_id"] for row in rows}
+    finally:
+        conn.close()
+
+
 def get_attendance_setting(key: str, default: str = "") -> str:
     conn = get_conn()
     try:

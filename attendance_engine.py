@@ -266,12 +266,31 @@ class AttendanceEngine:
                      f"(person={person_id}, conf={confidence:.2f})")
 
     def reload_faces(self):
-        """Reload registered faces from database."""
+        """Reload registered faces from database.
+
+        Also pre-populates the daily_marked and _notification_sent caches
+        from the persistent DB so dedup survives process restarts.
+        """
         self.known_faces = face_db.load_known_faces()
         if self.use_insightface and self._insightface_app:
             self.known_faces_insightface = face_db.load_known_faces(
                 encoding_type="insightface_512d")
         self._rebuild_grade_cache()
+
+        # Pre-populate dedup caches from persistent DB (survives restarts)
+        today = date.today().isoformat()
+        try:
+            marked_ids = db.get_today_marked_person_ids()
+            for pid in marked_ids:
+                self.daily_marked[pid] = today
+            notified_ids = db.get_today_notified_person_ids()
+            for pid in notified_ids:
+                self._notification_sent[pid] = today
+            logger.info(f"Pre-populated dedup caches: {len(marked_ids)} marked, "
+                        f"{len(notified_ids)} notified today")
+        except Exception as e:
+            logger.warning(f"Failed to pre-populate dedup caches from DB: {e}")
+
         engine_label = "insightface" if self.use_insightface else "face_recognition"
         n_legacy = len(self.known_faces)
         n_insight = len(self.known_faces_insightface)
@@ -316,9 +335,20 @@ class AttendanceEngine:
         return self._grade_face_cache_insightface.get(grade, {})
 
     def _is_already_marked_today(self, person_id: str) -> bool:
-        """Check if attendance already marked for this person today."""
+        """Check if attendance already marked for this person today.
+
+        Uses in-memory cache first for speed. On cache miss, falls back
+        to the persistent database so dedup survives process restarts.
+        """
         today = date.today().isoformat()
-        return self.daily_marked.get(person_id) == today
+        if self.daily_marked.get(person_id) == today:
+            return True
+        # Fallback: check persistent DB (survives restarts)
+        if db.is_attendance_marked_today(person_id):
+            # Populate cache so future checks are fast
+            self.daily_marked[person_id] = today
+            return True
+        return False
 
     def _mark_daily(self, person_id: str):
         """Record that this person was marked present today."""
@@ -647,9 +677,19 @@ class AttendanceEngine:
         return start <= now <= end
 
     def _is_notification_sent_today(self, person_id: str) -> bool:
-        """Check if notification was already sent for this person today."""
+        """Check if notification was already sent for this person today.
+
+        Uses in-memory cache first for speed. On cache miss, falls back
+        to the persistent database so dedup survives process restarts.
+        """
         today = date.today().isoformat()
-        return self._notification_sent.get(person_id) == today
+        if self._notification_sent.get(person_id) == today:
+            return True
+        # Fallback: check persistent DB (survives restarts)
+        if db.is_notification_sent_today(person_id):
+            self._notification_sent[person_id] = today
+            return True
+        return False
 
     def _mark_notification_sent(self, person_id: str):
         """Record that notification was sent for this person today."""
@@ -1032,7 +1072,17 @@ class AttendanceEngine:
             classroom_cams = [c for c in cameras if c["grade"] is not None]
             gate_cams = [c for c in cameras if c["grade"] is None]
 
-            self._classwise_stats["total_cameras"] = len(cameras)
+            # Reset all stats so counters don't accumulate across restarts
+            self._classwise_stats = {
+                "total_cameras": len(cameras),
+                "cameras_scanned": 0,
+                "current_camera": "",
+                "cycle_count": 0,
+                "last_cycle_duration": 0.0,
+                "faces_detected_total": 0,
+                "attendance_marked_today": 0,
+                "errors": 0,
+            }
             self.add_debug_log(
                 "classwise_started",
                 f"Monitoring {len(classroom_cams)} classroom cameras + "
