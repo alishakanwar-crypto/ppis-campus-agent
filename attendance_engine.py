@@ -72,8 +72,8 @@ ATTENDANCE_END_MINUTE = 0
 # Grade pattern to extract grade from camera location names
 _GRADE_RE = re.compile(
     r"(?:GRADE\s*(\d+[A-Z]?))"
-    r"|(?:(NUR|NURSERY)[\s\-]*(\d?))"
-    r"|(?:(PREP)[\s\-]*(\d?))"
+    r"|(?:(NUR|NURSERY)[\s\-]*(\d*))"
+    r"|(?:(PREP)[\s\-]*(\d*))"
     r"|(?:(Popsicles?))",
     re.IGNORECASE,
 )
@@ -105,10 +105,10 @@ def _extract_grade_from_location(location: str) -> str | None:
     if m.group(1):  # GRADE Nx
         return f"GRADE{m.group(1).upper()}"
     if m.group(2):  # NUR/NURSERY
-        n = m.group(3) or "1"
+        n = m.group(3) or ""
         return f"NUR{n}"
     if m.group(4):  # PREP
-        n = m.group(5) or "1"
+        n = m.group(5) or ""
         return f"PREP{n}"
     if m.group(6):  # Popsicles
         return "POPSICLES"

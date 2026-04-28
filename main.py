@@ -730,9 +730,20 @@ async def get_config():
 
 @app.post("/api/dvr/save")
 async def save_dvr_config(request: Request):
-    """Save DVR configuration locally and sync to cloud."""
+    """Save DVR configuration locally and sync to cloud.
+
+    Preserves existing passwords when incoming DVR entries have empty passwords
+    (the frontend strips passwords for display security).
+    """
     body = await request.json()
     dvrs = body.get("dvrs", [])
+
+    # Merge: preserve stored passwords when incoming password is empty
+    existing_dvrs = config.get("dvrs", [])
+    for i, new_dvr in enumerate(dvrs):
+        if not new_dvr.get("password") and i < len(existing_dvrs):
+            new_dvr["password"] = existing_dvrs[i].get("password", "")
+
     config["dvrs"] = dvrs
     save_config(config)
     # Sync to cloud DB
