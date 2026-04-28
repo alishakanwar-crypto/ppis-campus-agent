@@ -127,7 +127,7 @@ class AttendanceEngine:
         self.classwise_running = False
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
-        self.confidence_threshold = 0.85  # Match confidence > 85%
+        self.confidence_threshold = 0.10  # Match confidence > 10%
         self.known_faces: dict = {}
         self.last_attendance: dict[str, float] = {}  # person_id -> timestamp
         self.daily_marked: dict[str, str] = {}  # person_id -> date string
