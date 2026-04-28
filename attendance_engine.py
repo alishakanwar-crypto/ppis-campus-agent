@@ -347,23 +347,16 @@ class AttendanceEngine:
 
         faces_to_check = faces_subset if faces_subset is not None else self.known_faces
 
-        # Use dlib native file loader to avoid numpy ABI issues on Windows
-        tmp_path = None
+        # Load image via PIL -> numpy (avoids dlib numpy ABI issues on Windows)
         try:
-            if Image is not None and dlib is not None:
+            if Image is not None:
                 pil_img = Image.open(io.BytesIO(enhanced_bytes)).convert("RGB")
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                    pil_img.save(f, format="JPEG", quality=95)
-                    tmp_path = f.name
-                img_array = dlib.load_rgb_image(tmp_path)
+                img_array = np.asarray(pil_img, dtype=np.uint8)
             else:
                 img_array = face_recognition.load_image_file(io.BytesIO(enhanced_bytes))
         except Exception as e:
             self.add_debug_log("error", f"Failed to load image: {e}")
             return []
-        finally:
-            if tmp_path:
-                Path(tmp_path).unlink(missing_ok=True)
 
         # Upsample 2x to detect smaller/distant faces from security cameras
         face_locations = face_recognition.face_locations(

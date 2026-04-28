@@ -56,29 +56,27 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
         logger.error("face_recognition library not installed")
         return None
 
-    # Save to temp JPEG and use dlib's native loader to avoid numpy compat issues
-    tmp_path = None
+    # Load image via PIL -> numpy (avoids dlib numpy ABI issues on Windows)
     try:
         if Image is not None:
             pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             max_dim = 800
             if max(pil_img.size) > max_dim:
                 pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                pil_img.save(f, format="JPEG", quality=95)
-                tmp_path = f.name
-            img_array = dlib.load_rgb_image(tmp_path) if dlib else face_recognition.load_image_file(tmp_path)
+            img_array = np.asarray(pil_img, dtype=np.uint8)
         else:
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                f.write(image_bytes)
-                tmp_path = f.name
-            img_array = face_recognition.load_image_file(tmp_path)
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                    f.write(image_bytes)
+                    tmp_path = f.name
+                img_array = face_recognition.load_image_file(tmp_path)
+            finally:
+                if tmp_path:
+                    Path(tmp_path).unlink(missing_ok=True)
     except Exception as e:
         logger.error(f"Failed to load image: {e}")
         return None
-    finally:
-        if tmp_path:
-            Path(tmp_path).unlink(missing_ok=True)
     logger.info(f"Image ready: shape={img_array.shape}, dtype={img_array.dtype}")
     face_locations = face_recognition.face_locations(img_array, model="hog")
     logger.info(f"face_locations found: {len(face_locations)}")
