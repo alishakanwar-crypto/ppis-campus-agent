@@ -739,10 +739,17 @@ async def save_dvr_config(request: Request):
     dvrs = body.get("dvrs", [])
 
     # Merge: preserve stored passwords when incoming password is empty
+    # Match by (ip, port) key instead of index to handle DVR reordering/deletion
     existing_dvrs = config.get("dvrs", [])
-    for i, new_dvr in enumerate(dvrs):
-        if not new_dvr.get("password") and i < len(existing_dvrs):
-            new_dvr["password"] = existing_dvrs[i].get("password", "")
+    existing_pw_map = {}
+    for d in existing_dvrs:
+        key = (d.get("ip", ""), d.get("port", 80))
+        existing_pw_map[key] = d.get("password", "")
+    for new_dvr in dvrs:
+        if not new_dvr.get("password"):
+            key = (new_dvr.get("ip", ""), new_dvr.get("port", 80))
+            if key in existing_pw_map:
+                new_dvr["password"] = existing_pw_map[key]
 
     config["dvrs"] = dvrs
     save_config(config)
@@ -918,7 +925,7 @@ def _build_classroom_mapping(raw_mapping: dict) -> dict:
 
         # Check if this is a classroom camera
         match = re.match(
-            r'((?:GRADE|NURSERY|NUR|PREP|POPSICLE)\s+\d+\s*[A-C]?)$',
+            r'((?:GRADE|NURSERY|NUR|PREP)\s+\d+\s*[A-C]?|(?:POPSICLES?|NURSERY|NUR|PREP))$',
             classroom_part,
         )
 
@@ -1164,6 +1171,8 @@ async def start_attendance_monitoring(request: Request):
 
     if attendance_engine.running:
         return {"status": "already_running"}
+    if attendance_engine.classwise_running:
+        return {"status": "error", "error": "Classwise monitoring is running. Stop it first."}
 
     # Configure engine
     attendance_engine.test_mode = body.get("test_mode", True)
