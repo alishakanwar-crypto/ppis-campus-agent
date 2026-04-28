@@ -125,7 +125,14 @@ def _grade_from_person_id(person_id: str) -> str | None:
         r"(GRADE\d+[A-Z]?|NUR\d*|PREP\d*|POPSICLES?)$",
         person_id.upper(),
     )
-    return m.group(1) if m else None
+    if not m:
+        return None
+    grade = m.group(1)
+    # Normalize: POPSICLE (without trailing 's') -> POPSICLES
+    # so it matches _extract_grade_from_location which always returns "POPSICLES"
+    if grade.startswith("POPSICLE"):
+        return "POPSICLES"
+    return grade
 
 
 def _preprocess_image(image_bytes: bytes) -> bytes:
@@ -851,24 +858,23 @@ class AttendanceEngine:
                 {"dvr_index": 0, "channel": 1, "label": "Entrance"}
                 If None, uses the first available DVR channel 1.
         """
-        self.running = True
-        self.reload_faces()
-
-        if entrance_camera:
-            dvr_idx = entrance_camera.get("dvr_index", 0)
-            channel = entrance_camera.get("channel", 1)
-            label = entrance_camera.get("label", "Entrance")
-        else:
-            dvr_idx = 0
-            channel = 1
-            label = "Default Entrance"
-
-        self.add_debug_log("monitoring_started",
-                           f"Monitoring {label} (DVR {dvr_idx + 1}, Ch {channel}), "
-                           f"interval={self.scan_interval}s, "
-                           f"test_mode={'ON' if self.test_mode else 'OFF'}")
-
         try:
+            self.running = True
+            self.reload_faces()
+
+            if entrance_camera:
+                dvr_idx = entrance_camera.get("dvr_index", 0)
+                channel = entrance_camera.get("channel", 1)
+                label = entrance_camera.get("label", "Entrance")
+            else:
+                dvr_idx = 0
+                channel = 1
+                label = "Default Entrance"
+
+            self.add_debug_log("monitoring_started",
+                               f"Monitoring {label} (DVR {dvr_idx + 1}, Ch {channel}), "
+                               f"interval={self.scan_interval}s, "
+                               f"test_mode={'ON' if self.test_mode else 'OFF'}")
             while self.running:
                 try:
                     if dvr_idx < len(dvrs):
@@ -993,29 +999,28 @@ class AttendanceEngine:
 
         Entry gate cameras check ALL registered faces.
         """
-        self.classwise_running = True
-        self.reload_faces()
-
-        cameras = self.build_classroom_camera_list(camera_mapping, dvrs)
-        classroom_cams = [c for c in cameras if c["grade"] is not None]
-        gate_cams = [c for c in cameras if c["grade"] is None]
-
-        self._classwise_stats["total_cameras"] = len(cameras)
-        self.add_debug_log(
-            "classwise_started",
-            f"Monitoring {len(classroom_cams)} classroom cameras + "
-            f"{len(gate_cams)} entry gate cameras, "
-            f"{len(self.known_faces)} total faces loaded, "
-            f"{len(self._grade_face_cache)} grades with faces"
-        )
-
-        # Clear daily marks at start if it's a new day
-        today = date.today().isoformat()
-        self.daily_marked = {
-            pid: d for pid, d in self.daily_marked.items() if d == today
-        }
-
         try:
+            self.classwise_running = True
+            self.reload_faces()
+
+            cameras = self.build_classroom_camera_list(camera_mapping, dvrs)
+            classroom_cams = [c for c in cameras if c["grade"] is not None]
+            gate_cams = [c for c in cameras if c["grade"] is None]
+
+            self._classwise_stats["total_cameras"] = len(cameras)
+            self.add_debug_log(
+                "classwise_started",
+                f"Monitoring {len(classroom_cams)} classroom cameras + "
+                f"{len(gate_cams)} entry gate cameras, "
+                f"{len(self.known_faces)} total faces loaded, "
+                f"{len(self._grade_face_cache)} grades with faces"
+            )
+
+            # Clear daily marks at start if it's a new day
+            today = date.today().isoformat()
+            self.daily_marked = {
+                pid: d for pid, d in self.daily_marked.items() if d == today
+            }
             cycle = 0
             consecutive_full_failures = 0
             while self.classwise_running:
