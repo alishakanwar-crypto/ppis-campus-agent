@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+snapshots/
+face_images/
+attendance_snapshots/
+*.db
