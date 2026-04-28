@@ -570,6 +570,89 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
 # FastAPI — Local web UI
 # ---------------------------------------------------------------------------
 
+async def _auto_start_classwise():
+    """Auto-start classwise monitoring after a brief delay.
+
+    This ensures the system is always-on without manual intervention.
+    """
+    await asyncio.sleep(5)  # Let other startup tasks finish
+    if attendance_engine.classwise_running or attendance_engine.running:
+        logger.info("Monitoring already active — skipping auto-start")
+        return
+
+    dvrs = config.get("dvrs", [])
+    camera_mapping = config.get("camera_mapping", {})
+    if not dvrs or not camera_mapping:
+        logger.warning("Auto-start skipped: no DVRs or camera mapping configured")
+        return
+
+    attendance_engine.test_mode = False
+    attendance_engine.confidence_threshold = 0.40
+    attendance_engine.reload_faces()
+    attendance_engine.classwise_running = True
+    attendance_engine._classwise_task = asyncio.create_task(
+        attendance_engine.classwise_monitoring_loop(dvrs, camera_mapping)
+    )
+    logger.info("AUTO-START: Classwise attendance monitoring started automatically")
+
+
+async def _health_watchdog():
+    """Background watchdog that monitors system health and auto-recovers.
+
+    Checks every 60 seconds:
+    - Is classwise monitoring running? If not, restart it.
+    - Are cameras responding?
+    - Is the notification system reachable?
+    - Periodically sync new faces from cloud.
+    """
+    face_sync_counter = 0
+    while True:
+        await asyncio.sleep(60)
+        try:
+            # --- Check 1: Classwise monitoring alive ---
+            if attendance_engine._health.get("auto_start_enabled", True):
+                if not attendance_engine.classwise_running and not attendance_engine.running:
+                    dvrs = config.get("dvrs", [])
+                    camera_mapping = config.get("camera_mapping", {})
+                    if dvrs and camera_mapping:
+                        logger.warning("WATCHDOG: Classwise monitoring stopped — restarting")
+                        attendance_engine._health["total_recoveries"] += 1
+                        attendance_engine.test_mode = False
+                        attendance_engine.confidence_threshold = 0.40
+                        attendance_engine.reload_faces()
+                        attendance_engine.classwise_running = True
+                        attendance_engine._classwise_task = asyncio.create_task(
+                            attendance_engine.classwise_monitoring_loop(dvrs, camera_mapping)
+                        )
+
+            # --- Check 2: Notification system reachable ---
+            try:
+                api_url = attendance_engine.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.get(f"{api_url}/debug/version")
+                    if resp.status_code == 200:
+                        attendance_engine._health["notification_system"] = "ok"
+                    else:
+                        attendance_engine._health["notification_system"] = "degraded"
+            except Exception:
+                attendance_engine._health["notification_system"] = "error"
+
+            # --- Check 3: Periodic face sync from cloud (every 5 min) ---
+            face_sync_counter += 1
+            if face_sync_counter >= 5:
+                face_sync_counter = 0
+                synced = await sync_faces_from_cloud()
+                if synced > 0:
+                    attendance_engine.reload_faces()
+                    logger.info(f"WATCHDOG: Synced {synced} new face(s) from cloud")
+
+            attendance_engine._health["last_health_check"] = (
+                __import__("datetime").datetime.now().isoformat()
+            )
+        except Exception as e:
+            logger.error(f"WATCHDOG error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ws_task, config
@@ -590,7 +673,11 @@ async def lifespan(app: FastAPI):
     attendance_engine.reload_faces()
     # Start WebSocket client in background
     ws_task = asyncio.create_task(websocket_client())
-    logger.info("PPIS Campus Agent started (with Face Recognition Attendance)")
+    # Auto-start classwise monitoring (24/7 always-on)
+    asyncio.create_task(_auto_start_classwise())
+    # Start health watchdog (auto-recovery, face sync, system checks)
+    asyncio.create_task(_health_watchdog())
+    logger.info("PPIS Campus Agent started (24/7 mode with auto-recovery)")
     yield
     # Shutdown
     attendance_engine.stop()
@@ -1162,6 +1249,32 @@ async def stop_attendance_monitoring():
 async def get_attendance_status():
     """Get attendance engine status."""
     return attendance_engine.get_status()
+
+
+@app.get("/api/health")
+async def health_check():
+    """System health check — returns status of all subsystems."""
+    health = attendance_engine._health.copy()
+    health["classwise_running"] = attendance_engine.classwise_running
+    health["single_cam_running"] = attendance_engine.running
+    health["registered_faces"] = len(attendance_engine.known_faces)
+    health["attendance_marked_today"] = sum(
+        1 for d in attendance_engine.daily_marked.values()
+        if d == __import__("datetime").date.today().isoformat()
+    )
+    health["cameras_with_errors"] = len(attendance_engine._camera_errors)
+
+    # Overall status
+    statuses = [health["camera_feed"], health["recognition_engine"],
+                health["notification_system"]]
+    if "error" in statuses:
+        health["overall"] = "error"
+    elif "degraded" in statuses:
+        health["overall"] = "degraded"
+    else:
+        health["overall"] = "ok"
+
+    return health
 
 
 @app.get("/api/attendance/logs")

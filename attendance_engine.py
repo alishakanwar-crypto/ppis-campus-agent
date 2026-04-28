@@ -149,6 +149,19 @@ class AttendanceEngine:
         # Cache: grade -> list of (person_id, person_data)
         self._grade_face_cache: dict[str, dict] = {}
 
+        # Auto-recovery tracking
+        self._camera_errors: dict[str, int] = {}  # cam_key -> consecutive errors
+        self._health: dict = {
+            "camera_feed": "ok",
+            "recognition_engine": "ok",
+            "notification_system": "ok",
+            "last_health_check": "",
+            "uptime_start": datetime.now().isoformat(),
+            "total_recoveries": 0,
+            "auto_start_enabled": True,
+        }
+        self._admin_alerted: set = set()  # Track which issues already alerted
+
     def add_debug_log(self, event: str, details: str = "",
                       person_id: str = "", confidence: float = 0.0):
         entry = {
@@ -487,8 +500,12 @@ class AttendanceEngine:
         except Exception as e:
             self.add_debug_log("whatsapp_error", f"Failed to send: {e}")
 
-    async def capture_frame_from_dvr(self, dvr: dict, channel: int) -> bytes | None:
-        """Capture a single frame from a Hikvision DVR via ISAPI snapshot."""
+    async def capture_frame_from_dvr(self, dvr: dict, channel: int,
+                                     max_retries: int = 3) -> bytes | None:
+        """Capture a single frame from a Hikvision DVR via ISAPI snapshot.
+
+        Auto-retries on connection failures with exponential backoff.
+        """
         ip = dvr["ip"]
         port = dvr.get("port", 80)
         user = dvr["username"]
@@ -497,16 +514,28 @@ class AttendanceEngine:
         stream_channel = channel * 100 + 1
         url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
 
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url, auth=httpx.DigestAuth(user, pwd))
-                if resp.status_code == 401:
-                    resp = await client.get(url, auth=httpx.BasicAuth(user, pwd))
-                if resp.status_code == 200 and resp.headers.get(
-                        "content-type", "").startswith("image"):
-                    return resp.content
-        except Exception as e:
-            self.add_debug_log("dvr_error", f"Capture failed from {ip} ch{channel}: {e}")
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(url, auth=httpx.DigestAuth(user, pwd))
+                    if resp.status_code == 401:
+                        resp = await client.get(url, auth=httpx.BasicAuth(user, pwd))
+                    if resp.status_code == 200 and resp.headers.get(
+                            "content-type", "").startswith("image"):
+                        # Reset consecutive error count on success
+                        cam_key = f"{ip}:{channel}"
+                        self._camera_errors.pop(cam_key, None)
+                        return resp.content
+            except Exception as e:
+                cam_key = f"{ip}:{channel}"
+                self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
+                if attempt < max_retries - 1:
+                    backoff = 2 ** attempt
+                    await asyncio.sleep(backoff)
+                else:
+                    self.add_debug_log("dvr_error",
+                                       f"Capture failed from {ip} ch{channel} "
+                                       f"after {max_retries} attempts: {e}")
         return None
 
     async def scan_camera(self, dvr: dict, channel: int,
@@ -701,20 +730,28 @@ class AttendanceEngine:
 
         try:
             cycle = 0
+            consecutive_full_failures = 0
             while self.classwise_running:
                 cycle += 1
                 cycle_start = time.time()
                 self._classwise_stats["cycle_count"] = cycle
                 scanned = 0
                 faces_in_cycle = 0
+                cycle_errors = 0
 
                 # Check if day changed - reset daily marks
                 new_today = date.today().isoformat()
                 if new_today != today:
                     today = new_today
                     self.daily_marked.clear()
+                    self._camera_errors.clear()
+                    self._admin_alerted.clear()
                     self.add_debug_log("daily_reset",
                                        f"New day {today}: cleared attendance marks")
+
+                # Periodically reload faces (picks up new registrations)
+                if cycle % 20 == 0:
+                    self.reload_faces()
 
                 # Scan entry gate cameras first (priority)
                 for cam in gate_cams:
@@ -724,14 +761,15 @@ class AttendanceEngine:
                         self._classwise_stats["current_camera"] = cam["label"]
                         results = await self.scan_camera(
                             cam["dvr"], cam["channel"], cam["label"],
-                            faces_subset=None,  # Check ALL faces at gates
+                            faces_subset=None,
                         )
                         scanned += 1
                         faces_in_cycle += len(results)
                     except Exception as e:
                         self._classwise_stats["errors"] += 1
+                        cycle_errors += 1
                         logger.error(f"Error scanning {cam['label']}: {e}")
-                    await asyncio.sleep(0.5)  # Brief pause between cameras
+                    await asyncio.sleep(0.5)
 
                 # Scan classroom cameras with grade-filtered faces
                 for cam in classroom_cams:
@@ -741,7 +779,6 @@ class AttendanceEngine:
                         grade = cam["grade"]
                         grade_faces = self.get_faces_for_grade(grade)
 
-                        # Skip if no faces registered for this grade
                         if not grade_faces:
                             scanned += 1
                             continue
@@ -755,8 +792,9 @@ class AttendanceEngine:
                         faces_in_cycle += len(results)
                     except Exception as e:
                         self._classwise_stats["errors"] += 1
+                        cycle_errors += 1
                         logger.error(f"Error scanning {cam['label']}: {e}")
-                    await asyncio.sleep(0.5)  # Brief pause between cameras
+                    await asyncio.sleep(0.5)
 
                 cycle_duration = time.time() - cycle_start
                 self._classwise_stats["cameras_scanned"] = scanned
@@ -767,7 +805,23 @@ class AttendanceEngine:
                     if d == date.today().isoformat()
                 )
 
-                if cycle % 5 == 0:  # Log every 5 cycles
+                # Track full-cycle failures for auto-recovery
+                if scanned == 0 and cycle_errors > 0:
+                    consecutive_full_failures += 1
+                    self._health["camera_feed"] = "degraded"
+                    if consecutive_full_failures >= 5:
+                        self._health["camera_feed"] = "error"
+                        self.add_debug_log("auto_recovery",
+                                           "All cameras failed 5 cycles in a row — "
+                                           "waiting 30s before retry")
+                        await asyncio.sleep(30)
+                        consecutive_full_failures = 0
+                        self._health["total_recoveries"] += 1
+                else:
+                    consecutive_full_failures = 0
+                    self._health["camera_feed"] = "ok"
+
+                if cycle % 5 == 0:
                     self.add_debug_log(
                         "classwise_cycle",
                         f"Cycle {cycle}: scanned {scanned} cameras in "
@@ -775,9 +829,18 @@ class AttendanceEngine:
                         f"{self._classwise_stats['attendance_marked_today']} marked today"
                     )
 
+                self._health["last_health_check"] = datetime.now().isoformat()
+
                 # Brief cooldown between full cycles
                 await asyncio.sleep(2.0)
 
+        except asyncio.CancelledError:
+            self.add_debug_log("classwise_cancelled",
+                               "Classwise monitoring was cancelled")
+        except Exception as e:
+            self.add_debug_log("classwise_crash",
+                               f"Classwise monitoring crashed: {e}")
+            self._health["recognition_engine"] = "error"
         finally:
             self.classwise_running = False
             self._classwise_stats["current_camera"] = ""
@@ -813,6 +876,7 @@ class AttendanceEngine:
                 if d == date.today().isoformat()
             ),
             "grades_with_faces": len(self._grade_face_cache),
+            "health": self._health.copy(),
         }
         if self.classwise_running:
             status["classwise_stats"] = self._classwise_stats.copy()
