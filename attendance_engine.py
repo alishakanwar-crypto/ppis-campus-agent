@@ -580,6 +580,8 @@ class AttendanceEngine:
         """Match a 512-d InsightFace embedding against known faces.
 
         Uses cosine similarity (embeddings are already normalized).
+        Returns None if best similarity is below confidence_threshold,
+        allowing the legacy face_recognition fallback to be tried.
         """
         best_match = None
         best_sim = 0.0
@@ -600,6 +602,12 @@ class AttendanceEngine:
                         "confidence": sim,
                         "distance": 1.0 - sim,
                     }
+
+        # Return None for weak matches so the legacy fallback can be tried.
+        # Without this threshold, cosine similarity is almost always positive
+        # for at least one face, making the legacy fallback unreachable.
+        if best_match and best_sim < self.confidence_threshold:
+            return None
 
         return best_match
 
