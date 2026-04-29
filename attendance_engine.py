@@ -195,7 +195,10 @@ class AttendanceEngine:
         self._task: asyncio.Task | None = None
         self._classwise_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
-        self.use_insightface = _INSIGHTFACE_AVAILABLE
+        # Disable InsightFace — legacy face_recognition works more reliably
+        # with the current DVR setup. Re-enable once InsightFace image
+        # compatibility issues with all DVR models are resolved.
+        self.use_insightface = False
         self._insightface_app: "FaceAnalysis | None" = None
 
         # Classwise monitoring state
