@@ -679,14 +679,18 @@ class AttendanceEngine:
         if face_recognition is None:
             return None
         try:
+            # Ensure array is contiguous uint8 RGB for dlib/face_recognition
+            safe_img = np.array(img_array, dtype=np.uint8, copy=True)
+            if safe_img.ndim != 3 or safe_img.shape[2] != 3:
+                return None
             bbox = face_obj.bbox.astype(int)
             x1, y1, x2, y2 = bbox
-            h, w = img_array.shape[:2]
+            h, w = safe_img.shape[:2]
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(w, x2), min(h, y2)
             # face_recognition uses (top, right, bottom, left) format
             face_loc = [(y1, x2, y2, x1)]
-            encodings = face_recognition.face_encodings(img_array, face_loc)
+            encodings = face_recognition.face_encodings(safe_img, face_loc)
             if not encodings:
                 return None
             return self._match_face(encodings[0], legacy_faces)
