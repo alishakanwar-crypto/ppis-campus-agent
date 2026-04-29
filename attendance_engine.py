@@ -63,10 +63,10 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (7:15 AM to 2:00 PM)
+# Attendance time window (7:15 AM to 9:00 AM)
 ATTENDANCE_START_HOUR = 7
 ATTENDANCE_START_MINUTE = 15
-ATTENDANCE_END_HOUR = 14
+ATTENDANCE_END_HOUR = 9
 ATTENDANCE_END_MINUTE = 0
 
 # Grade pattern to extract grade from camera location names
@@ -743,7 +743,7 @@ class AttendanceEngine:
         """Process an attendance detection: check time window, cooldown/daily dedup, log, and notify."""
         now = time.time()
 
-        # Time window check: only mark attendance between 7:15 AM and 8:00 AM
+        # Time window check: only mark attendance between 7:15 AM and 9:00 AM
         if not self._is_within_attendance_window():
             return None
 
