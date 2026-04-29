@@ -363,7 +363,27 @@ def find_all_cameras_for_classroom(classroom: str) -> list[tuple[dict, int, str]
                 if key_clean == grade_no_section_clean:
                     logger.info(f"Fuzzy camera match: {target} -> {key} (section stripped)")
                     return val
-        # 4. Strip number from Nursery/Prep: "NURSERY 4" → "NURSERY"
+        # 4. Grade without section: "GRADE 9" → find "GRADE 9A" if it's the only match
+        m3 = re.match(r'^GRADE\s*(\d{1,2})$', target)
+        if m3:
+            grade_num = m3.group(1)
+            candidates = []
+            for key, val in mapping.items():
+                km = re.match(r'^GRADE\s*' + grade_num + r'\s*[A-D]$', key.strip().upper())
+                if km:
+                    candidates.append((key, val))
+            if len(candidates) == 1:
+                logger.info(f"Fuzzy camera match: {target} -> {candidates[0][0]} (section inferred)")
+                return candidates[0][1]
+            elif candidates:
+                # Multiple sections exist — pick section A as default
+                for key, val in candidates:
+                    if key.strip().upper().endswith('A'):
+                        logger.info(f"Fuzzy camera match: {target} -> {key} (default section A)")
+                        return val
+                logger.info(f"Fuzzy camera match: {target} -> {candidates[0][0]} (first of {len(candidates)})")
+                return candidates[0][1]
+        # 5. Strip number from Nursery/Prep: "NURSERY 4" → "NURSERY"
         m2 = re.match(r'^(NURSERY|NUR|PREP)\s*[-]?\s*\d+$', target)
         if m2:
             base_name = m2.group(1)
