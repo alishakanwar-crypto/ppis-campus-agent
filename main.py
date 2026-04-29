@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -1279,6 +1280,20 @@ async def stop_attendance_monitoring():
     """Stop attendance monitoring and disable auto-restart by the watchdog."""
     attendance_engine.stop()
     return {"status": "stopped", "auto_start_enabled": False}
+
+
+@app.post("/api/attendance/resend-notification")
+async def resend_notification(person_id: str):
+    """Clear notification dedup for a student so their next detection re-sends."""
+    today = date.today().isoformat()
+    cleared = []
+    if attendance_engine._notification_sent.get(person_id) == today:
+        del attendance_engine._notification_sent[person_id]
+        cleared.append("notification_sent")
+    if attendance_engine.daily_marked.get(person_id) == today:
+        del attendance_engine.daily_marked[person_id]
+        cleared.append("daily_marked")
+    return {"person_id": person_id, "cleared": cleared}
 
 
 @app.get("/api/attendance/status")
