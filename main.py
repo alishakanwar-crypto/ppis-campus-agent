@@ -1316,6 +1316,47 @@ async def resend_notification(person_id: str):
     return {"person_id": person_id, "cleared": cleared}
 
 
+@app.post("/api/attendance/scan-camera")
+async def scan_specific_camera(location: str):
+    """Manually trigger face recognition scan on a specific camera location."""
+    mapping = attendance_engine._last_camera_mapping or {}
+    dvrs = attendance_engine._last_dvrs or []
+    # Find the camera
+    target = location.strip()
+    cam_data = None
+    for key, val in mapping.items():
+        if key.upper() == target.upper() or target.upper() in key.upper():
+            cam_data = val
+            target = key
+            break
+    if not cam_data:
+        return {"error": f"Camera '{location}' not found", "available": list(mapping.keys())[:20]}
+    dvr_idx = cam_data.get("dvr_index", 0)
+    channel = cam_data.get("channel", 1)
+    if dvr_idx >= len(dvrs):
+        return {"error": f"DVR index {dvr_idx} out of range"}
+    dvr = dvrs[dvr_idx]
+    label = f"{target} (DVR {dvr_idx + 1} Ch {channel})"
+    logger.info(f"Manual scan triggered for {label}")
+    try:
+        results = await attendance_engine.scan_camera(
+            dvr, channel, label,
+            faces_subset=None,  # Check ALL faces
+            insightface_subset=None,
+        )
+        return {
+            "camera": label,
+            "faces_detected": len(results),
+            "results": [
+                {"person_id": r.get("person_id", ""), "name": r.get("name", ""),
+                 "confidence": r.get("confidence", 0)}
+                for r in results
+            ] if results else [],
+        }
+    except Exception as e:
+        return {"error": str(e), "camera": label}
+
+
 @app.get("/api/attendance/status")
 async def get_attendance_status():
     """Get attendance engine status."""

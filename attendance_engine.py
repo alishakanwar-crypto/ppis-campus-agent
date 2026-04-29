@@ -230,6 +230,8 @@ class AttendanceEngine:
             "face_engine": "insightface" if _INSIGHTFACE_AVAILABLE else "face_recognition",
         }
         self._admin_alerted: set = set()  # Track which issues already alerted
+        self._last_dvrs: list[dict] = []
+        self._last_camera_mapping: dict = {}
 
         # Initialize InsightFace if available
         if self.use_insightface:
@@ -1107,6 +1109,8 @@ class AttendanceEngine:
         """
         try:
             self.classwise_running = True
+            self._last_dvrs = dvrs
+            self._last_camera_mapping = camera_mapping
             self.reload_faces()
 
             cameras = self.build_classroom_camera_list(camera_mapping, dvrs)
@@ -1124,6 +1128,8 @@ class AttendanceEngine:
                 "attendance_marked_today": 0,
                 "errors": 0,
             }
+            # Log gate camera details for debugging
+            gate_labels = [c["label"] for c in gate_cams]
             self.add_debug_log(
                 "classwise_started",
                 f"Monitoring {len(classroom_cams)} classroom cameras + "
@@ -1131,6 +1137,8 @@ class AttendanceEngine:
                 f"{len(self.known_faces)} total faces loaded, "
                 f"{len(self._grade_face_cache)} grades with faces"
             )
+            if gate_cams:
+                logger.info(f"Gate/special cameras: {gate_labels}")
 
             # Clear daily marks at start if it's a new day
             today = date.today().isoformat()
