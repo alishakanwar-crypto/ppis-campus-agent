@@ -1446,6 +1446,56 @@ async def camera_alerts_status():
     }
 
 
+@app.post("/api/attendance/sync-to-cloud")
+async def sync_attendance_to_cloud():
+    """Push all of today's attendance records to the cloud dashboard."""
+    import database as db_mod
+    from datetime import date
+    records = db_mod.get_attendance_log(limit=500)
+    today = date.today().isoformat()
+    today_records = [r for r in records if r.get("logged_at", "").startswith(today)]
+
+    if not today_records:
+        return {"status": "ok", "synced": 0, "message": "No attendance records today"}
+
+    api_url = os.environ.get("CLOUD_BOT_URL", "https://app-itszlsnn.fly.dev")
+    agent_secret = os.environ.get("AGENT_SECRET", "")
+    headers = {"Content-Type": "application/json"}
+    if agent_secret:
+        headers["X-Agent-Secret"] = agent_secret
+
+    payload_records = []
+    for r in today_records:
+        pid = r.get("person_id", "")
+        grade = ""
+        for part in pid.split("_"):
+            if part.startswith("GRADE") or part.startswith("NUR") or part.startswith("PREP"):
+                grade = part
+                break
+        payload_records.append({
+            "person_id": pid,
+            "name": r.get("name", ""),
+            "grade": grade,
+            "camera": r.get("camera_source", ""),
+            "confidence": r.get("confidence", 0),
+            "notification_sent": bool(r.get("whatsapp_sent")),
+            "parent_phones": "",
+            "logged_at": r.get("logged_at", ""),
+        })
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{api_url}/api/dashboard/attendance/report",
+                json={"records": payload_records},
+                headers=headers,
+            )
+            data = resp.json()
+            return {"status": "ok", "synced": data.get("inserted", 0), "total_today": len(today_records)}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
 @app.post("/api/attendance/recognize")
 async def recognize_single_image(image: UploadFile = File(...)):
     """Run face recognition on a single uploaded image (manual test)."""

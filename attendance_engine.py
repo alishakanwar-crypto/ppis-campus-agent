@@ -803,6 +803,13 @@ class AttendanceEngine:
             "camera_source": camera_source,
         }
 
+        # Sync attendance to cloud dashboard
+        task_sync = asyncio.create_task(
+            self._sync_attendance_to_cloud(result, phone or "")
+        )
+        self._background_tasks.add(task_sync)
+        task_sync.add_done_callback(self._background_tasks.discard)
+
         # Send WhatsApp notification ONCE per student per day
         if phone and not self._is_notification_sent_today(person_id):
             phone_list = [p.strip() for p in phone.split(",") if p.strip()]
@@ -880,6 +887,49 @@ class AttendanceEngine:
                                        f"API returned {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
             self.add_debug_log("whatsapp_error", f"Failed to send: {e}")
+
+    async def _sync_attendance_to_cloud(self, record: dict, parent_phones: str):
+        """Report attendance record to cloud backend for dashboard display."""
+        api_url = self.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
+        agent_secret = os.environ.get("AGENT_SECRET", "")
+        headers = {"Content-Type": "application/json"}
+        if agent_secret:
+            headers["X-Agent-Secret"] = agent_secret
+
+        # Extract grade from person_id (e.g. NAVYA_MEHTA_GRADE2A -> GRADE 2A)
+        pid = record.get("person_id", "")
+        grade = ""
+        for part in pid.split("_"):
+            if part.startswith("GRADE") or part.startswith("NUR") or part.startswith("PREP"):
+                grade = part
+                break
+
+        payload = {
+            "records": [{
+                "person_id": pid,
+                "name": record.get("name", ""),
+                "grade": grade,
+                "camera": record.get("camera_source", ""),
+                "confidence": record.get("confidence", 0),
+                "notification_sent": bool(parent_phones),
+                "parent_phones": parent_phones,
+                "logged_at": datetime.now().isoformat(),
+            }]
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{api_url}/api/dashboard/attendance/report",
+                    json=payload, headers=headers,
+                )
+                if resp.status_code == 200:
+                    self.add_debug_log("cloud_sync",
+                                       f"Attendance synced to cloud: {record.get('name')}")
+                else:
+                    self.add_debug_log("cloud_sync_error",
+                                       f"Cloud sync failed: HTTP {resp.status_code}")
+        except Exception as e:
+            self.add_debug_log("cloud_sync_error", f"Cloud sync error: {e}")
 
     async def _send_camera_alert(self, cam_key: str, camera_label: str,
                                  error_count: int, alert_type: str = "offline"):
