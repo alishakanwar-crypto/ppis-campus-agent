@@ -612,6 +612,14 @@ async def _auto_start_classwise():
     attendance_engine.test_mode = False
     attendance_engine.confidence_threshold = 0.30
     attendance_engine.reload_faces()
+
+    # Configure camera alert phones from agent settings
+    import database as db_mod
+    alert_phones_str = db_mod.get_attendance_setting("camera_alert_phones", "")
+    if alert_phones_str:
+        attendance_engine._admin_phones = [p.strip() for p in alert_phones_str.split(",") if p.strip()]
+        logger.info(f"Camera alerts configured for: {attendance_engine._admin_phones}")
+
     attendance_engine.classwise_running = True
     attendance_engine._classwise_task = asyncio.create_task(
         attendance_engine.classwise_monitoring_loop(dvrs, camera_mapping)
@@ -1400,6 +1408,42 @@ async def get_attendance_logs(limit: int = 100, person_id: str | None = None):
 async def get_debug_logs(limit: int = 100):
     """Get real-time debug logs from the attendance engine."""
     return attendance_engine.get_debug_logs(limit)
+
+
+@app.post("/api/camera-alerts/configure")
+async def configure_camera_alerts(request: Request):
+    """Configure admin phones to receive camera offline/recovery alerts."""
+    import database as db_mod
+    body = await request.json()
+    phones = body.get("phones", [])
+    threshold = body.get("threshold", 5)
+    if isinstance(phones, str):
+        phones = [p.strip() for p in phones.split(",") if p.strip()]
+    attendance_engine._admin_phones = phones
+    attendance_engine._camera_alert_threshold = threshold
+    # Persist to DB so it survives restarts
+    db_mod.set_attendance_setting("camera_alert_phones", ",".join(phones))
+    logger.info(f"Camera alerts configured: phones={phones}, threshold={threshold}")
+    return {
+        "status": "ok",
+        "alert_phones": phones,
+        "failure_threshold": threshold,
+    }
+
+
+@app.get("/api/camera-alerts/status")
+async def camera_alerts_status():
+    """Get current camera health and alert status."""
+    errors = {}
+    for cam_key, count in attendance_engine._camera_errors.items():
+        label = attendance_engine._cam_key_to_label(cam_key)
+        errors[label] = {"consecutive_failures": count, "alerted": cam_key in attendance_engine._admin_alerted}
+    return {
+        "alert_phones": attendance_engine._admin_phones,
+        "failure_threshold": attendance_engine._camera_alert_threshold,
+        "cameras_with_errors": errors,
+        "total_alerted": len(attendance_engine._admin_alerted),
+    }
 
 
 @app.post("/api/attendance/recognize")

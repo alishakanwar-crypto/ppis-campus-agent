@@ -230,6 +230,9 @@ class AttendanceEngine:
             "face_engine": "insightface" if _INSIGHTFACE_AVAILABLE else "face_recognition",
         }
         self._admin_alerted: set = set()  # Track which issues already alerted
+        self._camera_alert_threshold = 5  # consecutive failures before alert
+        self._admin_phones: list[str] = []  # phones to receive camera alerts
+        self._camera_recovered: set = set()  # cameras that recovered after alert
         self._last_dvrs: list[dict] = []
         self._last_camera_mapping: dict = {}
 
@@ -878,6 +881,78 @@ class AttendanceEngine:
         except Exception as e:
             self.add_debug_log("whatsapp_error", f"Failed to send: {e}")
 
+    async def _send_camera_alert(self, cam_key: str, camera_label: str,
+                                 error_count: int, alert_type: str = "offline"):
+        """Send WhatsApp alert when a camera goes offline or recovers."""
+        if not self._admin_phones:
+            return
+        api_url = self.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
+        agent_secret = os.environ.get("AGENT_SECRET", "")
+        headers = {}
+        if agent_secret:
+            headers["X-Agent-Secret"] = agent_secret
+
+        now = datetime.now().strftime("%I:%M %p")
+        if alert_type == "offline":
+            msg = (
+                f"\u26a0\ufe0f *Camera Alert*\n\n"
+                f"Camera *{camera_label}* is offline.\n"
+                f"Failed {error_count} consecutive times.\n"
+                f"Time: {now}\n\n"
+                f"Please check the camera connection."
+            )
+        else:
+            msg = (
+                f"\u2705 *Camera Recovered*\n\n"
+                f"Camera *{camera_label}* is back online.\n"
+                f"Time: {now}"
+            )
+
+        phone_list = ",".join(self._admin_phones)
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                await client.post(
+                    f"{api_url}/api/send-whatsapp",
+                    json={"phone": phone_list, "message": msg},
+                    headers=headers,
+                )
+            self.add_debug_log("camera_alert",
+                               f"{alert_type}: {camera_label} -> {phone_list}")
+        except Exception as e:
+            self.add_debug_log("camera_alert_error",
+                               f"Failed to send alert for {camera_label}: {e}")
+
+    def _cam_key_to_label(self, cam_key: str) -> str:
+        """Resolve a cam_key like '192.168.0.12:57' to a friendly label."""
+        mapping = self._last_camera_mapping or {}
+        dvrs = self._last_dvrs or []
+        for loc, data in mapping.items():
+            dvr_idx = data.get("dvr_index", 0)
+            ch = data.get("channel", 1)
+            if dvr_idx < len(dvrs):
+                ip = dvrs[dvr_idx].get("ip", "")
+                if f"{ip}:{ch}" == cam_key:
+                    return loc
+        return cam_key
+
+    async def _check_camera_health_alerts(self):
+        """Check camera error counts and send alerts for offline cameras."""
+        for cam_key, error_count in list(self._camera_errors.items()):
+            if error_count >= self._camera_alert_threshold:
+                if cam_key not in self._admin_alerted:
+                    label = self._cam_key_to_label(cam_key)
+                    self._admin_alerted.add(cam_key)
+                    await self._send_camera_alert(cam_key, label, error_count,
+                                                  "offline")
+
+        # Check for recovered cameras (were alerted but errors cleared)
+        for cam_key in list(self._admin_alerted):
+            if cam_key not in self._camera_errors:
+                if cam_key not in self._camera_recovered:
+                    label = self._cam_key_to_label(cam_key)
+                    self._camera_recovered.add(cam_key)
+                    await self._send_camera_alert(cam_key, label, 0, "recovered")
+
     async def capture_frame_from_dvr(self, dvr: dict, channel: int,
                                      max_retries: int = 3) -> bytes | None:
         """Capture a single frame from a Hikvision DVR via ISAPI snapshot.
@@ -1250,6 +1325,10 @@ class AttendanceEngine:
                     )
 
                 self._health["last_health_check"] = datetime.now().isoformat()
+
+                # Check camera health and send alerts if needed
+                if cycle % 3 == 0:
+                    await self._check_camera_health_alerts()
 
                 # Brief cooldown between full cycles
                 await asyncio.sleep(2.0)
