@@ -381,12 +381,14 @@ class AttendanceEngine:
             results = self._recognize_insightface(
                 enhanced_bytes, camera_source, faces_subset,
                 insightface_subset)
-            # Fallback: if InsightFace detected no faces, try legacy engine
-            # (legacy HOG detector with 2x upsample catches distant faces better)
-            if not results and face_recognition is not None:
+            # Fallback: only if InsightFace detected ZERO faces (returns None),
+            # try legacy HOG detector which catches distant faces better.
+            # If InsightFace detected faces but couldn't match (returns []),
+            # don't fall back — InsightFace already handled it.
+            if results is None and face_recognition is not None:
                 return self._recognize_legacy(
                     enhanced_bytes, camera_source, faces_subset)
-            return results
+            return results or []
 
         return self._recognize_legacy(enhanced_bytes, camera_source, faces_subset)
 
@@ -555,7 +557,7 @@ class AttendanceEngine:
                 self.add_debug_log("no_face_detected",
                                    f"No faces in frame ({img_array.shape[1]}x{img_array.shape[0]}) "
                                    f"from {camera_source} [InsightFace]")
-            return []
+            return None  # None = no faces detected (triggers legacy fallback)
 
         self.add_debug_log("face_detected",
                            f"{len(detected)} face(s) detected from {camera_source} [InsightFace]")
