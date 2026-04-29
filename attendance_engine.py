@@ -406,16 +406,23 @@ class AttendanceEngine:
         try:
             if Image is not None:
                 pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                img_array = np.asarray(pil_img, dtype=np.uint8)
+                img_array = np.array(pil_img, dtype=np.uint8).copy()
             else:
                 img_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
+            if img_array.ndim != 3 or img_array.shape[2] != 3:
+                return []
         except Exception as e:
             self.add_debug_log("error", f"Failed to load image: {e}")
             return []
 
         # Upsample 2x to detect smaller/distant faces from security cameras
-        face_locations = face_recognition.face_locations(
-            img_array, model="hog", number_of_times_to_upsample=2)
+        try:
+            face_locations = face_recognition.face_locations(
+                img_array, model="hog", number_of_times_to_upsample=2)
+        except Exception as e:
+            self.add_debug_log("error",
+                               f"Legacy face detection failed for {camera_source}: {e}")
+            return []
 
         if not face_locations:
             if not self.classwise_running:
