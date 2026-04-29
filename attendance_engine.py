@@ -943,9 +943,12 @@ class AttendanceEngine:
             return []
 
         source = camera_label or f"{dvr['ip']}:ch{channel}"
-        return self.recognize_faces_in_image(
-            frame, camera_source=source, faces_subset=faces_subset,
-            insightface_subset=insightface_subset)
+        # Run CPU-bound face recognition in a thread pool so the event
+        # loop stays responsive for WebSocket snapshot requests.
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self.recognize_faces_in_image,
+            frame, source, faces_subset, insightface_subset)
 
     # ------------------------------------------------------------------
     # Single-camera monitoring (existing test mode)
