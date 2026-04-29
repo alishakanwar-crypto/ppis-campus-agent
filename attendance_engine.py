@@ -405,15 +405,18 @@ class AttendanceEngine:
 
         faces_to_check = faces_subset if faces_subset is not None else self.known_faces
 
-        # Load image via PIL -> numpy (avoids dlib numpy ABI issues on Windows)
+        # Load image: force re-encode to JPEG to guarantee clean RGB uint8
         try:
-            if Image is not None:
-                pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                img_array = np.array(pil_img, dtype=np.uint8).copy()
-            else:
-                img_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
-            if img_array.ndim != 3 or img_array.shape[2] != 3:
-                return []
+            pil_img = Image.open(io.BytesIO(image_bytes))
+            # Force to RGB (handles RGBA, P, L, CMYK, etc)
+            if pil_img.mode != "RGB":
+                pil_img = pil_img.convert("RGB")
+            # Re-encode to standard JPEG to strip any exotic metadata/format
+            clean_buf = io.BytesIO()
+            pil_img.save(clean_buf, format="JPEG", quality=95)
+            clean_buf.seek(0)
+            # Use face_recognition's own loader for maximum compatibility
+            img_array = face_recognition.load_image_file(clean_buf)
         except Exception as e:
             self.add_debug_log("error", f"Failed to load image: {e}")
             return []
