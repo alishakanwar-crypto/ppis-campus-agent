@@ -1066,8 +1066,8 @@ class AttendanceEngine:
                     "is_gate": False,
                 })
 
-        # Also include entry gate cameras (check ALL faces)
-        _GATE_KEYWORDS = {"ENTRY", "ENTRANCE", "DISPERSAL"}
+        # Also include entry gate cameras and special rooms (check ALL faces)
+        _GATE_KEYWORDS = {"ENTRY", "ENTRANCE", "DISPERSAL", "ADMISSION", "RECEPTION"}
         for location, cam_data in camera_mapping.items():
             loc_upper = location.upper()
             # Only match actual entry gates, not PARK GATE or other park cameras
