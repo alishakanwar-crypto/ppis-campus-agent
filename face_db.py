@@ -150,7 +150,10 @@ def encode_face_insightface(image_bytes: bytes) -> tuple[np.ndarray, bytes] | No
 
     try:
         pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_array = np.array(pil_img)
+        img_array = np.asarray(pil_img, dtype=np.uint8)
+        if img_array.ndim != 3 or img_array.shape[2] != 3:
+            logger.error(f"Bad image shape for InsightFace: {img_array.shape}")
+            return None
         img_bgr = img_array[:, :, ::-1].copy()
     except Exception as e:
         logger.error(f"Failed to load image for InsightFace: {e}")

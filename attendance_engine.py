@@ -538,7 +538,11 @@ class AttendanceEngine:
 
         try:
             img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            img_array = np.array(img)
+            img_array = np.asarray(img, dtype=np.uint8)
+            if img_array.ndim != 3 or img_array.shape[2] != 3:
+                self.add_debug_log("error",
+                                   f"Bad image shape {img_array.shape} from {camera_source}")
+                return []
             # InsightFace expects BGR
             img_bgr = img_array[:, :, ::-1].copy()
         except Exception as e:
