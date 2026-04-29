@@ -242,6 +242,10 @@ class AttendanceEngine:
                 providers=["CPUExecutionProvider"],
             )
             self._insightface_app.prepare(ctx_id=-1, det_size=(640, 640))
+            # Lower detection threshold for distant/small faces from ceiling cameras
+            for model in self._insightface_app.models:
+                if hasattr(model, 'det_thresh'):
+                    model.det_thresh = 0.3
             logger.info("InsightFace engine initialized (buffalo_l model)")
             self._health["face_engine"] = "insightface"
         except Exception as e:
@@ -372,12 +376,24 @@ class AttendanceEngine:
         # Preprocess image for better face detection
         enhanced_bytes = _preprocess_image(image_bytes)
 
-        # Use InsightFace if available
+        # Use InsightFace if available, with fallback to legacy engine
         if self.use_insightface and self._insightface_app:
-            return self._recognize_insightface(
+            results = self._recognize_insightface(
                 enhanced_bytes, camera_source, faces_subset,
                 insightface_subset)
+            # Fallback: if InsightFace detected no faces, try legacy engine
+            # (legacy HOG detector with 2x upsample catches distant faces better)
+            if not results and face_recognition is not None:
+                return self._recognize_legacy(
+                    enhanced_bytes, camera_source, faces_subset)
+            return results
 
+        return self._recognize_legacy(enhanced_bytes, camera_source, faces_subset)
+
+    def _recognize_legacy(self, image_bytes: bytes,
+                          camera_source: str = "",
+                          faces_subset: dict | None = None) -> list[dict]:
+        """Detect and recognize faces using the legacy face_recognition library."""
         if face_recognition is None:
             self.add_debug_log("error", "face_recognition library not available")
             return []
@@ -387,10 +403,10 @@ class AttendanceEngine:
         # Load image via PIL -> numpy (avoids dlib numpy ABI issues on Windows)
         try:
             if Image is not None:
-                pil_img = Image.open(io.BytesIO(enhanced_bytes)).convert("RGB")
+                pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
                 img_array = np.asarray(pil_img, dtype=np.uint8)
             else:
-                img_array = face_recognition.load_image_file(io.BytesIO(enhanced_bytes))
+                img_array = face_recognition.load_image_file(io.BytesIO(image_bytes))
         except Exception as e:
             self.add_debug_log("error", f"Failed to load image: {e}")
             return []
@@ -400,14 +416,13 @@ class AttendanceEngine:
             img_array, model="hog", number_of_times_to_upsample=2)
 
         if not face_locations:
-            # Only log no-face for single-camera mode (classwise is too noisy)
             if not self.classwise_running:
                 self.add_debug_log("no_face_detected",
                                    f"No faces in frame ({img_array.shape[1]}x{img_array.shape[0]}) from {camera_source}")
             return []
 
         self.add_debug_log("face_detected",
-                           f"{len(face_locations)} face(s) detected from {camera_source}")
+                           f"{len(face_locations)} face(s) detected from {camera_source} [legacy fallback]")
 
         face_encodings = face_recognition.face_encodings(img_array, face_locations)
         results = []
@@ -419,7 +434,6 @@ class AttendanceEngine:
                 person_id = match_result["person_id"]
                 confidence = match_result["confidence"]
 
-                # In test mode, only process test_person_id
                 if self.test_mode and person_id != self.test_person_id:
                     self.add_debug_log("test_mode_skip",
                                        f"Ignoring non-test person {person_id}",
@@ -456,7 +470,6 @@ class AttendanceEngine:
                     self.add_debug_log("face_unknown",
                                        f"Unregistered face in {camera_source}",
                                        confidence=0.0)
-                    # Save snapshot for manual review
                     try:
                         ts = int(time.time())
                         snap_path = str(ATTENDANCE_SNAPSHOTS_DIR / f"unknown_{ts}_{i}.jpg")
