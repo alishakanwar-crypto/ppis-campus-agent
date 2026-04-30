@@ -1616,6 +1616,77 @@ async def retry_notifications():
     }
 
 
+@app.post("/api/attendance/resend-all")
+async def resend_all_notifications():
+    """Re-send attendance notifications to ALL parents with corrected IST times."""
+    import database as db_mod
+    from datetime import date, datetime, timedelta
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+
+    records = db_mod.get_attendance_log(limit=500)
+    today = date.today().isoformat()
+    today_records = [r for r in records if today in str(r.get("logged_at", ""))]
+
+    if not today_records:
+        return {"status": "ok", "message": "No attendance records today"}
+
+    # Skip staff/test faces
+    skip_ids = {"arpit003", "Alisha002", "HARPREET001", "ALISHA001"}
+
+    sent_count = 0
+    failed_count = 0
+    skipped_count = 0
+    for r in today_records:
+        pid = r.get("person_id", "")
+        name = r.get("name", "")
+        if pid in skip_ids:
+            skipped_count += 1
+            continue
+
+        face_data = attendance_engine.known_faces.get(pid)
+        if not face_data:
+            skipped_count += 1
+            continue
+        phone = face_data.get("phone", "")
+        if not phone:
+            skipped_count += 1
+            continue
+
+        time_str = ""
+        try:
+            logged = str(r.get("logged_at", ""))
+            dt = datetime.fromisoformat(logged)
+            # Convert UTC to IST if hour < 4 (old UTC records)
+            if dt.hour < 4:
+                dt = dt + IST_OFFSET
+            time_str = dt.strftime("%I:%M %p")
+        except Exception:
+            time_str = "today"
+
+        phone_list = [p.strip() for p in phone.split(",") if p.strip()]
+        for parent_phone in phone_list:
+            try:
+                await attendance_engine._send_whatsapp_notification(
+                    attendance_id=r.get("id", 0),
+                    person_id=pid,
+                    name=name,
+                    time_str=time_str,
+                    phone=parent_phone,
+                )
+                sent_count += 1
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Resend failed for {name}: {e}")
+
+    return {
+        "status": "ok",
+        "total_today": len(today_records),
+        "sent": sent_count,
+        "failed": failed_count,
+        "skipped": skipped_count,
+    }
+
+
 @app.post("/api/attendance/recognize")
 async def recognize_single_image(image: UploadFile = File(...)):
     """Run face recognition on a single uploaded image (manual test)."""
