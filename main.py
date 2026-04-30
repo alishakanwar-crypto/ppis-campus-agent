@@ -1171,6 +1171,28 @@ async def list_registered_faces():
     return face_db.get_registered_list()
 
 
+@app.put("/api/face/{person_id}/phone")
+async def update_face_phone(person_id: str, request: Request):
+    """Update the phone number for a registered face."""
+    body = await request.json()
+    new_phone = body.get("phone", "")
+    if not new_phone:
+        return {"status": "error", "error": "Missing phone"}
+    import database as db_mod
+    conn = db_mod.get_conn()
+    try:
+        cursor = conn.execute(
+            "UPDATE face_encodings SET phone = ? WHERE person_id = ?",
+            (new_phone, person_id),
+        )
+        conn.commit()
+        updated = cursor.rowcount
+    finally:
+        conn.close()
+    attendance_engine.reload_faces()
+    return {"status": "ok", "updated": updated, "person_id": person_id, "phone": new_phone}
+
+
 @app.delete("/api/face/{person_id}")
 async def delete_registered_face(person_id: str):
     """Delete all face encodings for a person."""
