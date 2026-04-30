@@ -1453,10 +1453,17 @@ async def sync_attendance_to_cloud():
     from datetime import date
     records = db_mod.get_attendance_log(limit=500)
     today = date.today().isoformat()
-    today_records = [r for r in records if r.get("logged_at", "").startswith(today)]
+    # Match both ISO format (2026-04-30) and SQLite format (2026-04-30 HH:MM:SS)
+    today_records = [r for r in records if today in str(r.get("logged_at", ""))]
 
     if not today_records:
-        return {"status": "ok", "synced": 0, "message": "No attendance records today"}
+        return {
+            "status": "ok", "synced": 0,
+            "message": "No attendance records today",
+            "total_in_db": len(records),
+            "today_str": today,
+            "sample_dates": [str(r.get("logged_at", ""))[:16] for r in records[:5]],
+        }
 
     api_url = os.environ.get("CLOUD_BOT_URL", "https://app-itszlsnn.fly.dev")
     agent_secret = os.environ.get("AGENT_SECRET", "")
@@ -1480,7 +1487,7 @@ async def sync_attendance_to_cloud():
             "confidence": r.get("confidence", 0),
             "notification_sent": bool(r.get("whatsapp_sent")),
             "parent_phones": "",
-            "logged_at": r.get("logged_at", ""),
+            "logged_at": str(r.get("logged_at", "")),
         })
 
     try:
@@ -1493,7 +1500,8 @@ async def sync_attendance_to_cloud():
             data = resp.json()
             return {"status": "ok", "synced": data.get("inserted", 0), "total_today": len(today_records)}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        logger.error(f"Cloud sync error: {type(e).__name__}: {e}")
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
 
 @app.post("/api/attendance/recognize")
