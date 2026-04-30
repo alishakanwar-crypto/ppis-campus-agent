@@ -211,6 +211,9 @@ def compress_jpeg(data: bytes, max_bytes: int = 200_000, quality_start: int = 70
         return data
 
 
+_last_capture_error: str = ""
+
+
 async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
     """Capture a JPEG snapshot from a Hikvision NVR via ISAPI.
 
@@ -219,7 +222,9 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
     where channel is 1-based (1..64 per NVR).
 
     Returns JPEG bytes or None on failure.
+    Sets _last_capture_error with diagnostic details.
     """
+    global _last_capture_error
     ip = dvr["ip"]
     port = dvr.get("port", 80)
     user = dvr["username"]
@@ -242,18 +247,20 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
 
             if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
                 logger.info(f"Snapshot captured: {len(resp.content)} bytes from {ip} ch{channel}")
+                _last_capture_error = ""
                 return resp.content
             else:
-                logger.error(
-                    f"Snapshot failed from {ip} ch{channel}: "
-                    f"HTTP {resp.status_code}, content-type={resp.headers.get('content-type', 'unknown')}"
-                )
+                err = (f"HTTP {resp.status_code}, content-type="
+                       f"{resp.headers.get('content-type', 'unknown')}")
+                logger.error(f"Snapshot failed from {ip} ch{channel}: {err}")
+                _last_capture_error = f"{ip} ch{channel}: {err}"
                 # Try alternate URL format (sub-stream: channel*100 + 2)
                 alt_stream = channel * 100 + 2
                 alt_url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{alt_stream}/picture"
                 resp2 = await client.get(alt_url, auth=httpx.DigestAuth(user, pwd))
                 if resp2.status_code == 200 and resp2.headers.get("content-type", "").startswith("image"):
                     logger.info(f"Snapshot captured (sub-stream): {len(resp2.content)} bytes")
+                    _last_capture_error = ""
                     return resp2.content
 
                 # Try without /ISAPI prefix
@@ -261,10 +268,24 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
                 resp3 = await client.get(alt_url2, auth=httpx.DigestAuth(user, pwd))
                 if resp3.status_code == 200 and resp3.headers.get("content-type", "").startswith("image"):
                     logger.info(f"Snapshot captured (alt2 URL): {len(resp3.content)} bytes")
+                    _last_capture_error = ""
                     return resp3.content
 
                 return None
+    except httpx.ConnectError as e:
+        _last_capture_error = f"{ip} ch{channel}: connection_refused ({e})"
+        logger.error(f"Snapshot connection error from {ip} ch{channel}: {e}")
+        return None
+    except httpx.ConnectTimeout as e:
+        _last_capture_error = f"{ip} ch{channel}: connect_timeout ({e})"
+        logger.error(f"Snapshot connect timeout from {ip} ch{channel}: {e}")
+        return None
+    except httpx.ReadTimeout as e:
+        _last_capture_error = f"{ip} ch{channel}: read_timeout ({e})"
+        logger.error(f"Snapshot read timeout from {ip} ch{channel}: {e}")
+        return None
     except Exception as e:
+        _last_capture_error = f"{ip} ch{channel}: {type(e).__name__}: {e}"
         logger.error(f"Snapshot error from {ip} ch{channel}: {e}")
         return None
 
@@ -458,6 +479,21 @@ async def websocket_client():
                                 result = await test_dvr_connection(dvrs[dvr_idx])
                                 await ws.send(json.dumps({"type": "test_result", **result}))
 
+                        elif msg_type == "test_all_dvrs":
+                            request_id = data.get("request_id", "")
+                            dvrs = config.get("dvrs", [])
+                            results = []
+                            for i, dvr in enumerate(dvrs):
+                                result = await test_dvr_connection(dvr)
+                                result["dvr_index"] = i
+                                result["name"] = dvr.get("name", f"DVR {i}")
+                                results.append(result)
+                            await ws.send(json.dumps({
+                                "type": "test_all_dvrs_result",
+                                "request_id": request_id,
+                                "results": results,
+                            }))
+
                         elif msg_type == "update_camera_mapping":
                             new_mapping = data.get("camera_mapping", {})
                             if new_mapping:
@@ -555,6 +591,7 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
             "request_id": request_id,
             "success": False,
             "error": f"Failed to capture snapshot from any camera for {classroom}",
+            "detail": _last_capture_error,
         }))
         return
 
