@@ -2,9 +2,20 @@
 REM PPIS Campus Agent — Auto-restart wrapper
 REM This script ensures the agent restarts automatically if it crashes.
 REM Run this at Windows startup (via Task Scheduler) for 24/7 operation.
+REM
+REM Features:
+REM   - Suppresses Windows error dialogs so crashes auto-recover silently
+REM   - Pulls latest code before each restart
+REM   - Restarts after 10 second cooldown
 
 title PPIS Campus Agent (24/7)
 cd /d "%~dp0"
+
+REM Suppress Windows Error Reporting dialogs so crashes don't block restart
+REM SEM_FAILCRITICALERRORS=1 | SEM_NOGPFAULTERRORBOX=2 | SEM_NOOPENFILEERRORBOX=0x8000
+REM This prevents "The memory could not be written" popup from blocking restart
+reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v Disabled /t REG_DWORD /d 1 /f >nul 2>&1
 
 :loop
 echo.
