@@ -1504,6 +1504,21 @@ async def sync_attendance_to_cloud():
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
 
+@app.post("/api/attendance/reset-dedup")
+async def reset_dedup():
+    """Clear attendance dedup caches so students can be re-detected and notified."""
+    marked_count = len(attendance_engine.daily_marked)
+    notified_count = len(attendance_engine._notification_sent)
+    attendance_engine.daily_marked.clear()
+    attendance_engine._notification_sent.clear()
+    return {
+        "status": "ok",
+        "cleared_marked": marked_count,
+        "cleared_notified": notified_count,
+        "message": "Dedup caches cleared — students will be re-detected and notified",
+    }
+
+
 @app.post("/api/attendance/retry-notifications")
 async def retry_notifications():
     """Resend WhatsApp notifications for students marked today but not notified."""
