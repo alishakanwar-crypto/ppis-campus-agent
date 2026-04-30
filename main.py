@@ -1182,7 +1182,7 @@ async def update_face_phone(person_id: str, request: Request):
     conn = db_mod.get_conn()
     try:
         cursor = conn.execute(
-            "UPDATE face_encodings SET phone = ? WHERE person_id = ?",
+            "UPDATE registered_faces SET phone = ? WHERE person_id = ?",
             (new_phone, person_id),
         )
         conn.commit()
