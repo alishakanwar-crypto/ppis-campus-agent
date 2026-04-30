@@ -1504,6 +1504,65 @@ async def sync_attendance_to_cloud():
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
 
+@app.post("/api/attendance/retry-notifications")
+async def retry_notifications():
+    """Resend WhatsApp notifications for students marked today but not notified."""
+    import database as db_mod
+    from datetime import date, datetime
+    records = db_mod.get_attendance_log(limit=500)
+    today = date.today().isoformat()
+    today_records = [r for r in records if today in str(r.get("logged_at", ""))]
+
+    # Filter to only those not yet notified
+    not_notified = [r for r in today_records if not r.get("whatsapp_sent")]
+    if not not_notified:
+        return {"status": "ok", "message": "All students already notified", "total_today": len(today_records)}
+
+    sent_count = 0
+    failed_count = 0
+    for r in not_notified:
+        pid = r.get("person_id", "")
+        name = r.get("name", "")
+        # Look up phone from face DB
+        face_data = attendance_engine.known_faces.get(pid)
+        if not face_data:
+            continue
+        phone = face_data.get("phone", "")
+        if not phone:
+            continue
+
+        time_str = ""
+        try:
+            logged = str(r.get("logged_at", ""))
+            dt = datetime.fromisoformat(logged)
+            time_str = dt.strftime("%I:%M %p")
+        except Exception:
+            time_str = "today"
+
+        phone_list = [p.strip() for p in phone.split(",") if p.strip()]
+        for parent_phone in phone_list:
+            try:
+                await attendance_engine._send_whatsapp_notification(
+                    attendance_id=r.get("id", 0),
+                    person_id=pid,
+                    name=name,
+                    time_str=time_str,
+                    phone=parent_phone,
+                )
+                sent_count += 1
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Retry notification failed for {name}: {e}")
+
+    return {
+        "status": "ok",
+        "not_notified": len(not_notified),
+        "attempted": sent_count + failed_count,
+        "sent": sent_count,
+        "failed": failed_count,
+    }
+
+
 @app.post("/api/attendance/recognize")
 async def recognize_single_image(image: UploadFile = File(...)):
     """Run face recognition on a single uploaded image (manual test)."""

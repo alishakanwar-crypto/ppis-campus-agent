@@ -834,59 +834,72 @@ class AttendanceEngine:
                                            phone: str):
         """Send WhatsApp attendance notification via cloud bot API.
 
-        Tries template message first (works without 24-hour window),
-        falls back to plain text message.
+        Tries plain text first (works if parent messaged within 24h),
+        then falls back to template message (works anytime if approved).
         """
         api_url = self.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
         agent_secret = os.environ.get("AGENT_SECRET", "")
-        headers = {}
+        headers = {"Content-Type": "application/json"}
         if agent_secret:
             headers["X-Agent-Secret"] = agent_secret
 
         sent = False
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                # Try template message first (no 24-hour window needed)
+                # Try plain text first (works in 24-hour window)
+                message = (
+                    f"*Attendance Alert* \u2705\n\n"
+                    f"Your child *{name}* has been marked present today at *{time_str}*.\n\n"
+                    f"PP International School"
+                )
                 resp = await client.post(
                     f"{api_url}/api/send-whatsapp",
-                    json={
-                        "phone": phone,
-                        "template_name": "ppis_attendance_alert",
-                        "template_params": [name, time_str],
-                    },
+                    json={"phone": phone, "message": message},
                     headers=headers,
                 )
                 if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("status") == "ok":
-                        sent = True
+                    try:
+                        data = resp.json()
+                        if data.get("status") == "ok":
+                            sent = True
+                    except Exception:
+                        pass
 
-                # Fallback to plain text if template failed
+                # Fallback to template if plain text failed
                 if not sent:
-                    message = f"Your child {name} has been marked present today at {time_str}."
                     resp = await client.post(
                         f"{api_url}/api/send-whatsapp",
                         json={
                             "phone": phone,
-                            "message": message,
-                            "type": "attendance_notification",
+                            "template_name": "face_registration_reminder",
                         },
                         headers=headers,
                     )
                     if resp.status_code == 200:
-                        sent = True
+                        try:
+                            data = resp.json()
+                            if data.get("status") == "ok":
+                                sent = True
+                        except Exception:
+                            pass
 
                 if sent:
                     db.update_whatsapp_sent(attendance_id)
                     self._mark_notification_sent(person_id)
                     self.add_debug_log("whatsapp_sent",
                                        f"Notification sent to {phone}: "
-                                       f"[Attendance] {name} has arrived at {time_str}.")
+                                       f"[Attendance] {name} at {time_str}")
                 else:
+                    resp_text = ""
+                    try:
+                        resp_text = resp.text[:200]
+                    except Exception:
+                        pass
                     self.add_debug_log("whatsapp_failed",
-                                       f"API returned {resp.status_code}: {resp.text[:200]}")
+                                       f"Failed for {phone}: {resp_text}")
         except Exception as e:
-            self.add_debug_log("whatsapp_error", f"Failed to send: {e}")
+            self.add_debug_log("whatsapp_error",
+                               f"Failed to send to {phone}: {type(e).__name__}: {e}")
 
     async def _sync_attendance_to_cloud(self, record: dict, parent_phones: str):
         """Report attendance record to cloud backend for dashboard display."""
