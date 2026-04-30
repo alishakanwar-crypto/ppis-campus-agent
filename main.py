@@ -1450,10 +1450,11 @@ async def camera_alerts_status():
 async def sync_attendance_to_cloud():
     """Push all of today's attendance records to the cloud dashboard."""
     import database as db_mod
-    from datetime import date
+    from datetime import date, datetime, timedelta
+    IST_OFFSET = timedelta(hours=5, minutes=30)
     records = db_mod.get_attendance_log(limit=500)
     today = date.today().isoformat()
-    # Match both ISO format (2026-04-30) and SQLite format (2026-04-30 HH:MM:SS)
+    # Match both IST and UTC dates for today
     today_records = [r for r in records if today in str(r.get("logged_at", ""))]
 
     if not today_records:
@@ -1479,6 +1480,16 @@ async def sync_attendance_to_cloud():
             if part.startswith("GRADE") or part.startswith("NUR") or part.startswith("PREP"):
                 grade = part
                 break
+        # Convert UTC DB time to IST for cloud display
+        raw_time = str(r.get("logged_at", ""))
+        try:
+            dt = datetime.fromisoformat(raw_time)
+            # If hour < 4, it's likely UTC — convert to IST
+            if dt.hour < 4:
+                dt = dt + IST_OFFSET
+            raw_time = dt.isoformat()
+        except Exception:
+            pass
         payload_records.append({
             "person_id": pid,
             "name": r.get("name", ""),
@@ -1487,7 +1498,7 @@ async def sync_attendance_to_cloud():
             "confidence": r.get("confidence", 0),
             "notification_sent": bool(r.get("whatsapp_sent")),
             "parent_phones": "",
-            "logged_at": str(r.get("logged_at", "")),
+            "logged_at": raw_time,
         })
 
     try:
@@ -1523,7 +1534,7 @@ async def reset_dedup():
 async def retry_notifications():
     """Resend WhatsApp notifications for students marked today but not notified."""
     import database as db_mod
-    from datetime import date, datetime
+    from datetime import date, datetime, timedelta
     records = db_mod.get_attendance_log(limit=500)
     today = date.today().isoformat()
     today_records = [r for r in records if today in str(r.get("logged_at", ""))]
@@ -1532,6 +1543,9 @@ async def retry_notifications():
     not_notified = [r for r in today_records if not r.get("whatsapp_sent")]
     if not not_notified:
         return {"status": "ok", "message": "All students already notified", "total_today": len(today_records)}
+
+    # IST offset (UTC+5:30)
+    IST_OFFSET = timedelta(hours=5, minutes=30)
 
     sent_count = 0
     failed_count = 0
@@ -1550,7 +1564,9 @@ async def retry_notifications():
         try:
             logged = str(r.get("logged_at", ""))
             dt = datetime.fromisoformat(logged)
-            time_str = dt.strftime("%I:%M %p")
+            # DB stores UTC (datetime('now')), convert to IST
+            dt_ist = dt + IST_OFFSET
+            time_str = dt_ist.strftime("%I:%M %p")
         except Exception:
             time_str = "today"
 
