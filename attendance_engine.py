@@ -872,13 +872,15 @@ class AttendanceEngine:
                     except Exception:
                         pass
 
-                # Fallback to template if plain text failed
+                # Fallback to attendance template if plain text failed
+                # (plain text fails if parent hasn't messaged bot in 24h)
                 if not sent:
                     resp = await client.post(
                         f"{api_url}/api/send-whatsapp",
                         json={
                             "phone": phone,
-                            "template_name": "face_registration_reminder",
+                            "template_name": "ppis_attendance_alert",
+                            "template_params": [name, time_str],
                         },
                         headers=headers,
                     )
