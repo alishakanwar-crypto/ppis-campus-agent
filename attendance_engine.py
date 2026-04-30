@@ -11,6 +11,7 @@ Supports:
 """
 
 import asyncio
+import gc
 import io
 import logging
 import os
@@ -445,6 +446,12 @@ class AttendanceEngine:
                            f"{len(face_locations)} face(s) detected from {camera_source} [legacy fallback]")
 
         face_encodings = face_recognition.face_encodings(img_array, face_locations)
+
+        # Release the large image array to free memory
+        del img_array
+        del pil_img
+        del clean_buf
+
         results = []
 
         for i, (encoding, location) in enumerate(zip(face_encodings, face_locations)):
@@ -1327,32 +1334,42 @@ class AttendanceEngine:
                         logger.error(f"Error scanning {cam['label']}: {e}")
                     await asyncio.sleep(0.5)
 
-                # Scan classroom cameras with grade-filtered faces
-                for cam in classroom_cams:
-                    if not self.classwise_running:
-                        break
-                    try:
-                        grade = cam["grade"]
-                        grade_faces = self.get_faces_for_grade(grade)
-                        grade_faces_if = self.get_insightface_for_grade(grade)
+                # Free memory after gate cameras
+                gc.collect()
 
-                        if not grade_faces and not grade_faces_if:
+                # Scan classroom cameras in batches to manage memory
+                BATCH_SIZE = 10
+                for batch_start in range(0, len(classroom_cams), BATCH_SIZE):
+                    batch = classroom_cams[batch_start:batch_start + BATCH_SIZE]
+                    for cam in batch:
+                        if not self.classwise_running:
+                            break
+                        try:
+                            grade = cam["grade"]
+                            grade_faces = self.get_faces_for_grade(grade)
+                            grade_faces_if = self.get_insightface_for_grade(grade)
+
+                            if not grade_faces and not grade_faces_if:
+                                scanned += 1
+                                continue
+
+                            self._classwise_stats["current_camera"] = cam["label"]
+                            results = await self.scan_camera(
+                                cam["dvr"], cam["channel"], cam["label"],
+                                faces_subset=grade_faces,
+                                insightface_subset=grade_faces_if,
+                            )
                             scanned += 1
-                            continue
+                            faces_in_cycle += len(results)
+                        except Exception as e:
+                            self._classwise_stats["errors"] += 1
+                            cycle_errors += 1
+                            logger.error(f"Error scanning {cam['label']}: {e}")
+                        await asyncio.sleep(0.5)
 
-                        self._classwise_stats["current_camera"] = cam["label"]
-                        results = await self.scan_camera(
-                            cam["dvr"], cam["channel"], cam["label"],
-                            faces_subset=grade_faces,
-                            insightface_subset=grade_faces_if,
-                        )
-                        scanned += 1
-                        faces_in_cycle += len(results)
-                    except Exception as e:
-                        self._classwise_stats["errors"] += 1
-                        cycle_errors += 1
-                        logger.error(f"Error scanning {cam['label']}: {e}")
-                    await asyncio.sleep(0.5)
+                    # Free memory between batches
+                    gc.collect()
+                    await asyncio.sleep(1.0)
 
                 cycle_duration = time.time() - cycle_start
                 self._classwise_stats["cameras_scanned"] = scanned
@@ -1393,7 +1410,8 @@ class AttendanceEngine:
                 if cycle % 3 == 0:
                     await self._check_camera_health_alerts()
 
-                # Brief cooldown between full cycles
+                # Free memory between cycles and brief cooldown
+                gc.collect()
                 await asyncio.sleep(2.0)
 
         except asyncio.CancelledError:
