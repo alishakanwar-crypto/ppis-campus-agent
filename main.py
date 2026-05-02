@@ -105,58 +105,124 @@ def save_config(cfg: dict):
 async def sync_faces_from_cloud() -> int:
     """Download registered face images from cloud and register locally.
 
+    Uses incremental sync: first fetches lightweight manifest (no images),
+    compares with local DB, then downloads only missing faces one-by-one.
+    This prevents OOM on the school PC by avoiding bulk image downloads.
+
     Returns the number of faces synced.
     """
-    url = f"{CLOUD_API_BASE}/api/face/images"
     agent_secret = os.environ.get("AGENT_SECRET", "")
     headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
     try:
+        import gc
+        import database as db_mod
+
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(url, headers=headers)
+            # Step 1: Get manifest (metadata only — no images, ~1KB)
+            manifest_url = f"{CLOUD_API_BASE}/api/face/manifest"
+            resp = await client.get(manifest_url, headers=headers)
+            if resp.status_code == 404:
+                # Fallback to old /images endpoint if manifest not available
+                return await _sync_faces_legacy(client, headers)
             if resp.status_code != 200:
-                logger.warning(f"Cloud face sync: API returned {resp.status_code}")
+                logger.warning(f"Cloud face sync: manifest returned {resp.status_code}")
                 return 0
-            faces = resp.json()
-            if not faces:
+            manifest = resp.json()
+            if not manifest:
                 logger.info("Cloud face sync: no faces registered in cloud")
                 return 0
 
-            import database as db_mod
-            synced = 0
-            # Fetch existing faces once before the loop (avoid N+1 queries)
+            # Step 2: Find which faces we're missing locally
             existing = db_mod.get_all_face_encodings()
             existing_keys = {
                 (r["person_id"], r.get("angle", ""))
                 for r in existing
             }
-            for face_data in faces:
-                person_id = face_data["person_id"]
-                angle = face_data["angle"]
-                if (person_id, angle) in existing_keys:
-                    continue
+            missing = [
+                f for f in manifest
+                if (f["person_id"], f["angle"]) not in existing_keys
+            ]
+            if not missing:
+                logger.info(f"Cloud face sync: all {len(manifest)} faces already local")
+                return 0
 
-                # Decode image and register locally
-                image_bytes = base64.b64decode(face_data["image_base64"])
-                result = face_db.register_face(
-                    person_id=person_id,
-                    name=face_data["name"],
-                    role=face_data["role"],
-                    phone=face_data["phone"],
-                    angle=angle,
-                    image_bytes=image_bytes,
-                )
-                if result.get("success"):
-                    synced += 1
-                    existing_keys.add((person_id, angle))
-                    logger.info(f"Cloud face sync: registered {face_data['name']} ({person_id}) angle={angle}")
-                else:
-                    logger.warning(f"Cloud face sync: failed to register {person_id}: {result.get('error')}")
+            logger.info(f"Cloud face sync: {len(missing)} new face(s) to download")
+
+            # Step 3: Download missing faces ONE AT A TIME (low memory)
+            synced = 0
+            for face_meta in missing:
+                face_id = face_meta["id"]
+                person_id = face_meta["person_id"]
+                try:
+                    img_resp = await client.get(
+                        f"{CLOUD_API_BASE}/api/face/image/{face_id}",
+                        headers=headers,
+                    )
+                    if img_resp.status_code != 200:
+                        logger.warning(f"Cloud face sync: image {face_id} returned {img_resp.status_code}")
+                        continue
+                    image_bytes = img_resp.content
+                    result = face_db.register_face(
+                        person_id=person_id,
+                        name=face_meta["name"],
+                        role=face_meta["role"],
+                        phone=face_meta["phone"],
+                        angle=face_meta["angle"],
+                        image_bytes=image_bytes,
+                    )
+                    del image_bytes
+                    gc.collect()
+                    if result.get("success"):
+                        synced += 1
+                        logger.info(f"Cloud face sync: registered {face_meta['name']} ({person_id})")
+                    else:
+                        logger.warning(f"Cloud face sync: failed {person_id}: {result.get('error')}")
+                except Exception as e:
+                    logger.warning(f"Cloud face sync: error downloading {person_id}: {e}")
 
             logger.info(f"Cloud face sync complete: {synced} new face(s) synced")
             return synced
     except Exception as e:
         logger.warning(f"Cloud face sync failed: {e}")
         return 0
+
+
+async def _sync_faces_legacy(client: httpx.AsyncClient, headers: dict) -> int:
+    """Fallback: download all faces via /api/face/images (old endpoint)."""
+    import gc
+    import database as db_mod
+
+    url = f"{CLOUD_API_BASE}/api/face/images"
+    resp = await client.get(url, headers=headers)
+    if resp.status_code != 200:
+        return 0
+    faces = resp.json()
+    if not faces:
+        return 0
+    existing = db_mod.get_all_face_encodings()
+    existing_keys = {(r["person_id"], r.get("angle", "")) for r in existing}
+    synced = 0
+    for face_data in faces:
+        person_id = face_data["person_id"]
+        angle = face_data["angle"]
+        if (person_id, angle) in existing_keys:
+            continue
+        image_bytes = base64.b64decode(face_data["image_base64"])
+        result = face_db.register_face(
+            person_id=person_id,
+            name=face_data["name"],
+            role=face_data["role"],
+            phone=face_data["phone"],
+            angle=angle,
+            image_bytes=image_bytes,
+        )
+        del image_bytes
+        gc.collect()
+        if result.get("success"):
+            synced += 1
+            existing_keys.add((person_id, angle))
+    logger.info(f"Cloud face sync (legacy): {synced} new face(s)")
+    return synced
 
 
 async def load_config() -> dict:
