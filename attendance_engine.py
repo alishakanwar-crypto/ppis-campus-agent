@@ -841,8 +841,10 @@ class AttendanceEngine:
                                            phone: str):
         """Send WhatsApp attendance notification via cloud bot API.
 
-        Tries plain text first (works if parent messaged within 24h),
-        then falls back to template message (works anytime if approved).
+        Always uses the ppis_attendance_alert template for guaranteed
+        delivery to BOTH parents — no 24-hour window dependency.
+        Template messages are delivered regardless of whether the parent
+        has ever messaged the bot.
         """
         api_url = self.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
         agent_secret = os.environ.get("AGENT_SECRET", "")
@@ -853,15 +855,14 @@ class AttendanceEngine:
         sent = False
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                # Try plain text first (works in 24-hour window)
-                message = (
-                    f"*Attendance Alert* \u2705\n\n"
-                    f"Your child *{name}* has been marked present today at *{time_str}*.\n\n"
-                    f"PP International School"
-                )
+                # Always use template — guaranteed delivery to any number
                 resp = await client.post(
                     f"{api_url}/api/send-whatsapp",
-                    json={"phone": phone, "message": message},
+                    json={
+                        "phone": phone,
+                        "template_name": "ppis_attendance_alert",
+                        "template_params": [name, time_str],
+                    },
                     headers=headers,
                 )
                 if resp.status_code == 200:
@@ -871,26 +872,6 @@ class AttendanceEngine:
                             sent = True
                     except Exception:
                         pass
-
-                # Fallback to attendance template if plain text failed
-                # (plain text fails if parent hasn't messaged bot in 24h)
-                if not sent:
-                    resp = await client.post(
-                        f"{api_url}/api/send-whatsapp",
-                        json={
-                            "phone": phone,
-                            "template_name": "ppis_attendance_alert",
-                            "template_params": [name, time_str],
-                        },
-                        headers=headers,
-                    )
-                    if resp.status_code == 200:
-                        try:
-                            data = resp.json()
-                            if data.get("status") == "ok":
-                                sent = True
-                        except Exception:
-                            pass
 
                 if sent:
                     db.update_whatsapp_sent(attendance_id)
