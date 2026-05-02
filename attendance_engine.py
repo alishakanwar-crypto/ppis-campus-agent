@@ -64,9 +64,9 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (7:00 AM to 8:30 AM)
+# Attendance time window (7:15 AM to 8:30 AM)
 ATTENDANCE_START_HOUR = 7
-ATTENDANCE_START_MINUTE = 0
+ATTENDANCE_START_MINUTE = 15
 ATTENDANCE_END_HOUR = 8
 ATTENDANCE_END_MINUTE = 30
 
