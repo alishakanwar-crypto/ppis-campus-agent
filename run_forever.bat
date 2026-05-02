@@ -11,11 +11,17 @@ REM   - Restarts after 10 second cooldown
 title PPIS Campus Agent (24/7)
 cd /d "%~dp0"
 
-REM Suppress Windows Error Reporting dialogs so crashes don't block restart
-REM SEM_FAILCRITICALERRORS=1 | SEM_NOGPFAULTERRORBOX=2 | SEM_NOOPENFILEERRORBOX=0x8000
-REM This prevents "The memory could not be written" popup from blocking restart
+REM Suppress Windows Error Reporting dialogs (registry-level)
 reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f >nul 2>&1
 reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v Disabled /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "HKLM\Software\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f >nul 2>&1
+reg add "HKLM\Software\Microsoft\Windows\Windows Error Reporting" /v Disabled /t REG_DWORD /d 1 /f >nul 2>&1
+
+REM Suppress JIT debugger and app-crash popups (IFEO)
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug" /v Auto /t REG_SZ /d 1 /f >nul 2>&1
+
+REM Reduce memory footprint: skip .pyc file generation
+set PYTHONDONTWRITEBYTECODE=1
 
 :loop
 echo.

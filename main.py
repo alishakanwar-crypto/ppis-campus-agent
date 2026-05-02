@@ -21,6 +21,16 @@ from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
 
+# Suppress Windows crash dialogs so the process exits silently on errors
+# (allows run_forever.bat to auto-restart without a popup blocking it)
+if sys.platform == "win32":
+    try:
+        import ctypes
+        # SEM_FAILCRITICALERRORS=1 | SEM_NOGPFAULTERRORBOX=2 | SEM_NOOPENFILEERRORBOX=0x8000
+        ctypes.windll.kernel32.SetErrorMode(0x8003)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
 import httpx
 import websockets
 from fastapi import FastAPI, File, Form, Request, UploadFile
