@@ -1839,6 +1839,113 @@ async def get_unrecognized_faces(limit: int = 50, all: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# A4 Sheet Capture — Controlled face registration
+# ---------------------------------------------------------------------------
+
+import a4_capture
+
+
+@app.post("/api/a4-capture/single")
+async def a4_capture_single(
+    camera_label: str = Form(...),
+    grade: str = Form(""),
+):
+    """Trigger A4 sheet capture for a single student on a specific camera.
+
+    The student should be standing in front of the camera holding an A4 sheet
+    with their name written in bold black text.
+    """
+    # Find the camera
+    mapping = config.get("camera_mapping", {})
+    cam_config = mapping.get(camera_label)
+    if not cam_config:
+        return JSONResponse({"success": False, "error": f"Camera '{camera_label}' not found"},
+                           status_code=404)
+
+    dvr_index = cam_config["dvr_index"]
+    channel = cam_config["channel"]
+    dvrs = config.get("dvrs", [])
+    if dvr_index >= len(dvrs):
+        return JSONResponse({"success": False, "error": "DVR not configured"},
+                           status_code=400)
+
+    dvr = dvrs[dvr_index]
+    result = await a4_capture.capture_and_register(
+        capture_func=capture_snapshot,
+        dvr=dvr,
+        channel=channel,
+        camera_label=camera_label,
+        grade=grade,
+    )
+    return result
+
+
+@app.post("/api/a4-capture/batch")
+async def a4_capture_batch(
+    camera_label: str = Form(...),
+    grade: str = Form(""),
+    student_count: int = Form(1),
+):
+    """Trigger batch A4 sheet capture for multiple students in a class.
+
+    Students line up and step in front of the camera one at a time.
+    The system waits 5 seconds between each student.
+    """
+    mapping = config.get("camera_mapping", {})
+    cam_config = mapping.get(camera_label)
+    if not cam_config:
+        return JSONResponse({"success": False, "error": f"Camera '{camera_label}' not found"},
+                           status_code=404)
+
+    dvr_index = cam_config["dvr_index"]
+    channel = cam_config["channel"]
+    dvrs = config.get("dvrs", [])
+    if dvr_index >= len(dvrs):
+        return JSONResponse({"success": False, "error": "DVR not configured"},
+                           status_code=400)
+
+    dvr = dvrs[dvr_index]
+    results = await a4_capture.batch_capture_class(
+        capture_func=capture_snapshot,
+        dvr=dvr,
+        channel=channel,
+        camera_label=camera_label,
+        grade=grade,
+        student_count=student_count,
+    )
+
+    success_count = sum(1 for r in results if r.get("success"))
+    return {
+        "total": student_count,
+        "success": success_count,
+        "failed": student_count - success_count,
+        "results": results,
+    }
+
+
+@app.get("/api/a4-capture/logs")
+async def get_a4_capture_logs(date: str = ""):
+    """Get A4 capture logs for a given date (default: today IST)."""
+    logs = a4_capture.get_capture_logs(date)
+    return {"date": date, "entries": logs}
+
+
+@app.get("/api/a4-capture/cameras")
+async def get_capture_cameras():
+    """Get list of cameras available for A4 sheet capture."""
+    mapping = config.get("camera_mapping", {})
+    cameras = []
+    for label, cam_config in mapping.items():
+        cameras.append({
+            "label": label,
+            "dvr_index": cam_config.get("dvr_index"),
+            "channel": cam_config.get("channel"),
+            "description": cam_config.get("description", ""),
+        })
+    return {"cameras": cameras}
+
+
+# ---------------------------------------------------------------------------
 # Dashboard HTML (embedded for simplicity — no external templates needed)
 # ---------------------------------------------------------------------------
 
