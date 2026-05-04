@@ -414,29 +414,33 @@ class AttendanceEngine:
         # Load image: force to RGB uint8 numpy array
         try:
             pil_img = Image.open(io.BytesIO(image_bytes))
-            # Force to RGB (handles RGBA, P, L, CMYK, grayscale, etc)
             pil_img = pil_img.convert("RGB")
-            # Save to temp file and use face_recognition's loader (most reliable)
+            # Save to temp file — dlib loads via its own C++ loader
             import tempfile as _tf
             _tmp = _tf.NamedTemporaryFile(suffix=".jpg", delete=False, dir=".")
             _tmp_path = _tmp.name
             pil_img.save(_tmp, format="JPEG", quality=95)
             _tmp.close()
             clean_buf = io.BytesIO()  # kept for del below
-            img_array = face_recognition.load_image_file(_tmp_path)
+            # Use dlib's native loader to avoid numpy ABI issues
+            import dlib as _dlib
+            img_array = _dlib.load_rgb_image(_tmp_path)
             try:
                 import os; os.unlink(_tmp_path)
             except Exception:
                 pass
-            logger.info(f"Image loaded: shape={img_array.shape} dtype={img_array.dtype} from {camera_source}")
         except Exception as e:
             self.add_debug_log("error", f"Failed to load image: {e}")
             return []
 
         # Upsample 2x to detect smaller/distant faces from security cameras
         try:
-            face_locations = face_recognition.face_locations(
-                img_array, model="hog", number_of_times_to_upsample=2)
+            _detector = _dlib.get_frontal_face_detector()
+            dlib_dets = _detector(img_array, 2)
+            # Convert dlib rectangles to face_recognition format (top, right, bottom, left)
+            face_locations = [
+                (d.top(), d.right(), d.bottom(), d.left()) for d in dlib_dets
+            ]
         except Exception as e:
             self.add_debug_log("error",
                                f"Legacy face detection failed for {camera_source}: {e}")
