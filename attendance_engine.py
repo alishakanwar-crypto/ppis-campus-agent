@@ -820,18 +820,30 @@ class AttendanceEngine:
             "camera_source": camera_source,
         }
 
+        # Schedule async tasks — may be called from a thread pool,
+        # so use run_coroutine_threadsafe instead of create_task
+        try:
+            loop = asyncio.get_running_loop()
+            _schedule = lambda coro: asyncio.create_task(coro)
+        except RuntimeError:
+            # Running inside run_in_executor thread — no event loop here
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = None
+            _schedule = (
+                lambda coro: asyncio.run_coroutine_threadsafe(coro, loop)
+                if loop else None
+            )
+
         # Sync attendance to cloud dashboard
-        task_sync = asyncio.create_task(
-            self._sync_attendance_to_cloud(result, phone or "")
-        )
-        self._background_tasks.add(task_sync)
-        task_sync.add_done_callback(self._background_tasks.discard)
+        _schedule(self._sync_attendance_to_cloud(result, phone or ""))
 
         # Send WhatsApp notification ONCE per student per day
         if phone and not self._is_notification_sent_today(person_id):
             phone_list = [p.strip() for p in phone.split(",") if p.strip()]
             for parent_phone in phone_list:
-                task = asyncio.create_task(
+                _schedule(
                     self._send_whatsapp_notification(
                         attendance_id=attendance_id,
                         person_id=person_id,
@@ -840,8 +852,6 @@ class AttendanceEngine:
                         phone=parent_phone,
                     )
                 )
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
 
         return result
 
