@@ -1,57 +1,57 @@
 @echo off
+setlocal enabledelayedexpansion
 REM PPIS Campus Agent — Auto-restart wrapper with PID lock
-REM This script ensures the agent restarts automatically if it crashes.
-REM Run this at Windows startup (via Task Scheduler) for 24/7 operation.
-REM
 REM Features:
-REM   - PID lock prevents multiple instances from running simultaneously
-REM   - Suppresses Windows error dialogs so crashes auto-recover silently
-REM   - Pulls latest code before each restart
+REM   - PID lock prevents multiple instances
+REM   - Kills stale agent processes before starting
+REM   - Auto-pulls latest code before each restart
+REM   - Suppresses Windows error dialogs
 REM   - Restarts after 10 second cooldown
-REM   - Kills stale instances before starting
 
 title PPIS Campus Agent (24/7)
 cd /d "%~dp0"
 
 REM === PID Lock: prevent multiple instances ===
-set LOCKFILE=%~dp0agent.lock
+set "LOCKFILE=%~dp0agent.lock"
 
-REM Check if another instance of this script is already running
 if exist "%LOCKFILE%" (
-    set /p OLD_PID=<"%LOCKFILE%"
-    REM Check if the process is still running
-    tasklist /FI "PID eq %OLD_PID%" 2>nul | find "%OLD_PID%" >nul
-    if not errorlevel 1 (
-        echo [%DATE% %TIME%] Another agent instance is already running (PID: %OLD_PID%). Exiting.
+    echo [%DATE% %TIME%] Lock file found. Checking for running instance...
+    set /p "OLD_PID=" < "%LOCKFILE%"
+)
+
+if defined OLD_PID (
+    tasklist /FI "PID eq !OLD_PID!" 2>nul | find "!OLD_PID!" >nul
+    if !errorlevel! equ 0 (
+        echo [%DATE% %TIME%] Agent already running as PID !OLD_PID!. Exiting.
         exit /b 1
-    ) else (
-        echo [%DATE% %TIME%] Stale lock file found. Cleaning up...
-        del "%LOCKFILE%" 2>nul
     )
+    echo [%DATE% %TIME%] Stale lock. Cleaning up...
+    del "%LOCKFILE%" 2>nul
 )
 
 REM Kill any stale python processes running main.py
-for /f "tokens=2" %%a in ('tasklist /FI "IMAGENAME eq python.exe" /FO LIST 2^>nul ^| find "PID:"') do (
-    wmic process where "ProcessId=%%a" get CommandLine 2>nul | find "main.py" >nul
-    if not errorlevel 1 (
-        echo [%DATE% %TIME%] Killing stale agent process: %%a
-        taskkill /PID %%a /F >nul 2>&1
+tasklist /FI "IMAGENAME eq python.exe" >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [%DATE% %TIME%] Checking for stale agent processes...
+    wmic process where "name='python.exe'" get ProcessId,CommandLine /FORMAT:LIST 2>nul | find "main.py" >nul
+    if !errorlevel! equ 0 (
+        echo [%DATE% %TIME%] Killing stale agent processes...
+        for /f "tokens=2 delims==" %%p in ('wmic process where "name='python.exe' and CommandLine like '%%main.py%%'" get ProcessId /VALUE 2^>nul ^| find "="') do (
+            taskkill /PID %%p /F >nul 2>&1
+        )
     )
 )
 
 REM Write our PID to lock file
-echo %~dp0> "%LOCKFILE%"
+echo %PID%> "%LOCKFILE%"
 
-REM Suppress Windows Error Reporting dialogs (registry-level)
+REM Suppress Windows Error Reporting dialogs
 reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f >nul 2>&1
 reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v Disabled /t REG_DWORD /d 1 /f >nul 2>&1
 reg add "HKLM\Software\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f >nul 2>&1
 reg add "HKLM\Software\Microsoft\Windows\Windows Error Reporting" /v Disabled /t REG_DWORD /d 1 /f >nul 2>&1
-
-REM Suppress JIT debugger and app-crash popups (IFEO)
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug" /v Auto /t REG_SZ /d 1 /f >nul 2>&1
 
-REM Reduce memory footprint: skip .pyc file generation
 set PYTHONDONTWRITEBYTECODE=1
 
 :loop
