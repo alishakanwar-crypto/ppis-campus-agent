@@ -64,9 +64,9 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (7:15 AM to 9:30 AM)
+# Attendance time window (7:00 AM to 9:30 AM IST)
 ATTENDANCE_START_HOUR = 7
-ATTENDANCE_START_MINUTE = 15
+ATTENDANCE_START_MINUTE = 0
 ATTENDANCE_END_HOUR = 9
 ATTENDANCE_END_MINUTE = 30
 
@@ -726,8 +726,10 @@ class AttendanceEngine:
             return None
 
     def _is_within_attendance_window(self) -> bool:
-        """Check if the current time is within the attendance window."""
-        now = datetime.now()
+        """Check if the current IST time is within the attendance window."""
+        from datetime import timezone, timedelta as _td
+        _ist = timezone(_td(hours=5, minutes=30))
+        now = datetime.now(_ist)
         start = now.replace(hour=ATTENDANCE_START_HOUR, minute=ATTENDANCE_START_MINUTE,
                             second=0, microsecond=0)
         end = now.replace(hour=ATTENDANCE_END_HOUR, minute=ATTENDANCE_END_MINUTE,
@@ -876,44 +878,48 @@ class AttendanceEngine:
         if agent_secret:
             headers["X-Agent-Secret"] = agent_secret
 
-        sent = False
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                # Always use template — guaranteed delivery to any number
-                resp = await client.post(
-                    f"{api_url}/api/send-whatsapp",
-                    json={
-                        "phone": phone,
-                        "template_name": "ppis_attendance_alert",
-                        "template_params": [name, time_str],
-                    },
-                    headers=headers,
-                )
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                        if data.get("status") == "ok":
-                            sent = True
-                    except Exception:
-                        pass
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            sent = False
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(
+                        f"{api_url}/api/send-whatsapp",
+                        json={
+                            "phone": phone,
+                            "template_name": "ppis_attendance_alert",
+                            "template_params": [name, time_str],
+                        },
+                        headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                            if data.get("status") == "ok":
+                                sent = True
+                        except Exception:
+                            pass
 
-                if sent:
-                    db.update_whatsapp_sent(attendance_id)
-                    self._mark_notification_sent(person_id)
-                    self.add_debug_log("whatsapp_sent",
-                                       f"Notification sent to {phone}: "
-                                       f"[Attendance] {name} at {time_str}")
-                else:
-                    resp_text = ""
-                    try:
-                        resp_text = resp.text[:200]
-                    except Exception:
-                        pass
-                    self.add_debug_log("whatsapp_failed",
-                                       f"Failed for {phone}: {resp_text}")
-        except Exception as e:
-            self.add_debug_log("whatsapp_error",
-                               f"Failed to send to {phone}: {type(e).__name__}: {e}")
+                    if sent:
+                        db.update_whatsapp_sent(attendance_id)
+                        self._mark_notification_sent(person_id)
+                        self.add_debug_log("whatsapp_sent",
+                                           f"Notification sent to {phone}: "
+                                           f"[Attendance] {name} at {time_str}")
+                        return
+                    else:
+                        resp_text = ""
+                        try:
+                            resp_text = resp.text[:200]
+                        except Exception:
+                            pass
+                        self.add_debug_log("whatsapp_retry" if attempt < max_retries else "whatsapp_failed",
+                                           f"Attempt {attempt}/{max_retries} failed for {phone}: {resp_text}")
+            except Exception as e:
+                self.add_debug_log("whatsapp_retry" if attempt < max_retries else "whatsapp_failed",
+                                   f"Attempt {attempt}/{max_retries} failed for {phone}: {type(e).__name__}: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(2 * attempt)
 
     async def _sync_attendance_to_cloud(self, record: dict, parent_phones: str):
         """Report attendance record to cloud backend for dashboard display."""
