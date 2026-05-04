@@ -1003,8 +1003,8 @@ class AttendanceEngine:
                     "camera_source": camera,
                 }, phone)
 
-                # Send WhatsApp if not already sent
-                if not whatsapp_sent and phone:
+                # Always re-send notifications with correct IST time on re-sync
+                if phone:
                     # Convert logged_at (UTC in DB) to IST for notification
                     try:
                         from datetime import timezone, timedelta as _td
@@ -1013,6 +1013,7 @@ class AttendanceEngine:
                         t_ist = t + _td(hours=5, minutes=30)
                         time_str = t_ist.strftime("%I:%M %p")
                     except Exception:
+                        from datetime import timezone, timedelta as _td
                         _ist = timezone(_td(hours=5, minutes=30))
                         time_str = datetime.now(_ist).strftime("%I:%M %p")
 
