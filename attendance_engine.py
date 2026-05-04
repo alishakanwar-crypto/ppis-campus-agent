@@ -956,6 +956,76 @@ class AttendanceEngine:
         except Exception as e:
             self.add_debug_log("cloud_sync_error", f"Cloud sync error: {e}")
 
+    async def _resync_todays_records(self):
+        """Re-sync locally marked attendance records that may not have been
+        synced to cloud or notified due to previous event-loop issues."""
+        try:
+            records = db.get_attendance_log(limit=200)
+            today_ist = date.today().isoformat()
+            today_records = [
+                r for r in records
+                if r.get("logged_at", "")[:10] == today_ist
+            ]
+            if not today_records:
+                return
+
+            logger.info(f"Re-syncing {len(today_records)} locally-marked records to cloud")
+
+            for rec in today_records:
+                pid = rec.get("person_id", "")
+                name = rec.get("name", "")
+                confidence = rec.get("confidence", 0)
+                camera = rec.get("camera_source", "")
+                logged_at = rec.get("logged_at", "")
+                whatsapp_sent = rec.get("whatsapp_sent", 0)
+                attendance_id = rec.get("id", 0)
+
+                # Get phone from face DB
+                phone = ""
+                for face_pid, face_data in self.known_faces.items():
+                    if face_pid == pid:
+                        phone = face_data.get("phone", "")
+                        break
+
+                # Sync to cloud dashboard
+                grade = ""
+                for part in pid.split("_"):
+                    if part.startswith("GRADE") or part.startswith("NUR") or part.startswith("PREP"):
+                        grade = part
+                        break
+
+                await self._sync_attendance_to_cloud({
+                    "person_id": pid,
+                    "name": name,
+                    "confidence": confidence,
+                    "camera_source": camera,
+                }, phone)
+
+                # Send WhatsApp if not already sent
+                if not whatsapp_sent and phone:
+                    time_str = logged_at[11:16] if len(logged_at) > 16 else "today"
+                    # Convert 24h to 12h format
+                    try:
+                        from datetime import datetime as _dt
+                        t = _dt.strptime(time_str, "%H:%M")
+                        time_str = t.strftime("%I:%M %p")
+                    except Exception:
+                        pass
+
+                    phone_list = [p.strip() for p in phone.split(",") if p.strip()]
+                    for parent_phone in phone_list:
+                        await self._send_whatsapp_notification(
+                            attendance_id=attendance_id,
+                            person_id=pid,
+                            name=name,
+                            time_str=time_str,
+                            phone=parent_phone,
+                        )
+
+            logger.info(f"Re-sync complete for {len(today_records)} records")
+        except Exception as e:
+            logger.error(f"Re-sync failed: {e}")
+
     async def _send_camera_alert(self, cam_key: str, camera_label: str,
                                  error_count: int, alert_type: str = "offline"):
         """Send WhatsApp alert when a camera goes offline or recovers."""
@@ -1291,6 +1361,9 @@ class AttendanceEngine:
             )
             if gate_cams:
                 logger.info(f"Gate/special cameras: {gate_labels}")
+
+            # Re-sync locally marked but un-synced/un-notified records on startup
+            await self._resync_todays_records()
 
             # Clear daily marks at start if it's a new day
             today = date.today().isoformat()
