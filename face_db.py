@@ -60,7 +60,7 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
     try:
         if Image is not None:
             pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            max_dim = 800
+            max_dim = 480
             if max(pil_img.size) > max_dim:
                 pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
             img_array = np.asarray(pil_img, dtype=np.uint8)

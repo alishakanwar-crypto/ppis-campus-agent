@@ -177,6 +177,10 @@ async def sync_faces_from_cloud() -> int:
                         logger.info(f"Cloud face sync: registered {face_meta['name']} ({person_id})")
                     else:
                         logger.warning(f"Cloud face sync: failed {person_id}: {result.get('error')}")
+                except (MemoryError, OSError) as e:
+                    logger.error(f"Cloud face sync: MEMORY ERROR for {person_id}, skipping: {e}")
+                    import gc as _gc; _gc.collect()
+                    continue
                 except Exception as e:
                     logger.warning(f"Cloud face sync: error downloading {person_id}: {e}")
 
@@ -812,7 +816,10 @@ async def lifespan(app: FastAPI):
         f"{len(config.get('camera_mapping', {}))} camera mappings"
     )
     # Sync face registrations from cloud DB (downloads images, computes encodings)
-    await sync_faces_from_cloud()
+    try:
+        await sync_faces_from_cloud()
+    except Exception as e:
+        logger.error(f"Face sync crashed during startup (non-fatal): {e}")
     # Pre-load registered faces into attendance engine
     attendance_engine.reload_faces()
     # Start WebSocket client in background
