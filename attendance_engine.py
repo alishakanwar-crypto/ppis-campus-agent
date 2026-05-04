@@ -820,21 +820,23 @@ class AttendanceEngine:
             "camera_source": camera_source,
         }
 
-        # Schedule async tasks — may be called from a thread pool,
-        # so use run_coroutine_threadsafe instead of create_task
-        try:
-            loop = asyncio.get_running_loop()
-            _schedule = lambda coro: asyncio.create_task(coro)
-        except RuntimeError:
-            # Running inside run_in_executor thread — no event loop here
+        # Schedule async tasks from thread pool using stored event loop
+        loop = getattr(self, '_event_loop', None)
+        if loop is None:
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
             except RuntimeError:
-                loop = None
-            _schedule = (
-                lambda coro: asyncio.run_coroutine_threadsafe(coro, loop)
-                if loop else None
-            )
+                pass
+
+        def _schedule(coro):
+            if loop is None:
+                logger.error("No event loop available for async task")
+                return
+            try:
+                asyncio.get_running_loop()
+                asyncio.create_task(coro)
+            except RuntimeError:
+                asyncio.run_coroutine_threadsafe(coro, loop)
 
         # Sync attendance to cloud dashboard
         _schedule(self._sync_attendance_to_cloud(result, phone or ""))
@@ -1096,6 +1098,8 @@ class AttendanceEngine:
         # Run CPU-bound face recognition in a thread pool so the event
         # loop stays responsive for WebSocket snapshot requests.
         loop = asyncio.get_event_loop()
+        # Store loop reference so thread-pool code can schedule async tasks
+        self._event_loop = loop
         return await loop.run_in_executor(
             None, self.recognize_faces_in_image,
             frame, source, faces_subset, insightface_subset)
