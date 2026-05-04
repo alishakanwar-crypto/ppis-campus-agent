@@ -415,15 +415,20 @@ class AttendanceEngine:
         try:
             pil_img = Image.open(io.BytesIO(image_bytes))
             # Force to RGB (handles RGBA, P, L, CMYK, grayscale, etc)
-            if pil_img.mode != "RGB":
-                pil_img = pil_img.convert("RGB")
-            # Convert directly to numpy uint8 (avoids face_recognition loader issues)
+            pil_img = pil_img.convert("RGB")
+            # Save to temp file and use face_recognition's loader (most reliable)
+            import tempfile as _tf
+            _tmp = _tf.NamedTemporaryFile(suffix=".jpg", delete=False, dir=".")
+            _tmp_path = _tmp.name
+            pil_img.save(_tmp, format="JPEG", quality=95)
+            _tmp.close()
             clean_buf = io.BytesIO()  # kept for del below
-            img_array = np.asarray(pil_img, dtype=np.uint8)
-            if img_array.ndim != 3 or img_array.shape[2] != 3:
-                self.add_debug_log("error", f"Bad array shape {img_array.shape} from {camera_source}")
-                return []
-            img_array = img_array.copy()  # ensure contiguous for dlib
+            img_array = face_recognition.load_image_file(_tmp_path)
+            try:
+                import os; os.unlink(_tmp_path)
+            except Exception:
+                pass
+            logger.info(f"Image loaded: shape={img_array.shape} dtype={img_array.dtype} from {camera_source}")
         except Exception as e:
             self.add_debug_log("error", f"Failed to load image: {e}")
             return []
