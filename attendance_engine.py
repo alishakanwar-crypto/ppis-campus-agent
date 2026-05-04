@@ -801,7 +801,9 @@ class AttendanceEngine:
 
         self.last_attendance[person_id] = now
         self._mark_daily(person_id)
-        time_str = datetime.now().strftime("%I:%M %p")
+        from datetime import timezone, timedelta as _td
+        _ist = timezone(_td(hours=5, minutes=30))
+        time_str = datetime.now(_ist).strftime("%I:%M %p")
 
         self.add_debug_log("attendance_marked",
                            f"{name} marked Present at {time_str} "
@@ -1003,14 +1005,16 @@ class AttendanceEngine:
 
                 # Send WhatsApp if not already sent
                 if not whatsapp_sent and phone:
-                    time_str = logged_at[11:16] if len(logged_at) > 16 else "today"
-                    # Convert 24h to 12h format
+                    # Convert logged_at (UTC in DB) to IST for notification
                     try:
-                        from datetime import datetime as _dt
-                        t = _dt.strptime(time_str, "%H:%M")
-                        time_str = t.strftime("%I:%M %p")
+                        from datetime import timezone, timedelta as _td
+                        _ist = timezone(_td(hours=5, minutes=30))
+                        t = datetime.strptime(logged_at[:19], "%Y-%m-%d %H:%M:%S")
+                        t_ist = t + _td(hours=5, minutes=30)
+                        time_str = t_ist.strftime("%I:%M %p")
                     except Exception:
-                        pass
+                        _ist = timezone(_td(hours=5, minutes=30))
+                        time_str = datetime.now(_ist).strftime("%I:%M %p")
 
                     phone_list = [p.strip() for p in phone.split(",") if p.strip()]
                     for parent_phone in phone_list:
