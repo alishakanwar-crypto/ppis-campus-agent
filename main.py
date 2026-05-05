@@ -54,7 +54,7 @@ logger = logging.getLogger("ppis-agent")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-CLOUD_API_BASE = "https://app-itszlsnn.fly.dev"
+CLOUD_API_BASE = "https://ppis-whatsapp-bot.fly.dev"
 CONFIG_FILE = Path(__file__).parent / "config.json"
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 SNAPSHOT_DIR.mkdir(exist_ok=True)
@@ -87,7 +87,7 @@ def load_config_local() -> dict:
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
     return {
-        "cloud_bot_url": "wss://app-itszlsnn.fly.dev/ws/agent",
+        "cloud_bot_url": "wss://ppis-whatsapp-bot.fly.dev/ws/agent",
         "agent_secret": os.environ.get("AGENT_SECRET", ""),
         "dvrs": [],
         "camera_mapping": {},
@@ -235,7 +235,7 @@ async def load_config() -> dict:
     if cloud_cfg and cloud_cfg.get("dvrs"):
         # Merge cloud data into a usable config dict
         cfg = {
-            "cloud_bot_url": cloud_cfg.get("cloud_bot_url", "wss://app-itszlsnn.fly.dev/ws/agent"),
+            "cloud_bot_url": cloud_cfg.get("cloud_bot_url", "wss://ppis-whatsapp-bot.fly.dev/ws/agent"),
             "agent_secret": cloud_cfg.get("agent_secret", os.environ.get("AGENT_SECRET", "")),
             "dvrs": cloud_cfg.get("dvrs", []),
             "camera_mapping": cloud_cfg.get("camera_mapping", {}),
@@ -515,7 +515,7 @@ async def websocket_client():
     """Persistent WebSocket connection to the cloud bot.
     Receives snapshot requests and sends back images."""
     global ws_connection
-    url = config.get("cloud_bot_url", "wss://app-itszlsnn.fly.dev/ws/agent")
+    url = config.get("cloud_bot_url", "wss://ppis-whatsapp-bot.fly.dev/ws/agent")
     secret = config.get("agent_secret", os.environ.get("AGENT_SECRET", ""))
 
     while True:
@@ -775,7 +775,7 @@ async def _health_watchdog():
 
             # --- Check 2: Notification system reachable ---
             try:
-                api_url = attendance_engine.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
+                api_url = attendance_engine.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
                 async with httpx.AsyncClient(timeout=10) as client:
                     resp = await client.get(f"{api_url}/debug/version")
                     if resp.status_code == 200:
@@ -810,7 +810,7 @@ async def lifespan(app: FastAPI):
     # Load config from cloud DB (falls back to local config.json)
     config = await load_config()
     # ALWAYS enforce the correct cloud bot URL (prevents stale config.json issues)
-    config["cloud_bot_url"] = "wss://app-itszlsnn.fly.dev/ws/agent"
+    config["cloud_bot_url"] = "wss://ppis-whatsapp-bot.fly.dev/ws/agent"
     logger.info(
         f"Config loaded: {len(config.get('dvrs', []))} DVRs, "
         f"{len(config.get('camera_mapping', {}))} camera mappings"
@@ -1608,7 +1608,7 @@ async def sync_attendance_to_cloud():
             "sample_dates": [str(r.get("logged_at", ""))[:16] for r in records[:5]],
         }
 
-    api_url = os.environ.get("CLOUD_BOT_URL", "https://app-itszlsnn.fly.dev")
+    api_url = os.environ.get("CLOUD_BOT_URL", "https://ppis-whatsapp-bot.fly.dev")
     agent_secret = os.environ.get("AGENT_SECRET", "")
     headers = {"Content-Type": "application/json"}
     if agent_secret:

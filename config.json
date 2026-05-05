@@ -1,5 +1,5 @@
 {
-  "cloud_bot_url": "wss://app-itszlsnn.fly.dev/ws/agent",
+  "cloud_bot_url": "wss://ppis-whatsapp-bot.fly.dev/ws/agent",
   "agent_secret": "",
   "dvrs": [],
   "camera_mapping": {},

@@ -867,7 +867,7 @@ class AttendanceEngine:
         Template messages are delivered regardless of whether the parent
         has ever messaged the bot.
         """
-        api_url = self.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
+        api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
         agent_secret = os.environ.get("AGENT_SECRET", "")
         headers = {"Content-Type": "application/json"}
         if agent_secret:
@@ -918,7 +918,7 @@ class AttendanceEngine:
 
     async def _sync_attendance_to_cloud(self, record: dict, parent_phones: str):
         """Report attendance record to cloud backend for dashboard display."""
-        api_url = self.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
+        api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
         agent_secret = os.environ.get("AGENT_SECRET", "")
         headers = {"Content-Type": "application/json"}
         if agent_secret:
@@ -1037,7 +1037,7 @@ class AttendanceEngine:
         """Send WhatsApp alert when a camera goes offline or recovers."""
         if not self._admin_phones:
             return
-        api_url = self.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
+        api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
         agent_secret = os.environ.get("AGENT_SECRET", "")
         headers = {}
         if agent_secret:
