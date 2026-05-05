@@ -415,26 +415,21 @@ class AttendanceEngine:
         try:
             pil_img = Image.open(io.BytesIO(image_bytes))
             pil_img = pil_img.convert("RGB")
-            # Save to temp file — dlib loads via its own C++ loader
-            import tempfile as _tf
-            _tmp = _tf.NamedTemporaryFile(suffix=".jpg", delete=False, dir=".")
-            _tmp_path = _tmp.name
-            pil_img.save(_tmp, format="JPEG", quality=95)
-            _tmp.close()
             clean_buf = io.BytesIO()  # kept for del below
-            # Use dlib's native loader to avoid numpy ABI issues
-            import dlib as _dlib
-            img_array = _dlib.load_rgb_image(_tmp_path)
-            try:
-                import os; os.unlink(_tmp_path)
-            except Exception:
-                pass
+            # Convert PIL image to numpy array directly (avoids dlib loader
+            # compatibility issues with numpy 2.x)
+            img_array = np.asarray(pil_img, dtype=np.uint8)
+            if img_array.ndim != 3 or img_array.shape[2] != 3:
+                raise ValueError(f"Bad image shape: {img_array.shape}")
+            # Ensure array is contiguous and writable (dlib requirement)
+            img_array = np.ascontiguousarray(img_array)
         except Exception as e:
             self.add_debug_log("error", f"Failed to load image: {e}")
             return []
 
         # Upsample 2x to detect smaller/distant faces from security cameras
         try:
+            import dlib as _dlib
             _detector = _dlib.get_frontal_face_detector()
             dlib_dets = _detector(img_array, 2)
             # Convert dlib rectangles to face_recognition format (top, right, bottom, left)
