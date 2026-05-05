@@ -2,9 +2,10 @@
 REM PPIS Campus Agent — Auto-restart wrapper
 REM Features:
 REM   - Auto-restarts if the agent crashes
-REM   - Pulls latest code before each restart
+REM   - Pulls latest code before each restart (stashes local changes first)
 REM   - Suppresses Windows error dialogs
 REM   - 10 second cooldown between restarts
+REM   - Cleans up old snapshot files to prevent disk fill
 
 title PPIS Campus Agent (24/7)
 cd /d "%~dp0"
@@ -23,7 +24,15 @@ echo.
 echo ============================================
 echo [%DATE% %TIME%] Pulling latest code...
 echo ============================================
+REM Stash any local changes first (prevents git pull from failing)
+git stash 2>nul
 git pull 2>nul
+
+REM Clean up old snapshot files (older than 1 day) to prevent disk fill
+echo [%DATE% %TIME%] Cleaning old snapshots...
+forfiles /p "%~dp0snapshots" /d -1 /c "cmd /c del @path" 2>nul
+forfiles /p "%~dp0attendance_snapshots" /d -1 /c "cmd /c del @path" 2>nul
+
 echo.
 echo [%DATE% %TIME%] Starting PPIS Campus Agent...
 echo ============================================

@@ -518,6 +518,7 @@ async def websocket_client():
     url = config.get("cloud_bot_url", "wss://ppis-whatsapp-bot.fly.dev/ws/agent")
     secret = config.get("agent_secret", os.environ.get("AGENT_SECRET", ""))
 
+    ws_backoff = 5
     while True:
         try:
             logger.info(f"Connecting to cloud bot WebSocket: {url}")
@@ -529,6 +530,7 @@ async def websocket_client():
                 max_size=10 * 1024 * 1024,  # 10 MB max message size
             ) as ws:
                 ws_connection = ws
+                ws_backoff = 5  # Reset backoff on successful connect
                 logger.info("Connected to cloud bot WebSocket")
 
                 # Send hello
@@ -619,11 +621,13 @@ async def websocket_client():
         except websockets.exceptions.ConnectionClosed as e:
             logger.warning(f"WebSocket closed: {e}. Reconnecting in 5s...")
             ws_connection = None
+            ws_backoff = 5
         except Exception as e:
-            logger.error(f"WebSocket error: {e}. Reconnecting in 5s...")
+            logger.error(f"WebSocket error: {e}. Reconnecting in {ws_backoff}s...")
             ws_connection = None
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(ws_backoff)
+        ws_backoff = min(ws_backoff * 2, 60)
 
 
 async def handle_snapshot_request(ws, classroom: str, request_id: str):
@@ -752,8 +756,12 @@ async def _health_watchdog():
     - Are cameras responding?
     - Is the notification system reachable?
     - Periodically sync new faces from cloud.
+    - Monitor memory usage and force cleanup if too high.
+    - Clean stale snapshot files.
     """
+    import gc
     face_sync_counter = 0
+    cleanup_counter = 0
     while True:
         await asyncio.sleep(60)
         try:
@@ -794,11 +802,51 @@ async def _health_watchdog():
                     attendance_engine.reload_faces()
                     logger.info(f"WATCHDOG: Synced {synced} new face(s) from cloud")
 
+            # --- Check 4: Memory monitoring (every 5 min) ---
+            cleanup_counter += 1
+            if cleanup_counter >= 5:
+                cleanup_counter = 0
+                try:
+                    import psutil
+                    proc = psutil.Process()
+                    mem_mb = proc.memory_info().rss / (1024 * 1024)
+                    attendance_engine._health["memory_mb"] = round(mem_mb, 1)
+                    if mem_mb > 800:
+                        logger.warning(f"WATCHDOG: High memory usage: {mem_mb:.0f}MB — forcing cleanup")
+                        # Trim debug logs
+                        attendance_engine.debug_logs = attendance_engine.debug_logs[-100:]
+                        # Force garbage collection
+                        gc.collect()
+                        # Clean old snapshot files
+                        _cleanup_old_snapshots()
+                except ImportError:
+                    pass
+                except Exception as e:
+                    logger.debug(f"WATCHDOG: Memory check error: {e}")
+
+            # --- Check 5: Clean stale snapshots (every 30 min) ---
+            if face_sync_counter == 0 and cleanup_counter == 0:
+                _cleanup_old_snapshots()
+
             attendance_engine._health["last_health_check"] = (
                 __import__("datetime").datetime.now().isoformat()
             )
         except Exception as e:
             logger.error(f"WATCHDOG error: {e}")
+
+
+def _cleanup_old_snapshots():
+    """Remove snapshot files older than 2 hours to prevent disk fill."""
+    cutoff = time.time() - 7200  # 2 hours
+    for snap_dir in [SNAPSHOT_DIR, Path(__file__).parent / "attendance_snapshots"]:
+        if not snap_dir.exists():
+            continue
+        try:
+            for f in snap_dir.iterdir():
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+        except Exception:
+            pass
 
 
 @asynccontextmanager
