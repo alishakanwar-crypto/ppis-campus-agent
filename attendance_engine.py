@@ -1331,30 +1331,32 @@ class AttendanceEngine:
                     "is_gate": False,
                 })
 
-        # Also include entry gate cameras and special rooms (check ALL faces)
-        _GATE_KEYWORDS = {"ENTRY", "ENTRANCE", "DISPERSAL", "ADMISSION", "RECEPTION"}
+        # Include ALL remaining cameras (gates, labs, staff rooms, assembly,
+        # activity rooms, parks, etc.) so teachers can be recognized everywhere.
+        # These get grade=None so they scan ALL known faces.
         for location, cam_data in camera_mapping.items():
-            loc_upper = location.upper()
-            # Only match actual entry gates, not PARK GATE or other park cameras
-            if any(kw in loc_upper for kw in _GATE_KEYWORDS):
-                all_cams = cam_data.get("all_cameras", [])
-                cams_to_add = all_cams if all_cams else [cam_data]
-                for ac in cams_to_add:
-                    dvr_idx = ac.get("dvr_index", 0)
-                    channel = ac.get("channel", 1)
-                    key = (dvr_idx, channel)
-                    if key in seen or dvr_idx >= len(dvrs):
-                        continue
-                    seen.add(key)
-                    cameras.append({
-                        "location": location,
-                        "grade": None,  # Check ALL faces at gates
-                        "dvr_index": dvr_idx,
-                        "channel": channel,
-                        "dvr": dvrs[dvr_idx],
-                        "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
-                        "is_gate": True,
-                    })
+            all_cams = cam_data.get("all_cameras", [])
+            cams_to_add = all_cams if all_cams else [cam_data]
+            for ac in cams_to_add:
+                dvr_idx = ac.get("dvr_index", 0)
+                channel = ac.get("channel", 1)
+                key = (dvr_idx, channel)
+                if key in seen or dvr_idx >= len(dvrs):
+                    continue
+                seen.add(key)
+                loc_upper = location.upper()
+                _GATE_KEYWORDS = {"ENTRY", "ENTRANCE", "DISPERSAL",
+                                  "ADMISSION", "RECEPTION"}
+                is_gate = any(kw in loc_upper for kw in _GATE_KEYWORDS)
+                cameras.append({
+                    "location": location,
+                    "grade": None,  # Check ALL faces
+                    "dvr_index": dvr_idx,
+                    "channel": channel,
+                    "dvr": dvrs[dvr_idx],
+                    "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
+                    "is_gate": is_gate,
+                })
 
         return cameras
 
