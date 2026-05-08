@@ -731,7 +731,6 @@ async def _auto_start_classwise():
         return
 
     attendance_engine.test_mode = False
-    attendance_engine.confidence_threshold = 0.30
     attendance_engine.reload_faces()
 
     # Configure camera alert phones from agent settings
@@ -774,7 +773,6 @@ async def _health_watchdog():
                         logger.warning("WATCHDOG: Classwise monitoring stopped — restarting")
                         attendance_engine._health["total_recoveries"] += 1
                         attendance_engine.test_mode = False
-                        attendance_engine.confidence_threshold = 0.30
                         attendance_engine.reload_faces()
                         attendance_engine.classwise_running = True
                         attendance_engine._classwise_task = asyncio.create_task(
