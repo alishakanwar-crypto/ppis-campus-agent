@@ -840,7 +840,7 @@ class AttendanceEngine:
         # Sync attendance to cloud dashboard
         _schedule(self._sync_attendance_to_cloud(result, phone or ""))
 
-        # Send WhatsApp notification ONCE per student per day
+        # Send WhatsApp notification ONCE per person per day
         if phone and not self._is_notification_sent_today(person_id):
             phone_list = [p.strip() for p in phone.split(",") if p.strip()]
             for parent_phone in phone_list:
@@ -862,16 +862,17 @@ class AttendanceEngine:
                                            phone: str):
         """Send WhatsApp attendance notification via cloud bot API.
 
-        Always uses the ppis_attendance_alert template for guaranteed
-        delivery to BOTH parents — no 24-hour window dependency.
-        Template messages are delivered regardless of whether the parent
-        has ever messaged the bot.
+        Uses ppis_attendance_alert template for guaranteed delivery.
+        For teachers (person_id starts with TEACHER_), the notification
+        goes directly to the teacher's own WhatsApp number.
         """
         api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
         agent_secret = os.environ.get("AGENT_SECRET", "")
         headers = {"Content-Type": "application/json"}
         if agent_secret:
             headers["X-Agent-Secret"] = agent_secret
+
+        is_teacher = person_id.startswith("TEACHER_")
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):
