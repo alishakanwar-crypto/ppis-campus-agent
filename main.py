@@ -612,6 +612,25 @@ async def websocket_client():
                                     "error": "Empty DVR data",
                                 }))
 
+                        elif msg_type == "restart":
+                            logger.info("REMOTE RESTART requested via WebSocket")
+                            await ws.send(json.dumps({
+                                "type": "restart_ack",
+                                "success": True,
+                            }))
+                            await ws.close()
+                            os._exit(0)  # run_forever.bat will restart with git pull
+
+                        elif msg_type == "sync_faces":
+                            logger.info("REMOTE FACE SYNC requested via WebSocket")
+                            synced = await sync_faces_from_cloud()
+                            if synced > 0:
+                                attendance_engine.reload_faces()
+                            await ws.send(json.dumps({
+                                "type": "sync_faces_result",
+                                "synced": synced,
+                            }))
+
                         else:
                             logger.warning(f"Unknown WS message type: {msg_type}")
 
