@@ -312,9 +312,18 @@ class AttendanceEngine:
                            f"(engine={engine_label})")
 
     def _rebuild_grade_cache(self):
-        """Build per-grade face lookup for classwise monitoring."""
+        """Build per-grade face lookup for classwise monitoring.
+
+        Also builds a separate teacher face cache so that teacher faces
+        are included in every classroom camera scan (teachers walk
+        through all classrooms, not just gates).
+        """
         self._grade_face_cache.clear()
+        self._teacher_faces_cache: dict = {}
         for person_id, person_data in self.known_faces.items():
+            if person_id.startswith("TEACHER_"):
+                self._teacher_faces_cache[person_id] = person_data
+                continue
             grade = _grade_from_person_id(person_id)
             if grade:
                 if grade not in self._grade_face_cache:
@@ -322,7 +331,11 @@ class AttendanceEngine:
                 self._grade_face_cache[grade][person_id] = person_data
 
         self._grade_face_cache_insightface.clear()
+        self._teacher_faces_cache_insightface: dict = {}
         for person_id, person_data in self.known_faces_insightface.items():
+            if person_id.startswith("TEACHER_"):
+                self._teacher_faces_cache_insightface[person_id] = person_data
+                continue
             grade = _grade_from_person_id(person_id)
             if grade:
                 if grade not in self._grade_face_cache_insightface:
@@ -330,22 +343,43 @@ class AttendanceEngine:
                 self._grade_face_cache_insightface[grade][person_id] = person_data
 
         grades_with_faces = {g: len(v) for g, v in self._grade_face_cache.items()}
-        logger.info(f"Grade face cache: {grades_with_faces}")
+        logger.info(f"Grade face cache: {grades_with_faces}, "
+                    f"teacher faces: {len(self._teacher_faces_cache)} legacy / "
+                    f"{len(self._teacher_faces_cache_insightface)} insightface")
 
     def get_faces_for_grade(self, grade: str | None) -> dict:
         """Return known_faces filtered to a specific grade.
 
         If grade is None, returns all known faces (for entry gates etc).
+        Teacher faces are always included so they can be recognized
+        on every camera (classroom + gate).
         """
         if grade is None:
             return self.known_faces
-        return self._grade_face_cache.get(grade, {})
+        grade_faces = self._grade_face_cache.get(grade, {})
+        teacher_faces = getattr(self, '_teacher_faces_cache', {})
+        if teacher_faces:
+            merged = {}
+            merged.update(grade_faces)
+            merged.update(teacher_faces)
+            return merged
+        return grade_faces
 
     def get_insightface_for_grade(self, grade: str | None) -> dict:
-        """Return InsightFace embeddings filtered to a specific grade."""
+        """Return InsightFace embeddings filtered to a specific grade.
+
+        Teacher faces are always included.
+        """
         if grade is None:
             return self.known_faces_insightface
-        return self._grade_face_cache_insightface.get(grade, {})
+        grade_faces = self._grade_face_cache_insightface.get(grade, {})
+        teacher_faces = getattr(self, '_teacher_faces_cache_insightface', {})
+        if teacher_faces:
+            merged = {}
+            merged.update(grade_faces)
+            merged.update(teacher_faces)
+            return merged
+        return grade_faces
 
     def _is_already_marked_today(self, person_id: str) -> bool:
         """Check if attendance already marked for this person today.
