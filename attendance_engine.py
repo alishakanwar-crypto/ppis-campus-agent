@@ -185,7 +185,7 @@ class AttendanceEngine:
         self.confidence_threshold = 0.42  # Match confidence > 42%
         self.min_sightings = 2  # Must be seen 2+ times before marking present
         self.sighting_window = 300  # 5-minute window for sightings to accumulate
-        self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence}, ...]
+        self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
         self.known_faces: dict = {}
         self.known_faces_insightface: dict = {}  # person_id -> {name, phone, embeddings: [...]}
         self.last_attendance: dict[str, float] = {}  # person_id -> timestamp
@@ -537,6 +537,8 @@ class AttendanceEngine:
                         image_bytes=image_bytes,
                         face_location=location,
                         camera_source=camera_source,
+                        embedding=encoding,
+                        face_size=(face_w, face_h),
                     )
                     if result:
                         results.append(result)
@@ -701,6 +703,8 @@ class AttendanceEngine:
                         image_bytes=image_bytes,
                         face_location=(0, 0, 0, 0),
                         camera_source=camera_source,
+                        embedding=embedding,
+                        face_size=(int(face_w), int(face_h)),
                     )
                     if result:
                         results.append(result)
@@ -865,7 +869,9 @@ class AttendanceEngine:
         self._notification_sent[person_id] = date.today().isoformat()
 
     def _record_sighting(self, person_id: str, confidence: float,
-                         camera_source: str) -> int:
+                         camera_source: str,
+                         embedding: np.ndarray | None = None,
+                         face_size: tuple[int, int] | None = None) -> int:
         """Record a face sighting and return how many recent sightings exist."""
         now = time.time()
         if person_id not in self._sightings:
@@ -874,6 +880,8 @@ class AttendanceEngine:
             "time": now,
             "camera": camera_source,
             "confidence": confidence,
+            "embedding": embedding,
+            "face_size": face_size,
         })
         # Prune old sightings outside the window
         cutoff = now - self.sighting_window
@@ -882,10 +890,89 @@ class AttendanceEngine:
         ]
         return len(self._sightings[person_id])
 
+    def _check_anti_spoof(self, person_id: str, name: str) -> bool:
+        """Anti-spoofing check: detect if sightings look like a static photo.
+
+        Returns True if the sightings appear to be from a REAL person,
+        False if they look like a photo/spoof (and attendance should be blocked).
+
+        Three checks:
+        1. Embedding variance — real faces show slight natural variation between
+           frames (micro-movements, lighting changes). A static photo produces
+           near-identical embeddings.
+        2. Face size consistency — a photo held to a camera often produces faces
+           with unrealistically identical sizes across frames. Real people move
+           and their face size varies slightly.
+        3. Camera diversity — sightings from multiple cameras strongly indicate
+           a real person walking through campus (optional bonus signal).
+        """
+        sightings = self._sightings.get(person_id, [])
+        if len(sightings) < 2:
+            return True  # Not enough data to check, allow
+
+        # --- Check 1: Embedding variance ---
+        embeddings = [s["embedding"] for s in sightings
+                      if s.get("embedding") is not None]
+        if len(embeddings) >= 2:
+            # Compute pairwise cosine similarity between consecutive embeddings
+            similarities = []
+            for i in range(len(embeddings) - 1):
+                sim = float(np.dot(embeddings[i], embeddings[i + 1]))
+                similarities.append(sim)
+            avg_sim = sum(similarities) / len(similarities)
+
+            # Real faces: embeddings vary slightly between frames due to
+            # micro-expressions, head tilt, lighting changes.
+            # Typical real-face similarity: 0.70 - 0.95
+            # Static photo similarity: 0.97 - 1.00 (nearly identical)
+            if avg_sim > 0.97:
+                self.add_debug_log("anti_spoof_blocked",
+                                   f"{name}: embeddings too similar "
+                                   f"(avg cosine sim {avg_sim:.4f} > 0.97) — "
+                                   f"likely a static photo",
+                                   person_id=person_id)
+                return False
+
+        # --- Check 2: Face size variance ---
+        face_sizes = [s["face_size"] for s in sightings
+                      if s.get("face_size") is not None]
+        if len(face_sizes) >= 2:
+            widths = [fs[0] for fs in face_sizes]
+            heights = [fs[1] for fs in face_sizes]
+            avg_w = sum(widths) / len(widths)
+            avg_h = sum(heights) / len(heights)
+            # Coefficient of variation (std/mean) for width and height
+            if avg_w > 0 and avg_h > 0:
+                std_w = (sum((w - avg_w) ** 2 for w in widths) / len(widths)) ** 0.5
+                std_h = (sum((h - avg_h) ** 2 for h in heights) / len(heights)) ** 0.5
+                cv_w = std_w / avg_w
+                cv_h = std_h / avg_h
+                # Real faces: some size variation as person moves (CV > 0.01)
+                # Static photo: virtually identical sizes (CV ~ 0)
+                if cv_w < 0.005 and cv_h < 0.005 and len(face_sizes) >= 3:
+                    self.add_debug_log("anti_spoof_blocked",
+                                       f"{name}: face size too consistent "
+                                       f"(width CV={cv_w:.4f}, height CV={cv_h:.4f}) — "
+                                       f"likely a static photo",
+                                       person_id=person_id)
+                    return False
+
+        # --- Check 3: Camera diversity (bonus signal, not blocking) ---
+        cameras = set(s["camera"] for s in sightings)
+        if len(cameras) > 1:
+            self.add_debug_log("anti_spoof_multi_cam",
+                               f"{name}: seen on {len(cameras)} cameras — "
+                               f"strong real-person signal",
+                               person_id=person_id)
+
+        return True
+
     def _process_attendance(self, person_id: str, name: str, phone: str,
                             confidence: float, image_bytes: bytes,
                             face_location: tuple,
-                            camera_source: str) -> dict | None:
+                            camera_source: str,
+                            embedding: np.ndarray | None = None,
+                            face_size: tuple[int, int] | None = None) -> dict | None:
         """Process an attendance detection: check time window, cooldown/daily dedup, log, and notify."""
         now = time.time()
 
@@ -903,7 +990,10 @@ class AttendanceEngine:
 
         # Multi-detection: require 2+ sightings within the sighting window
         # to prevent false positives from one-off camera noise/artifacts.
-        sighting_count = self._record_sighting(person_id, confidence, camera_source)
+        sighting_count = self._record_sighting(
+            person_id, confidence, camera_source,
+            embedding=embedding, face_size=face_size,
+        )
         if sighting_count < self.min_sightings:
             self.add_debug_log("awaiting_confirmation",
                                f"{name} sighting {sighting_count}/{self.min_sightings} "
@@ -911,6 +1001,18 @@ class AttendanceEngine:
                                f"to confirm presence)",
                                person_id=person_id,
                                confidence=confidence)
+            return None
+
+        # Anti-spoofing: check that sightings look like a real person,
+        # not a static photo held up to the camera.
+        if not self._check_anti_spoof(person_id, name):
+            self.add_debug_log("spoof_rejected",
+                               f"{name} blocked by anti-spoof check — "
+                               f"resetting sightings",
+                               person_id=person_id,
+                               confidence=confidence)
+            # Clear sightings so they can't just wait and try again
+            self._sightings.pop(person_id, None)
             return None
 
         # Cooldown check (prevents rapid duplicate detections)
@@ -1735,6 +1837,7 @@ class AttendanceEngine:
             ),
             "grades_with_faces": len(self._grade_face_cache),
             "health": self._health.copy(),
+            "anti_spoof_enabled": True,
         }
         if self.classwise_running:
             status["classwise_stats"] = self._classwise_stats.copy()
