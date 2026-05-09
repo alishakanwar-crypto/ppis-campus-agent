@@ -182,7 +182,10 @@ class AttendanceEngine:
         self.classwise_running = False
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
-        self.confidence_threshold = 0.50  # Match confidence > 50% (raised from 42% to reduce false positives like Navish/Nitya)
+        self.confidence_threshold = 0.42  # Match confidence > 42%
+        self.min_sightings = 2  # Must be seen 2+ times before marking present
+        self.sighting_window = 300  # 5-minute window for sightings to accumulate
+        self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence}, ...]
         self.known_faces: dict = {}
         self.known_faces_insightface: dict = {}  # person_id -> {name, phone, embeddings: [...]}
         self.last_attendance: dict[str, float] = {}  # person_id -> timestamp
@@ -494,6 +497,18 @@ class AttendanceEngine:
         results = []
 
         for i, (encoding, location) in enumerate(zip(face_encodings, face_locations)):
+            # Face quality filter: reject tiny/distant faces (legacy)
+            top, right, bottom, left = location
+            face_w = right - left
+            face_h = bottom - top
+            min_face_px = 40
+            if face_w < min_face_px or face_h < min_face_px:
+                self.add_debug_log("face_too_small",
+                                   f"Face {face_w}x{face_h}px < {min_face_px}px "
+                                   f"minimum from {camera_source} — skipping",
+                                   confidence=0.0)
+                continue
+
             match_result = self._match_face(encoding, faces_to_check)
 
             if match_result:
@@ -628,6 +643,27 @@ class AttendanceEngine:
 
         results = []
         for i, face_obj in enumerate(detected):
+            # Face quality filter: reject tiny/distant faces
+            bbox = face_obj.bbox  # [x1, y1, x2, y2]
+            face_w = bbox[2] - bbox[0]
+            face_h = bbox[3] - bbox[1]
+            min_face_px = 40  # minimum face size in pixels
+            if face_w < min_face_px or face_h < min_face_px:
+                self.add_debug_log("face_too_small",
+                                   f"Face {face_w:.0f}x{face_h:.0f}px < {min_face_px}px "
+                                   f"minimum from {camera_source} — skipping",
+                                   confidence=0.0)
+                continue
+
+            # Detection score filter: InsightFace detection confidence
+            det_score = getattr(face_obj, 'det_score', 1.0)
+            if det_score < 0.5:
+                self.add_debug_log("low_det_score",
+                                   f"Detection score {det_score:.2f} < 0.5 "
+                                   f"from {camera_source} — skipping",
+                                   confidence=0.0)
+                continue
+
             embedding = face_obj.normed_embedding  # 512-d normalized embedding
 
             match_result = self._match_insightface(embedding, faces_if)
@@ -650,7 +686,9 @@ class AttendanceEngine:
 
                 self.add_debug_log("face_matched",
                                    f"Matched {match_result['name']} "
-                                   f"(confidence: {confidence:.1%}) [InsightFace]",
+                                   f"(confidence: {confidence:.1%}, "
+                                   f"face: {face_w:.0f}x{face_h:.0f}px, "
+                                   f"det: {det_score:.2f}) [InsightFace]",
                                    person_id=person_id,
                                    confidence=confidence)
 
@@ -784,6 +822,24 @@ class AttendanceEngine:
         """Record that notification was sent for this person today."""
         self._notification_sent[person_id] = date.today().isoformat()
 
+    def _record_sighting(self, person_id: str, confidence: float,
+                         camera_source: str) -> int:
+        """Record a face sighting and return how many recent sightings exist."""
+        now = time.time()
+        if person_id not in self._sightings:
+            self._sightings[person_id] = []
+        self._sightings[person_id].append({
+            "time": now,
+            "camera": camera_source,
+            "confidence": confidence,
+        })
+        # Prune old sightings outside the window
+        cutoff = now - self.sighting_window
+        self._sightings[person_id] = [
+            s for s in self._sightings[person_id] if s["time"] >= cutoff
+        ]
+        return len(self._sightings[person_id])
+
     def _process_attendance(self, person_id: str, name: str, phone: str,
                             confidence: float, image_bytes: bytes,
                             face_location: tuple,
@@ -799,6 +855,18 @@ class AttendanceEngine:
         if self._is_already_marked_today(person_id):
             self.add_debug_log("daily_already_marked",
                                f"{name} already marked today",
+                               person_id=person_id,
+                               confidence=confidence)
+            return None
+
+        # Multi-detection: require 2+ sightings within the sighting window
+        # to prevent false positives from one-off camera noise/artifacts.
+        sighting_count = self._record_sighting(person_id, confidence, camera_source)
+        if sighting_count < self.min_sightings:
+            self.add_debug_log("awaiting_confirmation",
+                               f"{name} sighting {sighting_count}/{self.min_sightings} "
+                               f"(need {self.min_sightings} within {self.sighting_window}s "
+                               f"to confirm presence)",
                                person_id=person_id,
                                confidence=confidence)
             return None
@@ -1576,6 +1644,12 @@ class AttendanceEngine:
             "test_mode": self.test_mode,
             "test_person_id": self.test_person_id,
             "confidence_threshold": self.confidence_threshold,
+            "min_sightings": self.min_sightings,
+            "sighting_window": self.sighting_window,
+            "pending_sightings": {
+                pid: len(sights) for pid, sights in self._sightings.items()
+                if sights
+            },
             "scan_interval": self.scan_interval,
             "registered_persons": len(self.known_faces),
             "registered_persons_insightface": len(self.known_faces_insightface),
