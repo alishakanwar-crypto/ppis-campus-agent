@@ -793,15 +793,57 @@ class AttendanceEngine:
             return None
 
     def _is_within_attendance_window(self) -> bool:
-        """Check if the current IST time is within the attendance window."""
+        """Check if the current IST time is within the attendance window.
+
+        Returns False on weekends (Saturday/Sunday) and holidays.
+        """
         from datetime import timezone, timedelta as _td
         _ist = timezone(_td(hours=5, minutes=30))
         now = datetime.now(_ist)
+
+        # Block on Saturday (5) and Sunday (6)
+        if now.weekday() in (5, 6):
+            return False
+
+        # Block on holidays (fetched from backend)
+        if self._is_holiday_today():
+            return False
+
         start = now.replace(hour=ATTENDANCE_START_HOUR, minute=ATTENDANCE_START_MINUTE,
                             second=0, microsecond=0)
         end = now.replace(hour=ATTENDANCE_END_HOUR, minute=ATTENDANCE_END_MINUTE,
                           second=0, microsecond=0)
         return start <= now <= end
+
+    def _is_holiday_today(self) -> bool:
+        """Check if today is a holiday (cached, refreshed once per hour)."""
+        now = time.time()
+        # Cache for 1 hour to avoid hitting the backend on every scan
+        if (hasattr(self, '_holiday_cache_time')
+                and now - self._holiday_cache_time < 3600
+                and hasattr(self, '_holiday_cache_date')
+                and self._holiday_cache_date == date.today().isoformat()):
+            return self._holiday_cache_result
+        # Default: not a holiday (fail-open if backend is unreachable)
+        self._holiday_cache_time = now
+        self._holiday_cache_date = date.today().isoformat()
+        self._holiday_cache_result = False
+        try:
+            import httpx
+            api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+            resp = httpx.get(f"{api_url}/api/holidays", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                today_str = date.today().isoformat()
+                for h in data.get("holidays", []):
+                    if h.get("date") == today_str:
+                        self._holiday_cache_result = True
+                        self.add_debug_log("holiday_detected",
+                                           f"Today is a holiday: {h.get('reason', 'Holiday')}")
+                        break
+        except Exception as e:
+            logger.warning(f"Holiday check failed (allowing attendance): {e}")
+        return self._holiday_cache_result
 
     def _is_notification_sent_today(self, person_id: str) -> bool:
         """Check if notification was already sent for this person today.
@@ -1315,6 +1357,14 @@ class AttendanceEngine:
                                f"interval={self.scan_interval}s, "
                                f"test_mode={'ON' if self.test_mode else 'OFF'}")
             while self.running:
+                # --- Weekend/holiday check ---
+                from datetime import timezone as _tz3, timedelta as _td3
+                _ist3 = _tz3(_td3(hours=5, minutes=30))
+                _now3 = datetime.now(_ist3)
+                if _now3.weekday() in (5, 6) or self._is_holiday_today():
+                    await asyncio.sleep(60)
+                    continue
+
                 try:
                     if dvr_idx < len(dvrs):
                         await self.scan_camera(dvrs[dvr_idx], channel, label)
@@ -1491,16 +1541,38 @@ class AttendanceEngine:
                 faces_in_cycle = 0
                 cycle_errors = 0
 
+                # --- Weekend/holiday check: skip entire scan cycle ---
+                from datetime import timezone as _tz2, timedelta as _td2
+                _ist2 = _tz2(_td2(hours=5, minutes=30))
+                _now_ist = datetime.now(_ist2)
+                _day_name = _now_ist.strftime("%A")
+                if _now_ist.weekday() in (5, 6):
+                    if cycle <= 1 or cycle % 100 == 0:
+                        self.add_debug_log("weekend_skip",
+                                           f"Today is {_day_name} — attendance disabled. "
+                                           f"No scanning, no notifications.")
+                    await asyncio.sleep(60)
+                    continue
+                if self._is_holiday_today():
+                    if cycle <= 1 or cycle % 100 == 0:
+                        self.add_debug_log("holiday_skip",
+                                           "Today is a holiday — attendance disabled. "
+                                           "No scanning, no notifications.")
+                    await asyncio.sleep(60)
+                    continue
+
                 # Check if day changed - reset daily marks
                 new_today = date.today().isoformat()
                 if new_today != today:
                     today = new_today
                     self.daily_marked.clear()
                     self._notification_sent.clear()
+                    self._sightings.clear()
                     self._camera_errors.clear()
                     self._admin_alerted.clear()
                     self.add_debug_log("daily_reset",
-                                       f"New day {today}: cleared attendance marks and notifications")
+                                       f"New day {today}: cleared attendance marks, "
+                                       f"notifications, and sightings")
 
                 # Periodically reload faces (picks up new registrations)
                 if cycle % 20 == 0:
