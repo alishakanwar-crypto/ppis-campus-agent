@@ -796,17 +796,31 @@ class AttendanceEngine:
         except Exception:
             return None
 
+    @staticmethod
+    def _is_off_day(dt: datetime) -> bool:
+        """Check if the given datetime falls on a school off-day.
+
+        Off-days: every Sunday + only the 2nd Saturday of each month.
+        All other Saturdays are working days.
+        """
+        if dt.weekday() == 6:  # Sunday
+            return True
+        if dt.weekday() == 5:  # Saturday
+            saturday_number = (dt.day - 1) // 7 + 1
+            return saturday_number == 2  # Only 2nd Saturday is off
+        return False
+
     def _is_within_attendance_window(self) -> bool:
         """Check if the current IST time is within the attendance window.
 
-        Returns False on weekends (Saturday/Sunday) and holidays.
+        Returns False on off-days (Sundays, 2nd Saturday) and holidays.
         """
         from datetime import timezone, timedelta as _td
         _ist = timezone(_td(hours=5, minutes=30))
         now = datetime.now(_ist)
 
-        # Block on Saturday (5) and Sunday (6)
-        if now.weekday() in (5, 6):
+        # Block on Sundays and 2nd Saturday only
+        if self._is_off_day(now):
             return False
 
         # Block on holidays (fetched from backend)
@@ -1459,11 +1473,11 @@ class AttendanceEngine:
                                f"interval={self.scan_interval}s, "
                                f"test_mode={'ON' if self.test_mode else 'OFF'}")
             while self.running:
-                # --- Weekend/holiday check ---
+                # --- Off-day/holiday check ---
                 from datetime import timezone as _tz3, timedelta as _td3
                 _ist3 = _tz3(_td3(hours=5, minutes=30))
                 _now3 = datetime.now(_ist3)
-                if _now3.weekday() in (5, 6) or self._is_holiday_today():
+                if self._is_off_day(_now3) or self._is_holiday_today():
                     await asyncio.sleep(60)
                     continue
 
@@ -1643,14 +1657,14 @@ class AttendanceEngine:
                 faces_in_cycle = 0
                 cycle_errors = 0
 
-                # --- Weekend/holiday check: skip entire scan cycle ---
+                # --- Off-day/holiday check: skip entire scan cycle ---
                 from datetime import timezone as _tz2, timedelta as _td2
                 _ist2 = _tz2(_td2(hours=5, minutes=30))
                 _now_ist = datetime.now(_ist2)
                 _day_name = _now_ist.strftime("%A")
-                if _now_ist.weekday() in (5, 6):
+                if self._is_off_day(_now_ist):
                     if cycle <= 1 or cycle % 100 == 0:
-                        self.add_debug_log("weekend_skip",
+                        self.add_debug_log("off_day_skip",
                                            f"Today is {_day_name} — attendance disabled. "
                                            f"No scanning, no notifications.")
                     await asyncio.sleep(60)
