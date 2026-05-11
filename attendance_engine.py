@@ -239,8 +239,8 @@ class AttendanceEngine:
         self.classwise_running = False
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
-        self.confidence_threshold = 0.42  # Match confidence > 42%
-        self.review_threshold = 0.30  # 30-42% goes to manual review queue
+        self.confidence_threshold = 0.30  # Match confidence > 30%
+        self.review_threshold = 0.25  # 25-30% goes to manual review queue
         self.min_sightings = 2  # Must be seen 2+ times before marking present
         self.sighting_window = 300  # 5-minute window for sightings to accumulate
         self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
