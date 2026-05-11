@@ -183,6 +183,7 @@ class AttendanceEngine:
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
         self.confidence_threshold = 0.42  # Match confidence > 42%
+        self.review_threshold = 0.30  # 30-42% goes to manual review queue
         self.min_sightings = 2  # Must be seen 2+ times before marking present
         self.sighting_window = 300  # 5-minute window for sightings to accumulate
         self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
@@ -542,10 +543,22 @@ class AttendanceEngine:
                     )
                     if result:
                         results.append(result)
+                elif confidence >= self.review_threshold:
+                    self.add_debug_log("manual_review",
+                                       f"Confidence {confidence:.1%} in review band "
+                                       f"({self.review_threshold:.0%}-{self.confidence_threshold:.0%})",
+                                       person_id=person_id,
+                                       confidence=confidence)
+                    self._queue_manual_review(
+                        person_id=person_id,
+                        name=match_result["name"],
+                        confidence=confidence,
+                        camera_source=camera_source,
+                    )
                 else:
                     self.add_debug_log("low_confidence",
                                        f"Confidence {confidence:.1%} < "
-                                       f"{self.confidence_threshold:.0%} threshold",
+                                       f"{self.review_threshold:.0%} minimum",
                                        person_id=person_id,
                                        confidence=confidence)
             else:
@@ -563,6 +576,44 @@ class AttendanceEngine:
                         pass
 
         return results
+
+    def _queue_manual_review(self, person_id: str, name: str,
+                             confidence: float, camera_source: str):
+        """Queue a low-confidence detection for manual review on the backend."""
+        try:
+            grade = ""
+            parts = person_id.rsplit("_", 1)
+            if len(parts) > 1 and not person_id.startswith("TEACHER_"):
+                grade = parts[-1]
+
+            review_data = {
+                "person_id": person_id,
+                "name": name,
+                "grade": grade,
+                "camera": camera_source,
+                "confidence": confidence,
+            }
+
+            # Send to backend asynchronously
+            async def _send():
+                try:
+                    import httpx
+                    api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        resp = await client.post(
+                            f"{api_url}/api/dashboard/review/report",
+                            json={"records": [review_data]},
+                        )
+                        if resp.status_code == 200:
+                            logger.info(f"Manual review queued: {name} ({confidence:.1%}) from {camera_source}")
+                except Exception as e:
+                    logger.warning(f"Failed to queue manual review: {e}")
+
+            task = asyncio.create_task(_send())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except Exception as e:
+            logger.warning(f"Manual review queue error: {e}")
 
     def _match_face(self, encoding: np.ndarray,
                     faces: dict | None = None) -> dict | None:
@@ -1351,6 +1402,32 @@ class AttendanceEngine:
                     self._camera_recovered.add(cam_key)
                     await self._send_camera_alert(cam_key, label, 0, "recovered")
 
+    async def _report_camera_status_to_backend(self, cameras: list[dict]):
+        """Report camera health status to the backend for dashboard tracking."""
+        try:
+            camera_statuses = []
+            for cam in cameras:
+                cam_key = f"{cam['dvr']['ip']}:{cam['channel']}"
+                errors = self._camera_errors.get(cam_key, 0)
+                status = "offline" if errors >= self._camera_alert_threshold else "online"
+                camera_statuses.append({
+                    "label": cam["label"],
+                    "dvr_ip": cam["dvr"]["ip"],
+                    "channel": cam["channel"],
+                    "status": status,
+                    "error_code": f"{errors} consecutive failures" if errors else "",
+                    "consecutive_failures": errors,
+                })
+
+            api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+            async with httpx.AsyncClient(timeout=15) as client:
+                await client.post(
+                    f"{api_url}/api/dashboard/cameras/status/report",
+                    json={"cameras": camera_statuses},
+                )
+        except Exception as e:
+            logger.warning(f"Camera status report failed (non-fatal): {e}")
+
     async def capture_frame_from_dvr(self, dvr: dict, channel: int,
                                      max_retries: int = 3) -> bytes | None:
         """Capture a single frame from a Hikvision DVR via ISAPI snapshot.
@@ -1778,6 +1855,10 @@ class AttendanceEngine:
                 # Check camera health and send alerts if needed
                 if cycle % 3 == 0:
                     await self._check_camera_health_alerts()
+
+                # Report camera status to backend every 10 cycles
+                if cycle % 10 == 0:
+                    await self._report_camera_status_to_backend(cameras)
 
                 # Free memory between cycles and brief cooldown
                 gc.collect()
