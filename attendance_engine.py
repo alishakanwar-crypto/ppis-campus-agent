@@ -1595,7 +1595,8 @@ class AttendanceEngine:
         loc_upper = location.upper()
         _GATE_RECEPTION_KEYWORDS = {"ENTRY", "ENTRANCE", "DISPERSAL",
                                     "ADMISSION", "RECEPTION"}
-        _STAFF_KEYWORDS = {"TEACHER STAFF", "STAFF ROOM"}
+        _STAFF_KEYWORDS = {"TEACHER STAFF", "STAFF ROOM", "PRINCIPAL",
+                           "ACADEMIC COORDINATOR", "ADMIN ROOM", "ACCOUNTS ROOM"}
         if any(kw in loc_upper for kw in _GATE_RECEPTION_KEYWORDS):
             return "gate_reception"
         if any(kw in loc_upper for kw in _STAFF_KEYWORDS):
