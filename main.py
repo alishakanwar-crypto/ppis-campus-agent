@@ -2673,8 +2673,44 @@ setInterval(async () => {
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _kill_port_holder(port: int) -> None:
+    """Kill any process currently listening on the given port (Windows only)."""
+    if sys.platform != "win32":
+        return
+    import subprocess
+    try:
+        result = subprocess.run(
+            f'netstat -ano | findstr :{port} | findstr LISTENING',
+            capture_output=True, text=True, shell=True,
+        )
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if parts:
+                pid = parts[-1]
+                subprocess.run(f"taskkill /F /PID {pid}", shell=True,
+                               capture_output=True)
+                logger.info(f"Killed stale process PID {pid} on port {port}")
+        time.sleep(3)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     import uvicorn
+
     port = config.get("local_port", 8897)
+
+    # Kill any lingering process on our port before binding
+    _kill_port_holder(port)
+
     logger.info(f"Starting PPIS Campus Agent on http://localhost:{port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    except OSError as e:
+        if "10048" in str(e) or "Address already in use" in str(e):
+            logger.warning(f"Port {port} still busy, retrying after kill...")
+            _kill_port_holder(port)
+            time.sleep(5)
+            uvicorn.run(app, host="0.0.0.0", port=port)
+        else:
+            raise
