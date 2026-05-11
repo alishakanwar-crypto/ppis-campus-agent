@@ -89,6 +89,44 @@ STUDENT_PHASE_END_MIN = 0
 # Set to True for testing, False for production
 FORCE_RENOTIFY_TEST = False
 
+# Summer break schedule: grades on break won't be scanned on classroom cameras.
+# Teachers and entry gate/reception scanning continue normally.
+# Format: list of (start_date, end_date, set_of_normalized_grade_prefixes)
+SUMMER_BREAK_SCHEDULE = [
+    # Popsicles through Grade 8: May 12 - June 30, 2026
+    ("2026-05-12", "2026-06-30", {
+        "POPSICLES", "NUR", "NUR1", "NUR2", "NUR3",
+        "PREP", "PREP1", "PREP2", "PREP3",
+        "GRADE1A", "GRADE1B", "GRADE1C",
+        "GRADE2A", "GRADE2B", "GRADE2C",
+        "GRADE3A", "GRADE3B", "GRADE3C",
+        "GRADE4A", "GRADE4B", "GRADE4C",
+        "GRADE5A", "GRADE5B", "GRADE5C",
+        "GRADE6A", "GRADE6B", "GRADE6C",
+        "GRADE7A", "GRADE7B", "GRADE7C",
+        "GRADE8A", "GRADE8B", "GRADE8C",
+    }),
+    # Grade 9-12: May 27 - June 30, 2026 (last working day May 26)
+    ("2026-05-27", "2026-06-30", {
+        "GRADE9A", "GRADE9B", "GRADE9C",
+        "GRADE10A", "GRADE10B", "GRADE10C",
+        "GRADE11A", "GRADE11B", "GRADE11C",
+        "GRADE12A", "GRADE12B", "GRADE12C",
+    }),
+]
+
+
+def _is_grade_on_break(grade: str) -> bool:
+    """Check if a grade is currently on summer break."""
+    if not grade:
+        return False
+    today = date.today().isoformat()
+    for start_date, end_date, grades_set in SUMMER_BREAK_SCHEDULE:
+        if start_date <= today <= end_date and grade in grades_set:
+            return True
+    return False
+
+
 # Grade pattern to extract grade from camera location names
 _GRADE_RE = re.compile(
     r"(?:GRADE\s*(\d+[A-Z]?))"
@@ -1898,9 +1936,20 @@ class AttendanceEngine:
                     gc.collect()
 
                     # 2b. Scan classroom cameras (grade-specific students ONLY)
+                    # Skip grades on summer break
+                    active_classroom_cams = [
+                        c for c in student_phase_cams_classroom
+                        if not _is_grade_on_break(c.get("grade", ""))
+                    ]
+                    skipped_break = len(student_phase_cams_classroom) - len(active_classroom_cams)
+                    if skipped_break > 0 and (cycle <= 1 or cycle % 60 == 0):
+                        self.add_debug_log("summer_break_skip",
+                                           f"Skipping {skipped_break} classroom cameras "
+                                           f"(grades on summer break)")
+
                     BATCH_SIZE = 10
-                    for batch_start in range(0, len(student_phase_cams_classroom), BATCH_SIZE):
-                        batch = student_phase_cams_classroom[batch_start:batch_start + BATCH_SIZE]
+                    for batch_start in range(0, len(active_classroom_cams), BATCH_SIZE):
+                        batch = active_classroom_cams[batch_start:batch_start + BATCH_SIZE]
                         for cam in batch:
                             if not self.classwise_running:
                                 break
