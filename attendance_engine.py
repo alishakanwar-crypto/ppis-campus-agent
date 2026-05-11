@@ -64,10 +64,10 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (7:00 AM to 9:30 AM IST)
+# Attendance time window (7:00 AM to 11:30 AM IST) — extended for testing 2026-05-11
 ATTENDANCE_START_HOUR = 7
 ATTENDANCE_START_MINUTE = 0
-ATTENDANCE_END_HOUR = 9
+ATTENDANCE_END_HOUR = 11
 ATTENDANCE_END_MINUTE = 30
 
 # Grade pattern to extract grade from camera location names
