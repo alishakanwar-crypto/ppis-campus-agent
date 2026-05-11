@@ -928,17 +928,25 @@ class AttendanceEngine:
         embeddings = [s["embedding"] for s in sightings
                       if s.get("embedding") is not None]
         if len(embeddings) >= 2:
-            # Compute pairwise cosine similarity between consecutive embeddings
+            # Compute pairwise cosine similarity between consecutive embeddings.
+            # Use proper cosine similarity (dot / (|a|*|b|)) — NOT raw dot product,
+            # because face_recognition 128-d embeddings are not unit-normalized.
             similarities = []
             for i in range(len(embeddings) - 1):
-                sim = float(np.dot(embeddings[i], embeddings[i + 1]))
+                a, b = embeddings[i], embeddings[i + 1]
+                norm_a = float(np.linalg.norm(a))
+                norm_b = float(np.linalg.norm(b))
+                if norm_a > 0 and norm_b > 0:
+                    sim = float(np.dot(a, b) / (norm_a * norm_b))
+                else:
+                    sim = 0.0
                 similarities.append(sim)
             avg_sim = sum(similarities) / len(similarities)
 
             # Real faces: embeddings vary slightly between frames due to
             # micro-expressions, head tilt, lighting changes.
-            # Typical real-face similarity: 0.70 - 0.95
-            # Static photo similarity: 0.97 - 1.00 (nearly identical)
+            # Typical real-face cosine similarity: 0.70 - 0.95
+            # Static photo cosine similarity: 0.97 - 1.00 (nearly identical)
             if avg_sim > 0.97:
                 self.add_debug_log("anti_spoof_blocked",
                                    f"{name}: embeddings too similar "
@@ -963,7 +971,7 @@ class AttendanceEngine:
                 cv_h = std_h / avg_h
                 # Real faces: some size variation as person moves (CV > 0.01)
                 # Static photo: virtually identical sizes (CV ~ 0)
-                if cv_w < 0.005 and cv_h < 0.005 and len(face_sizes) >= 3:
+                if cv_w < 0.005 and cv_h < 0.005 and len(face_sizes) >= 2:
                     self.add_debug_log("anti_spoof_blocked",
                                        f"{name}: face size too consistent "
                                        f"(width CV={cv_w:.4f}, height CV={cv_h:.4f}) — "
@@ -1133,6 +1141,10 @@ class AttendanceEngine:
             headers["X-Agent-Secret"] = agent_secret
 
         is_teacher = person_id.startswith("TEACHER_")
+        if is_teacher:
+            notif_name = f"Dear {name}, you have been"
+        else:
+            notif_name = f"Dear Parent, {name} has been"
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):
@@ -1144,7 +1156,7 @@ class AttendanceEngine:
                         json={
                             "phone": phone,
                             "template_name": "ppis_attendance_alert",
-                            "template_params": [name, time_str],
+                            "template_params": [notif_name, time_str],
                         },
                         headers=headers,
                     )
