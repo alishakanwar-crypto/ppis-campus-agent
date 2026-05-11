@@ -54,13 +54,11 @@ if %ERRORLEVEL% NEQ 0 (
     schtasks /create /tn "PPIS Campus Agent" /tr "wscript.exe \"%~dp0run_hidden.vbs\"" /sc onlogon /rl highest /f
 )
 
-REM Also add to Windows Startup folder as backup
-echo Adding to Startup folder as backup...
+REM Remove any old startup folder entry to prevent duplicate instances
+REM (ONLY the scheduled task should auto-start the agent)
 set STARTUP_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
-echo Set WshShell = CreateObject("WScript.Shell") > "%STARTUP_DIR%\PPIS Agent.vbs"
-echo scriptDir = "%~dp0" >> "%STARTUP_DIR%\PPIS Agent.vbs"
-echo WshShell.CurrentDirectory = scriptDir >> "%STARTUP_DIR%\PPIS Agent.vbs"
-echo WshShell.Run """" ^& scriptDir ^& "run_forever.bat""", 0, False >> "%STARTUP_DIR%\PPIS Agent.vbs"
+del "%STARTUP_DIR%\PPIS Agent.vbs" >nul 2>&1
+echo Removed startup folder entry (using scheduled task only).
 
 if %ERRORLEVEL% EQU 0 (
     echo.
