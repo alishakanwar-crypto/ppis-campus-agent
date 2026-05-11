@@ -738,32 +738,35 @@ async def _auto_start_classwise():
 
     This ensures the system is always-on without manual intervention.
     """
-    await asyncio.sleep(5)  # Let other startup tasks finish
-    if attendance_engine.classwise_running or attendance_engine.running:
-        logger.info("Monitoring already active — skipping auto-start")
-        return
+    try:
+        await asyncio.sleep(5)  # Let other startup tasks finish
+        if attendance_engine.classwise_running or attendance_engine.running:
+            logger.info("Monitoring already active — skipping auto-start")
+            return
 
-    dvrs = config.get("dvrs", [])
-    camera_mapping = config.get("camera_mapping", {})
-    if not dvrs or not camera_mapping:
-        logger.warning("Auto-start skipped: no DVRs or camera mapping configured")
-        return
+        dvrs = config.get("dvrs", [])
+        camera_mapping = config.get("camera_mapping", {})
+        if not dvrs or not camera_mapping:
+            logger.warning("Auto-start skipped: no DVRs or camera mapping configured")
+            return
 
-    attendance_engine.test_mode = False
-    attendance_engine.reload_faces()
+        attendance_engine.test_mode = False
+        attendance_engine.reload_faces()
 
-    # Configure camera alert phones from agent settings
-    import database as db_mod
-    alert_phones_str = db_mod.get_attendance_setting("camera_alert_phones", "")
-    if alert_phones_str:
-        attendance_engine._admin_phones = [p.strip() for p in alert_phones_str.split(",") if p.strip()]
-        logger.info(f"Camera alerts configured for: {attendance_engine._admin_phones}")
+        # Configure camera alert phones from agent settings
+        import database as db_mod
+        alert_phones_str = db_mod.get_attendance_setting("camera_alert_phones", "")
+        if alert_phones_str:
+            attendance_engine._admin_phones = [p.strip() for p in alert_phones_str.split(",") if p.strip()]
+            logger.info(f"Camera alerts configured for: {attendance_engine._admin_phones}")
 
-    attendance_engine.classwise_running = True
-    attendance_engine._classwise_task = asyncio.create_task(
-        attendance_engine.classwise_monitoring_loop(dvrs, camera_mapping)
-    )
-    logger.info("AUTO-START: Classwise attendance monitoring started automatically")
+        attendance_engine.classwise_running = True
+        attendance_engine._classwise_task = asyncio.create_task(
+            attendance_engine.classwise_monitoring_loop(dvrs, camera_mapping)
+        )
+        logger.info("AUTO-START: Classwise attendance monitoring started automatically")
+    except Exception as e:
+        logger.error(f"AUTO-START FAILED: {e}", exc_info=True)
 
 
 async def _health_watchdog():
@@ -869,6 +872,14 @@ def _cleanup_old_snapshots():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ws_task, config
+
+    # Set up asyncio exception handler to log unhandled task errors
+    def _handle_task_exception(loop, context):
+        exc = context.get("exception")
+        msg = context.get("message", "")
+        logger.critical(f"ASYNCIO UNHANDLED: {msg} — {exc}", exc_info=exc)
+    asyncio.get_event_loop().set_exception_handler(_handle_task_exception)
+
     # Initialize database (creates tables including attendance tables)
     import database as db_mod
     db_mod.init_db()
@@ -2697,6 +2708,15 @@ def _kill_port_holder(port: int) -> None:
 
 if __name__ == "__main__":
     import uvicorn
+    import traceback
+
+    # Global crash logger
+    def _log_crash(exc_type, exc_value, exc_tb):
+        logger.critical(
+            f"UNHANDLED EXCEPTION: {exc_type.__name__}: {exc_value}\n"
+            + "".join(traceback.format_tb(exc_tb))
+        )
+    sys.excepthook = _log_crash
 
     port = config.get("local_port", 8897)
 
@@ -2713,4 +2733,8 @@ if __name__ == "__main__":
             time.sleep(5)
             uvicorn.run(app, host="0.0.0.0", port=port)
         else:
+            logger.critical(f"FATAL OS ERROR: {e}", exc_info=True)
             raise
+    except Exception as e:
+        logger.critical(f"FATAL CRASH: {e}", exc_info=True)
+        raise

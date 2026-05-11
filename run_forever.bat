@@ -36,7 +36,7 @@ echo [%DATE% %TIME%] Pulling latest code...
 echo ============================================
 REM Stash any local changes first (prevents git pull from failing)
 git stash 2>nul
-git pull 2>nul
+git pull origin devin/1778414374-enterprise-hardening 2>nul
 
 REM Clean up old snapshot files (older than 1 day) to prevent disk fill
 echo [%DATE% %TIME%] Cleaning old snapshots...
