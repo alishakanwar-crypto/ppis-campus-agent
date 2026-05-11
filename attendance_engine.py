@@ -1233,8 +1233,13 @@ class AttendanceEngine:
             self.add_debug_log("cloud_sync_error", f"Cloud sync error: {e}")
 
     async def _resync_todays_records(self):
-        """Re-sync locally marked attendance records that may not have been
-        synced to cloud or notified due to previous event-loop issues."""
+        """Re-sync locally marked attendance records to cloud.
+
+        Only syncs record metadata to the cloud dashboard — does NOT
+        re-send WhatsApp notifications. The backend handles notification
+        sending as a safety net so we avoid duplicate sends and startup
+        crashes from heavy HTTP activity.
+        """
         try:
             records = db.get_attendance_log(limit=200)
             today_ist = date.today().isoformat()
@@ -1245,16 +1250,13 @@ class AttendanceEngine:
             if not today_records:
                 return
 
-            logger.info(f"Re-syncing {len(today_records)} locally-marked records to cloud")
+            logger.info(f"Re-syncing {len(today_records)} locally-marked records to cloud (metadata only)")
 
             for rec in today_records:
                 pid = rec.get("person_id", "")
                 name = rec.get("name", "")
                 confidence = rec.get("confidence", 0)
                 camera = rec.get("camera_source", "")
-                logged_at = rec.get("logged_at", "")
-                whatsapp_sent = rec.get("whatsapp_sent", 0)
-                attendance_id = rec.get("id", 0)
 
                 # Get phone from face DB
                 phone = ""
@@ -1263,43 +1265,15 @@ class AttendanceEngine:
                         phone = face_data.get("phone", "")
                         break
 
-                # Sync to cloud dashboard
-                grade = ""
-                for part in pid.split("_"):
-                    if part.startswith("GRADE") or part.startswith("NUR") or part.startswith("PREP"):
-                        grade = part
-                        break
-
-                await self._sync_attendance_to_cloud({
-                    "person_id": pid,
-                    "name": name,
-                    "confidence": confidence,
-                    "camera_source": camera,
-                }, phone)
-
-                # Always re-send notifications with correct IST time on re-sync
-                if phone:
-                    # Convert logged_at (UTC in DB) to IST for notification
-                    try:
-                        from datetime import timezone, timedelta as _td
-                        _ist = timezone(_td(hours=5, minutes=30))
-                        t = datetime.strptime(logged_at[:19], "%Y-%m-%d %H:%M:%S")
-                        t_ist = t + _td(hours=5, minutes=30)
-                        time_str = t_ist.strftime("%I:%M %p")
-                    except Exception:
-                        from datetime import timezone, timedelta as _td
-                        _ist = timezone(_td(hours=5, minutes=30))
-                        time_str = datetime.now(_ist).strftime("%I:%M %p")
-
-                    phone_list = [p.strip() for p in phone.split(",") if p.strip()]
-                    for parent_phone in phone_list:
-                        await self._send_whatsapp_notification(
-                            attendance_id=attendance_id,
-                            person_id=pid,
-                            name=name,
-                            time_str=time_str,
-                            phone=parent_phone,
-                        )
+                try:
+                    await self._sync_attendance_to_cloud({
+                        "person_id": pid,
+                        "name": name,
+                        "confidence": confidence,
+                        "camera_source": camera,
+                    }, phone)
+                except Exception as e:
+                    logger.error(f"Resync cloud sync error for {pid}: {e}")
 
             logger.info(f"Re-sync complete for {len(today_records)} records")
         except Exception as e:
@@ -1652,7 +1626,11 @@ class AttendanceEngine:
                 logger.info(f"Gate/special cameras: {gate_labels}")
 
             # Re-sync locally marked but un-synced/un-notified records on startup
-            await self._resync_todays_records()
+            # Wrapped in try/except to prevent startup crash
+            try:
+                await self._resync_todays_records()
+            except Exception as e:
+                logger.error(f"Resync failed on startup (non-fatal): {e}")
 
             # Clear daily marks at start if it's a new day
             today = date.today().isoformat()
