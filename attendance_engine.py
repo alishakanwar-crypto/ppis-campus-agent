@@ -70,6 +70,9 @@ ATTENDANCE_START_MINUTE = 0
 ATTENDANCE_END_HOUR = 11
 ATTENDANCE_END_MINUTE = 30
 
+# TEMPORARY TEST FLAG (2026-05-11): Force re-send notifications even if already sent today
+FORCE_RENOTIFY_TEST = True
+
 # Grade pattern to extract grade from camera location names
 _GRADE_RE = re.compile(
     r"(?:GRADE\s*(\d+[A-Z]?))"
@@ -296,17 +299,23 @@ class AttendanceEngine:
 
         # Pre-populate dedup caches from persistent DB (survives restarts)
         today = date.today().isoformat()
-        try:
-            marked_ids = db.get_today_marked_person_ids()
-            for pid in marked_ids:
-                self.daily_marked[pid] = today
-            notified_ids = db.get_today_notified_person_ids()
-            for pid in notified_ids:
-                self._notification_sent[pid] = today
-            logger.info(f"Pre-populated dedup caches: {len(marked_ids)} marked, "
-                        f"{len(notified_ids)} notified today")
-        except Exception as e:
-            logger.warning(f"Failed to pre-populate dedup caches from DB: {e}")
+        if FORCE_RENOTIFY_TEST:
+            logger.info("FORCE_RENOTIFY_TEST=True: Skipping dedup cache pre-population "
+                        "— will re-mark and re-notify all detected faces")
+            self.daily_marked = {}
+            self._notification_sent = {}
+        else:
+            try:
+                marked_ids = db.get_today_marked_person_ids()
+                for pid in marked_ids:
+                    self.daily_marked[pid] = today
+                notified_ids = db.get_today_notified_person_ids()
+                for pid in notified_ids:
+                    self._notification_sent[pid] = today
+                logger.info(f"Pre-populated dedup caches: {len(marked_ids)} marked, "
+                            f"{len(notified_ids)} notified today")
+            except Exception as e:
+                logger.warning(f"Failed to pre-populate dedup caches from DB: {e}")
 
         engine_label = "insightface" if self.use_insightface else "face_recognition"
         n_legacy = len(self.known_faces)
@@ -391,6 +400,10 @@ class AttendanceEngine:
         Uses in-memory cache first for speed. On cache miss, falls back
         to the persistent database so dedup survives process restarts.
         """
+        if FORCE_RENOTIFY_TEST:
+            # During test mode, only dedup within this session (in-memory only)
+            today = date.today().isoformat()
+            return self.daily_marked.get(person_id) == today
         today = date.today().isoformat()
         if self.daily_marked.get(person_id) == today:
             return True
@@ -920,6 +933,10 @@ class AttendanceEngine:
         Uses in-memory cache first for speed. On cache miss, falls back
         to the persistent database so dedup survives process restarts.
         """
+        if FORCE_RENOTIFY_TEST:
+            # During test mode, only dedup within this session (in-memory only)
+            today = date.today().isoformat()
+            return self._notification_sent.get(person_id) == today
         today = date.today().isoformat()
         if self._notification_sent.get(person_id) == today:
             return True
