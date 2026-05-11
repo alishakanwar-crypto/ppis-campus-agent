@@ -1904,6 +1904,35 @@ class AttendanceEngine:
                         await asyncio.sleep(0.5)
                     gc.collect()
 
+                # --- Trigger teacher report email once Phase 1 ends ---
+                if not in_teacher_phase and getattr(self, '_teacher_report_sent_today', None) != date.today().isoformat():
+                    if _now_mins >= teacher_end and _now_mins < student_end:
+                        self._teacher_report_sent_today = date.today().isoformat()
+                        self.add_debug_log("teacher_report",
+                                           "Phase 1 ended — triggering teacher attendance report email")
+                        try:
+                            api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+                            agent_secret = os.environ.get("AGENT_SECRET", "")
+                            headers = {"Content-Type": "application/json"}
+                            if agent_secret:
+                                headers["X-Agent-Secret"] = agent_secret
+                            async with httpx.AsyncClient(timeout=30) as _rpt_client:
+                                _rpt_resp = await _rpt_client.post(
+                                    f"{api_url}/api/dashboard/attendance/teacher-report/email",
+                                    json={}, headers=headers,
+                                )
+                                if _rpt_resp.status_code == 200:
+                                    _rpt_data = _rpt_resp.json()
+                                    self.add_debug_log("teacher_report_sent",
+                                                       f"Teacher report emailed: {_rpt_data.get('present', 0)} present, "
+                                                       f"{_rpt_data.get('absent', 0)} absent")
+                                else:
+                                    self.add_debug_log("teacher_report_error",
+                                                       f"Report email failed: HTTP {_rpt_resp.status_code}")
+                        except Exception as _rpt_e:
+                            self.add_debug_log("teacher_report_error",
+                                               f"Report email error: {_rpt_e}")
+
                 # === PHASE 2: Student Recognition ===
                 if in_student_phase:
                     if cycle <= 1 or (cycle % 30 == 0):
