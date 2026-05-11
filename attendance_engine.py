@@ -1629,12 +1629,12 @@ class AttendanceEngine:
             if gate_cams:
                 logger.info(f"Gate/special cameras: {gate_labels}")
 
-            # Re-sync locally marked but un-synced/un-notified records on startup
-            # Wrapped in try/except to prevent startup crash
-            try:
-                await self._resync_todays_records()
-            except Exception as e:
-                logger.error(f"Resync failed on startup (non-fatal): {e}")
+            # Resync disabled — backend already has all records and handles
+            # notifications as safety net. Resync was causing startup crashes.
+            # try:
+            #     await self._resync_todays_records()
+            # except Exception as e:
+            #     logger.error(f"Resync failed on startup (non-fatal): {e}")
 
             # Clear daily marks at start if it's a new day
             today = date.today().isoformat()
@@ -1643,8 +1643,10 @@ class AttendanceEngine:
             }
             cycle = 0
             consecutive_full_failures = 0
+            print(f"[CLASSWISE] Entering scan loop... classwise_running={self.classwise_running}", flush=True)
             while self.classwise_running:
                 cycle += 1
+                print(f"[CLASSWISE] Cycle {cycle} starting...", flush=True)
                 cycle_start = time.time()
                 self._classwise_stats["cycle_count"] = cycle
                 scanned = 0
