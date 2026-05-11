@@ -1582,12 +1582,41 @@ class AttendanceEngine:
     # Classwise multi-camera monitoring
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _classify_camera_type(location: str) -> str:
+        """Classify a camera into a type for attendance scanning rules.
+
+        Camera types:
+        - 'gate_reception': Entry gates, reception — scan ALL faces (teachers + students)
+        - 'staff': Teacher staff rooms — scan ONLY teacher/staff faces
+        - 'classroom': Grade classrooms (NUR, PREP, GRADE) — scan ONLY grade students
+        - 'other': Labs, galleries, parks, etc. — scan ALL faces in test mode only
+        """
+        loc_upper = location.upper()
+        _GATE_RECEPTION_KEYWORDS = {"ENTRY", "ENTRANCE", "DISPERSAL",
+                                    "ADMISSION", "RECEPTION"}
+        _STAFF_KEYWORDS = {"TEACHER STAFF", "STAFF ROOM"}
+        if any(kw in loc_upper for kw in _GATE_RECEPTION_KEYWORDS):
+            return "gate_reception"
+        if any(kw in loc_upper for kw in _STAFF_KEYWORDS):
+            return "staff"
+        grade = _extract_grade_from_location(location)
+        if grade is not None:
+            return "classroom"
+        return "other"
+
     def build_classroom_camera_list(self, camera_mapping: dict,
                                      dvrs: list[dict]) -> list[dict]:
-        """Build list of classroom cameras with their DVR configs and grade.
+        """Build list of ALL cameras with their DVR configs, grade, and camera type.
 
         Each classroom may have multiple cameras (C1, C2). This includes
         ALL camera feeds per classroom from the all_cameras field.
+
+        Camera types for attendance:
+        - gate_reception: Entry Gate, Reception → teachers + students
+        - staff: Teacher Staff rooms → teachers only
+        - classroom: Grade classrooms → grade students only
+        - other: Labs, galleries, parks → all faces (test mode) / skip (production)
 
         Returns list of dicts:
             {
@@ -1598,39 +1627,23 @@ class AttendanceEngine:
                 "dvr": {...},
                 "label": "GRADE 3C (DVR 2 Ch 13)",
                 "is_gate": False,
+                "cam_type": "classroom",
             }
         """
         cameras = []
         seen = set()  # (dvr_index, channel) to avoid duplicates
 
+        # Process ALL cameras from the mapping
         for location, cam_data in camera_mapping.items():
             grade = _extract_grade_from_location(location)
-            if grade is None:
-                continue  # Not a classroom camera
+            cam_type = self._classify_camera_type(location)
 
-            # Add ALL cameras for this classroom (C1, C2, etc.)
             all_cams = cam_data.get("all_cameras", [])
-            if all_cams:
-                for ac in all_cams:
-                    dvr_idx = ac.get("dvr_index", 0)
-                    channel = ac.get("channel", 1)
-                    key = (dvr_idx, channel)
-                    if key in seen or dvr_idx >= len(dvrs):
-                        continue
-                    seen.add(key)
-                    desc = ac.get("description", location)
-                    cameras.append({
-                        "location": location,
-                        "grade": grade,
-                        "dvr_index": dvr_idx,
-                        "channel": channel,
-                        "dvr": dvrs[dvr_idx],
-                        "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
-                        "is_gate": False,
-                    })
-            else:
-                dvr_idx = cam_data.get("dvr_index", 0)
-                channel = cam_data.get("channel", 1)
+            cams_to_add = all_cams if all_cams else [cam_data]
+
+            for ac in cams_to_add:
+                dvr_idx = ac.get("dvr_index", 0)
+                channel = ac.get("channel", 1)
                 key = (dvr_idx, channel)
                 if key in seen or dvr_idx >= len(dvrs):
                     continue
@@ -1642,34 +1655,8 @@ class AttendanceEngine:
                     "channel": channel,
                     "dvr": dvrs[dvr_idx],
                     "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
-                    "is_gate": False,
-                })
-
-        # Include ALL remaining cameras (gates, labs, staff rooms, assembly,
-        # activity rooms, parks, etc.) so teachers can be recognized everywhere.
-        # These get grade=None so they scan ALL known faces.
-        for location, cam_data in camera_mapping.items():
-            all_cams = cam_data.get("all_cameras", [])
-            cams_to_add = all_cams if all_cams else [cam_data]
-            for ac in cams_to_add:
-                dvr_idx = ac.get("dvr_index", 0)
-                channel = ac.get("channel", 1)
-                key = (dvr_idx, channel)
-                if key in seen or dvr_idx >= len(dvrs):
-                    continue
-                seen.add(key)
-                loc_upper = location.upper()
-                _GATE_KEYWORDS = {"ENTRY", "ENTRANCE", "DISPERSAL",
-                                  "ADMISSION", "RECEPTION"}
-                is_gate = any(kw in loc_upper for kw in _GATE_KEYWORDS)
-                cameras.append({
-                    "location": location,
-                    "grade": None,  # Check ALL faces
-                    "dvr_index": dvr_idx,
-                    "channel": channel,
-                    "dvr": dvrs[dvr_idx],
-                    "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
-                    "is_gate": is_gate,
+                    "is_gate": cam_type == "gate_reception",
+                    "cam_type": cam_type,
                 })
 
         return cameras
@@ -1693,12 +1680,33 @@ class AttendanceEngine:
             self.reload_faces()
 
             cameras = self.build_classroom_camera_list(camera_mapping, dvrs)
-            classroom_cams = [c for c in cameras if c["grade"] is not None]
-            gate_cams = [c for c in cameras if c["grade"] is None]
+
+            # Categorize cameras by type
+            gate_reception_cams = [c for c in cameras if c["cam_type"] == "gate_reception"]
+            staff_cams = [c for c in cameras if c["cam_type"] == "staff"]
+            classroom_cams = [c for c in cameras if c["cam_type"] == "classroom"]
+            other_cams = [c for c in cameras if c["cam_type"] == "other"]
+
+            # In test mode (FORCE_RENOTIFY_TEST), scan ALL cameras for all faces
+            # In production mode, follow strict camera-type rules
+            if FORCE_RENOTIFY_TEST:
+                # Test mode: treat "other" cameras like gate cameras (scan all faces)
+                gate_reception_cams = gate_reception_cams + staff_cams + other_cams
+                # Classroom cams still scan grade students + teachers in test mode
+                scan_teachers_on_classroom = True
+            else:
+                # Production mode (from tomorrow):
+                # - gate_reception: ALL faces (teachers + students)
+                # - staff: ONLY teacher faces
+                # - classroom: ONLY grade students (NO teachers)
+                # - other: skip for attendance
+                scan_teachers_on_classroom = False
+
+            active_cam_count = len(gate_reception_cams) + len(staff_cams) + len(classroom_cams)
 
             # Reset all stats so counters don't accumulate across restarts
             self._classwise_stats = {
-                "total_cameras": len(cameras),
+                "total_cameras": active_cam_count,
                 "cameras_scanned": 0,
                 "current_camera": "",
                 "cycle_count": 0,
@@ -1707,17 +1715,21 @@ class AttendanceEngine:
                 "attendance_marked_today": 0,
                 "errors": 0,
             }
-            # Log gate camera details for debugging
-            gate_labels = [c["label"] for c in gate_cams]
+            # Log camera breakdown
+            mode = "TEST (all cameras, all faces)" if FORCE_RENOTIFY_TEST else "PRODUCTION"
             self.add_debug_log(
                 "classwise_started",
-                f"Monitoring {len(classroom_cams)} classroom cameras + "
-                f"{len(gate_cams)} entry gate cameras, "
+                f"Mode: {mode} | "
+                f"Gate/Reception: {len(gate_reception_cams)}, "
+                f"Staff: {len(staff_cams)}, "
+                f"Classroom: {len(classroom_cams)}, "
+                f"Other (skipped): {len(other_cams) if not FORCE_RENOTIFY_TEST else 0} | "
                 f"{len(self.known_faces)} total faces loaded, "
                 f"{len(self._grade_face_cache)} grades with faces"
             )
-            if gate_cams:
-                logger.info(f"Gate/special cameras: {gate_labels}")
+            gate_labels = [c["label"] for c in gate_reception_cams]
+            if gate_reception_cams:
+                logger.info(f"Gate/Reception/Staff cameras: {gate_labels}")
 
             # Resync disabled — backend already has all records and handles
             # notifications as safety net. Resync was causing startup crashes.
@@ -1778,8 +1790,8 @@ class AttendanceEngine:
                 if cycle % 20 == 0:
                     self.reload_faces()
 
-                # Scan entry gate cameras first (priority)
-                for cam in gate_cams:
+                # 1. Scan gate/reception cameras (ALL faces: teachers + students)
+                for cam in gate_reception_cams:
                     if not self.classwise_running:
                         break
                     try:
@@ -1800,7 +1812,34 @@ class AttendanceEngine:
                 # Free memory after gate cameras
                 gc.collect()
 
-                # Scan classroom cameras in batches to manage memory
+                # 2. Scan staff cameras (ONLY teacher faces in production mode)
+                if not FORCE_RENOTIFY_TEST:
+                    # In production: staff cams scan only teachers
+                    for cam in staff_cams:
+                        if not self.classwise_running:
+                            break
+                        try:
+                            self._classwise_stats["current_camera"] = cam["label"]
+                            teacher_faces = getattr(self, '_teacher_faces_cache', {})
+                            teacher_faces_if = getattr(self, '_teacher_faces_cache_insightface', {})
+                            if not teacher_faces and not teacher_faces_if:
+                                scanned += 1
+                                continue
+                            results = await self.scan_camera(
+                                cam["dvr"], cam["channel"], cam["label"],
+                                faces_subset=teacher_faces,
+                                insightface_subset=teacher_faces_if,
+                            )
+                            scanned += 1
+                            faces_in_cycle += len(results)
+                        except Exception as e:
+                            self._classwise_stats["errors"] += 1
+                            cycle_errors += 1
+                            logger.error(f"Error scanning {cam['label']}: {e}")
+                        await asyncio.sleep(0.5)
+                    gc.collect()
+
+                # 3. Scan classroom cameras in batches
                 BATCH_SIZE = 10
                 for batch_start in range(0, len(classroom_cams), BATCH_SIZE):
                     batch = classroom_cams[batch_start:batch_start + BATCH_SIZE]
@@ -1809,8 +1848,14 @@ class AttendanceEngine:
                             break
                         try:
                             grade = cam["grade"]
-                            grade_faces = self.get_faces_for_grade(grade)
-                            grade_faces_if = self.get_insightface_for_grade(grade)
+                            if scan_teachers_on_classroom:
+                                # Test mode: grade students + teachers
+                                grade_faces = self.get_faces_for_grade(grade)
+                                grade_faces_if = self.get_insightface_for_grade(grade)
+                            else:
+                                # Production: ONLY grade students, no teachers
+                                grade_faces = self._grade_face_cache.get(grade, {})
+                                grade_faces_if = self._grade_face_cache_insightface.get(grade, {})
 
                             if not grade_faces and not grade_faces_if:
                                 scanned += 1
