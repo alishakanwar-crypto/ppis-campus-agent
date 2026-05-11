@@ -9,6 +9,9 @@ Features:
 - On-demand child photo capture and delivery
 """
 
+import faulthandler
+faulthandler.enable()  # Print C-level crash tracebacks
+
 import asyncio
 import base64
 import io
@@ -741,33 +744,43 @@ async def _auto_start_classwise():
     This ensures the system is always-on without manual intervention.
     """
     try:
-        await asyncio.sleep(5)  # Let other startup tasks finish
+        print("[AUTO-START] Waiting 10 seconds before starting classwise monitoring...", flush=True)
+        await asyncio.sleep(10)  # Let other startup tasks finish
+        print("[AUTO-START] Wait complete, checking state...", flush=True)
         if attendance_engine.classwise_running or attendance_engine.running:
             logger.info("Monitoring already active — skipping auto-start")
             return
 
         dvrs = config.get("dvrs", [])
         camera_mapping = config.get("camera_mapping", {})
+        print(f"[AUTO-START] Config: {len(dvrs)} DVRs, {len(camera_mapping)} cameras", flush=True)
         if not dvrs or not camera_mapping:
             logger.warning("Auto-start skipped: no DVRs or camera mapping configured")
             return
 
+        print("[AUTO-START] Setting test_mode=False...", flush=True)
         attendance_engine.test_mode = False
-        attendance_engine.reload_faces()
+        print("[AUTO-START] Reloading faces (skip - already loaded at startup)...", flush=True)
+        # Skip reload_faces here — already done during startup lifespan
+        # attendance_engine.reload_faces()
 
         # Configure camera alert phones from agent settings
+        print("[AUTO-START] Loading alert phones...", flush=True)
         import database as db_mod
         alert_phones_str = db_mod.get_attendance_setting("camera_alert_phones", "")
         if alert_phones_str:
             attendance_engine._admin_phones = [p.strip() for p in alert_phones_str.split(",") if p.strip()]
             logger.info(f"Camera alerts configured for: {attendance_engine._admin_phones}")
 
+        print("[AUTO-START] Creating classwise_monitoring_loop task...", flush=True)
         attendance_engine.classwise_running = True
         attendance_engine._classwise_task = asyncio.create_task(
             attendance_engine.classwise_monitoring_loop(dvrs, camera_mapping)
         )
         logger.info("AUTO-START: Classwise attendance monitoring started automatically")
+        print("[AUTO-START] Task created successfully!", flush=True)
     except Exception as e:
+        print(f"[AUTO-START] CRASHED: {e}", flush=True)
         logger.error(f"AUTO-START FAILED: {e}", exc_info=True)
 
 

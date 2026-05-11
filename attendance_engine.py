@@ -1593,12 +1593,16 @@ class AttendanceEngine:
         Entry gate cameras check ALL registered faces.
         """
         try:
+            print("[CLASSWISE] Starting classwise_monitoring_loop...", flush=True)
             self.classwise_running = True
             self._last_dvrs = dvrs
             self._last_camera_mapping = camera_mapping
+            print(f"[CLASSWISE] Reloading faces...", flush=True)
             self.reload_faces()
 
+            print(f"[CLASSWISE] Building camera list from {len(camera_mapping)} mappings...", flush=True)
             cameras = self.build_classroom_camera_list(camera_mapping, dvrs)
+            print(f"[CLASSWISE] Built {len(cameras)} camera entries", flush=True)
             classroom_cams = [c for c in cameras if c["grade"] is not None]
             gate_cams = [c for c in cameras if c["grade"] is None]
 
