@@ -64,14 +64,30 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (7:00 AM to 11:30 AM IST) — extended for testing 2026-05-11
+# Attendance time window (overall: 7:00 AM to 9:00 AM IST)
 ATTENDANCE_START_HOUR = 7
 ATTENDANCE_START_MINUTE = 0
-ATTENDANCE_END_HOUR = 11
-ATTENDANCE_END_MINUTE = 30
+ATTENDANCE_END_HOUR = 9
+ATTENDANCE_END_MINUTE = 0
 
-# TEMPORARY TEST FLAG (2026-05-11): Force re-send notifications even if already sent today
-FORCE_RENOTIFY_TEST = True
+# Two-phase attendance windows (production mode)
+# Phase 1: Teacher recognition (7:00 AM - 7:35 AM)
+# Cameras: Reception, Entry Gate, Admission Room, Teacher Staff 1 & 2
+TEACHER_PHASE_START_HOUR = 7
+TEACHER_PHASE_START_MIN = 0
+TEACHER_PHASE_END_HOUR = 7
+TEACHER_PHASE_END_MIN = 35
+
+# Phase 2: Student recognition (7:30 AM - 9:00 AM)
+# Cameras: Entry Gate, Reception, Classroom cameras (grade-specific)
+STUDENT_PHASE_START_HOUR = 7
+STUDENT_PHASE_START_MIN = 30
+STUDENT_PHASE_END_HOUR = 9
+STUDENT_PHASE_END_MIN = 0
+
+# TEMPORARY TEST FLAG: Force re-send notifications even if already sent today
+# Set to True for testing, False for production
+FORCE_RENOTIFY_TEST = False
 
 # Grade pattern to extract grade from camera location names
 _GRADE_RE = re.compile(
@@ -1683,27 +1699,21 @@ class AttendanceEngine:
             cameras = self.build_classroom_camera_list(camera_mapping, dvrs)
 
             # Categorize cameras by type
-            gate_reception_cams = [c for c in cameras if c["cam_type"] == "gate_reception"]
-            staff_cams = [c for c in cameras if c["cam_type"] == "staff"]
-            classroom_cams = [c for c in cameras if c["cam_type"] == "classroom"]
-            other_cams = [c for c in cameras if c["cam_type"] == "other"]
+            all_gate_reception_cams = [c for c in cameras if c["cam_type"] == "gate_reception"]
+            all_staff_cams = [c for c in cameras if c["cam_type"] == "staff"]
+            all_classroom_cams = [c for c in cameras if c["cam_type"] == "classroom"]
+            all_other_cams = [c for c in cameras if c["cam_type"] == "other"]
 
-            # In test mode (FORCE_RENOTIFY_TEST), scan ALL cameras for all faces
-            # In production mode, follow strict camera-type rules
-            if FORCE_RENOTIFY_TEST:
-                # Test mode: treat "other" cameras like gate cameras (scan all faces)
-                gate_reception_cams = gate_reception_cams + staff_cams + other_cams
-                # Classroom cams still scan grade students + teachers in test mode
-                scan_teachers_on_classroom = True
-            else:
-                # Production mode (from tomorrow):
-                # - gate_reception: ALL faces (teachers + students)
-                # - staff: ONLY teacher faces
-                # - classroom: ONLY grade students (NO teachers)
-                # - other: skip for attendance
-                scan_teachers_on_classroom = False
+            # Phase 1 teacher cameras: gate/reception + staff + admission
+            teacher_phase_cams = all_gate_reception_cams + all_staff_cams
+            # Phase 2 student cameras: gate/reception + classrooms
+            student_phase_cams_gate = all_gate_reception_cams
+            student_phase_cams_classroom = all_classroom_cams
 
-            active_cam_count = len(gate_reception_cams) + len(staff_cams) + len(classroom_cams)
+            active_cam_count = len(set(
+                (c["dvr_index"], c["channel"]) for c in
+                teacher_phase_cams + student_phase_cams_gate + student_phase_cams_classroom
+            ))
 
             # Reset all stats so counters don't accumulate across restarts
             self._classwise_stats = {
@@ -1717,20 +1727,26 @@ class AttendanceEngine:
                 "errors": 0,
             }
             # Log camera breakdown
-            mode = "TEST (all cameras, all faces)" if FORCE_RENOTIFY_TEST else "PRODUCTION"
+            mode = "TEST (all cameras, all faces)" if FORCE_RENOTIFY_TEST else "TWO-PHASE"
             self.add_debug_log(
                 "classwise_started",
                 f"Mode: {mode} | "
-                f"Gate/Reception: {len(gate_reception_cams)}, "
-                f"Staff: {len(staff_cams)}, "
-                f"Classroom: {len(classroom_cams)}, "
-                f"Other (skipped): {len(other_cams) if not FORCE_RENOTIFY_TEST else 0} | "
+                f"Phase1 teacher cams: {len(teacher_phase_cams)} "
+                f"(gate/reception: {len(all_gate_reception_cams)}, staff: {len(all_staff_cams)}) | "
+                f"Phase2 student cams: {len(student_phase_cams_gate)} gate + "
+                f"{len(student_phase_cams_classroom)} classroom | "
+                f"Other (skipped): {len(all_other_cams)} | "
                 f"{len(self.known_faces)} total faces loaded, "
-                f"{len(self._grade_face_cache)} grades with faces"
+                f"{len(self._grade_face_cache)} grades with faces | "
+                f"Teacher window: {TEACHER_PHASE_START_HOUR}:{TEACHER_PHASE_START_MIN:02d}-"
+                f"{TEACHER_PHASE_END_HOUR}:{TEACHER_PHASE_END_MIN:02d} | "
+                f"Student window: {STUDENT_PHASE_START_HOUR}:{STUDENT_PHASE_START_MIN:02d}-"
+                f"{STUDENT_PHASE_END_HOUR}:{STUDENT_PHASE_END_MIN:02d}"
             )
-            gate_labels = [c["label"] for c in gate_reception_cams]
-            if gate_reception_cams:
-                logger.info(f"Gate/Reception/Staff cameras: {gate_labels}")
+            if teacher_phase_cams:
+                logger.info(f"Phase1 teacher cameras: {[c['label'] for c in teacher_phase_cams]}")
+            if student_phase_cams_classroom:
+                logger.info(f"Phase2 classroom cameras: {[c['label'] for c in student_phase_cams_classroom[:5]]}... ({len(student_phase_cams_classroom)} total)")
 
             # Resync disabled — backend already has all records and handles
             # notifications as safety net. Resync was causing startup crashes.
@@ -1791,45 +1807,55 @@ class AttendanceEngine:
                 if cycle % 20 == 0:
                     self.reload_faces()
 
-                # 1. Scan gate/reception cameras (ALL faces: teachers + students)
-                for cam in gate_reception_cams:
-                    if not self.classwise_running:
-                        break
-                    try:
-                        self._classwise_stats["current_camera"] = cam["label"]
-                        results = await self.scan_camera(
-                            cam["dvr"], cam["channel"], cam["label"],
-                            faces_subset=None,
-                            insightface_subset=None,
-                        )
-                        scanned += 1
-                        faces_in_cycle += len(results)
-                    except Exception as e:
-                        self._classwise_stats["errors"] += 1
-                        cycle_errors += 1
-                        logger.error(f"Error scanning {cam['label']}: {e}")
-                    await asyncio.sleep(0.5)
+                # Determine current phase based on IST time
+                from datetime import timezone as _tz3, timedelta as _td3
+                _ist3 = _tz3(_td3(hours=5, minutes=30))
+                _now_phase = datetime.now(_ist3)
+                _h, _m = _now_phase.hour, _now_phase.minute
+                _now_mins = _h * 60 + _m
 
-                # Free memory after gate cameras
-                gc.collect()
+                teacher_start = TEACHER_PHASE_START_HOUR * 60 + TEACHER_PHASE_START_MIN
+                teacher_end = TEACHER_PHASE_END_HOUR * 60 + TEACHER_PHASE_END_MIN
+                student_start = STUDENT_PHASE_START_HOUR * 60 + STUDENT_PHASE_START_MIN
+                student_end = STUDENT_PHASE_END_HOUR * 60 + STUDENT_PHASE_END_MIN
 
-                # 2. Scan staff cameras (ONLY teacher faces in production mode)
-                if not FORCE_RENOTIFY_TEST:
-                    # In production: staff cams scan only teachers
-                    for cam in staff_cams:
+                in_teacher_phase = teacher_start <= _now_mins < teacher_end
+                in_student_phase = student_start <= _now_mins < student_end
+
+                if FORCE_RENOTIFY_TEST:
+                    # Test mode: both phases always active
+                    in_teacher_phase = True
+                    in_student_phase = True
+
+                if not in_teacher_phase and not in_student_phase:
+                    # Outside all attendance windows — sleep and retry
+                    if cycle <= 1 or cycle % 60 == 0:
+                        self.add_debug_log("outside_window",
+                                           f"Current time {_now_phase.strftime('%H:%M')} IST — "
+                                           f"outside both teacher ({TEACHER_PHASE_START_HOUR}:{TEACHER_PHASE_START_MIN:02d}-"
+                                           f"{TEACHER_PHASE_END_HOUR}:{TEACHER_PHASE_END_MIN:02d}) and "
+                                           f"student ({STUDENT_PHASE_START_HOUR}:{STUDENT_PHASE_START_MIN:02d}-"
+                                           f"{STUDENT_PHASE_END_HOUR}:{STUDENT_PHASE_END_MIN:02d}) windows")
+                    await asyncio.sleep(30)
+                    continue
+
+                # === PHASE 1: Teacher Recognition ===
+                if in_teacher_phase:
+                    if cycle <= 1 or (cycle % 30 == 0):
+                        self.add_debug_log("teacher_phase",
+                                           f"Phase 1 ACTIVE: scanning {len(teacher_phase_cams)} "
+                                           f"cameras for teacher faces")
+                    teacher_faces = getattr(self, '_teacher_faces_cache', {})
+                    teacher_faces_if = getattr(self, '_teacher_faces_cache_insightface', {})
+                    for cam in teacher_phase_cams:
                         if not self.classwise_running:
                             break
                         try:
                             self._classwise_stats["current_camera"] = cam["label"]
-                            teacher_faces = getattr(self, '_teacher_faces_cache', {})
-                            teacher_faces_if = getattr(self, '_teacher_faces_cache_insightface', {})
-                            if not teacher_faces and not teacher_faces_if:
-                                scanned += 1
-                                continue
                             results = await self.scan_camera(
                                 cam["dvr"], cam["channel"], cam["label"],
-                                faces_subset=teacher_faces,
-                                insightface_subset=teacher_faces_if,
+                                faces_subset=teacher_faces if teacher_faces else None,
+                                insightface_subset=teacher_faces_if if teacher_faces_if else None,
                             )
                             scanned += 1
                             faces_in_cycle += len(results)
@@ -1840,45 +1866,71 @@ class AttendanceEngine:
                         await asyncio.sleep(0.5)
                     gc.collect()
 
-                # 3. Scan classroom cameras in batches
-                BATCH_SIZE = 10
-                for batch_start in range(0, len(classroom_cams), BATCH_SIZE):
-                    batch = classroom_cams[batch_start:batch_start + BATCH_SIZE]
-                    for cam in batch:
+                # === PHASE 2: Student Recognition ===
+                if in_student_phase:
+                    if cycle <= 1 or (cycle % 30 == 0):
+                        self.add_debug_log("student_phase",
+                                           f"Phase 2 ACTIVE: scanning {len(student_phase_cams_gate)} gate + "
+                                           f"{len(student_phase_cams_classroom)} classroom cameras "
+                                           f"for student faces")
+
+                    # 2a. Scan gate/reception cameras for ALL student faces
+                    for cam in student_phase_cams_gate:
                         if not self.classwise_running:
                             break
+                        # Skip if already scanned in teacher phase this cycle
+                        if in_teacher_phase and cam in teacher_phase_cams:
+                            continue
                         try:
-                            grade = cam["grade"]
-                            if scan_teachers_on_classroom:
-                                # Test mode: grade students + teachers
-                                grade_faces = self.get_faces_for_grade(grade)
-                                grade_faces_if = self.get_insightface_for_grade(grade)
-                            else:
-                                # Production: ONLY grade students, no teachers
+                            self._classwise_stats["current_camera"] = cam["label"]
+                            results = await self.scan_camera(
+                                cam["dvr"], cam["channel"], cam["label"],
+                                faces_subset=None,
+                                insightface_subset=None,
+                            )
+                            scanned += 1
+                            faces_in_cycle += len(results)
+                        except Exception as e:
+                            self._classwise_stats["errors"] += 1
+                            cycle_errors += 1
+                            logger.error(f"Error scanning {cam['label']}: {e}")
+                        await asyncio.sleep(0.5)
+                    gc.collect()
+
+                    # 2b. Scan classroom cameras (grade-specific students ONLY)
+                    BATCH_SIZE = 10
+                    for batch_start in range(0, len(student_phase_cams_classroom), BATCH_SIZE):
+                        batch = student_phase_cams_classroom[batch_start:batch_start + BATCH_SIZE]
+                        for cam in batch:
+                            if not self.classwise_running:
+                                break
+                            try:
+                                grade = cam["grade"]
+                                # Students only — no teachers on classroom cameras
                                 grade_faces = self._grade_face_cache.get(grade, {})
                                 grade_faces_if = self._grade_face_cache_insightface.get(grade, {})
 
-                            if not grade_faces and not grade_faces_if:
+                                if not grade_faces and not grade_faces_if:
+                                    scanned += 1
+                                    continue
+
+                                self._classwise_stats["current_camera"] = cam["label"]
+                                results = await self.scan_camera(
+                                    cam["dvr"], cam["channel"], cam["label"],
+                                    faces_subset=grade_faces,
+                                    insightface_subset=grade_faces_if,
+                                )
                                 scanned += 1
-                                continue
+                                faces_in_cycle += len(results)
+                            except Exception as e:
+                                self._classwise_stats["errors"] += 1
+                                cycle_errors += 1
+                                logger.error(f"Error scanning {cam['label']}: {e}")
+                            await asyncio.sleep(0.5)
 
-                            self._classwise_stats["current_camera"] = cam["label"]
-                            results = await self.scan_camera(
-                                cam["dvr"], cam["channel"], cam["label"],
-                                faces_subset=grade_faces,
-                                insightface_subset=grade_faces_if,
-                            )
-                            scanned += 1
-                            faces_in_cycle += len(results)
-                        except Exception as e:
-                            self._classwise_stats["errors"] += 1
-                            cycle_errors += 1
-                            logger.error(f"Error scanning {cam['label']}: {e}")
-                        await asyncio.sleep(0.5)
-
-                    # Free memory between batches
-                    gc.collect()
-                    await asyncio.sleep(1.0)
+                        # Free memory between batches
+                        gc.collect()
+                        await asyncio.sleep(1.0)
 
                 cycle_duration = time.time() - cycle_start
                 self._classwise_stats["cameras_scanned"] = scanned
