@@ -913,18 +913,44 @@ async def lifespan(app: FastAPI):
         logger.error(f"Face sync crashed during startup (non-fatal): {e}")
     # Pre-load registered faces into attendance engine
     attendance_engine.reload_faces()
-    # Start WebSocket client in background
+
+    # ---- DIAGNOSTIC: Start background tasks one at a time ----
+    # Phase 1: Start ONLY WebSocket (to test if WS causes crash)
     ws_task = asyncio.create_task(websocket_client())
-    # Auto-start classwise monitoring (24/7 always-on)
-    asyncio.create_task(_auto_start_classwise())
-    # Start health watchdog (auto-recovery, face sync, system checks)
-    asyncio.create_task(_health_watchdog())
-    logger.info("PPIS Campus Agent started (24/7 mode with auto-recovery)")
+    logger.info("PPIS Campus Agent started — WebSocket only (diagnostic mode)")
+    print("[STARTUP] WebSocket task started. Auto-start and watchdog DISABLED for diagnosis.", flush=True)
+    print("[STARTUP] If agent stays alive >30 seconds, WebSocket is stable.", flush=True)
+
+    # Phase 2: Start classwise monitoring after 15 seconds (if WS is stable)
+    async def _delayed_classwise_start():
+        try:
+            await asyncio.sleep(15)
+            print("[STARTUP] 15 seconds passed — agent is stable! Starting classwise monitoring...", flush=True)
+            await _auto_start_classwise()
+        except Exception as e:
+            print(f"[STARTUP] Delayed classwise start failed: {e}", flush=True)
+            logger.error(f"Delayed classwise start failed: {e}", exc_info=True)
+
+    asyncio.create_task(_delayed_classwise_start())
+
+    # Phase 3: Start health watchdog after 60 seconds
+    async def _delayed_watchdog():
+        try:
+            await asyncio.sleep(60)
+            print("[STARTUP] 60 seconds passed — starting health watchdog...", flush=True)
+            await _health_watchdog()
+        except Exception as e:
+            print(f"[STARTUP] Health watchdog failed: {e}", flush=True)
+            logger.error(f"Health watchdog failed: {e}", exc_info=True)
+
+    asyncio.create_task(_delayed_watchdog())
     try:
         yield
     except Exception as e:
+        print(f"[LIFESPAN] CRASH during yield: {e}", flush=True)
         logger.critical(f"LIFESPAN CRASH: {e}", exc_info=True)
     finally:
+        print("[LIFESPAN] Shutting down — yield exited!", flush=True)
         # Shutdown
         attendance_engine.stop()
         if ws_task:
@@ -2726,11 +2752,28 @@ def _kill_port_holder(port: int) -> None:
 
 
 if __name__ == "__main__":
+    import atexit
     import uvicorn
     import traceback
 
+    # Log when process exits (catch ALL exits)
+    def _on_exit():
+        print("[ATEXIT] Python process is exiting!", flush=True)
+        # Print stack trace of ALL threads to see what's happening
+        import threading
+        for th in threading.enumerate():
+            print(f"[ATEXIT] Thread: {th.name} (daemon={th.daemon})", flush=True)
+        # Print current exception info if any
+        exc = sys.exc_info()
+        if exc[0] is not None:
+            print(f"[ATEXIT] Current exception: {exc[0].__name__}: {exc[1]}", flush=True)
+            traceback.print_tb(exc[2])
+    atexit.register(_on_exit)
+
     # Global crash logger
     def _log_crash(exc_type, exc_value, exc_tb):
+        print(f"[EXCEPTHOOK] {exc_type.__name__}: {exc_value}", flush=True)
+        traceback.print_tb(exc_tb)
         logger.critical(
             f"UNHANDLED EXCEPTION: {exc_type.__name__}: {exc_value}\n"
             + "".join(traceback.format_tb(exc_tb))
@@ -2744,7 +2787,11 @@ if __name__ == "__main__":
 
     logger.info(f"Starting PPIS Campus Agent on http://localhost:{port}")
     try:
-        uvicorn.run(app, host="0.0.0.0", port=port)
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
+                    timeout_keep_alive=30, ws_max_size=16777216)
+        # If uvicorn.run returns cleanly, something told it to shut down
+        print("[MAIN] uvicorn.run() returned cleanly — something caused shutdown", flush=True)
+        logger.warning("uvicorn.run() returned cleanly — investigating shutdown cause")
     except OSError as e:
         if "10048" in str(e) or "Address already in use" in str(e):
             logger.warning(f"Port {port} still busy, retrying after kill...")
