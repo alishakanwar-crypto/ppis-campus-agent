@@ -636,6 +636,8 @@ async def websocket_client():
 
                     except json.JSONDecodeError:
                         logger.error(f"Invalid JSON from cloud bot: {message[:200]}")
+                    except Exception as e:
+                        logger.error(f"Error handling WS message: {e}", exc_info=True)
 
         except websockets.exceptions.ConnectionClosed as e:
             logger.warning(f"WebSocket closed: {e}. Reconnecting in 5s...")
@@ -905,11 +907,15 @@ async def lifespan(app: FastAPI):
     # Start health watchdog (auto-recovery, face sync, system checks)
     asyncio.create_task(_health_watchdog())
     logger.info("PPIS Campus Agent started (24/7 mode with auto-recovery)")
-    yield
-    # Shutdown
-    attendance_engine.stop()
-    if ws_task:
-        ws_task.cancel()
+    try:
+        yield
+    except Exception as e:
+        logger.critical(f"LIFESPAN CRASH: {e}", exc_info=True)
+    finally:
+        # Shutdown
+        attendance_engine.stop()
+        if ws_task:
+            ws_task.cancel()
     logger.info("PPIS Campus Agent stopped")
 
 
