@@ -855,25 +855,45 @@ async def _health_watchdog():
                     attendance_engine.reload_faces()
                     logger.info(f"WATCHDOG: Synced {synced} new face(s) from cloud")
 
-            # --- Check 4: Memory monitoring (every 5 min) ---
+            # --- Check 4: Tiered memory management (every 2 min) ---
             cleanup_counter += 1
-            if cleanup_counter >= 5:
+            if cleanup_counter >= 2:
                 cleanup_counter = 0
                 try:
                     import psutil
                     proc = psutil.Process()
                     mem_mb = proc.memory_info().rss / (1024 * 1024)
                     attendance_engine._health["memory_mb"] = round(mem_mb, 1)
-                    if mem_mb > 800:
-                        logger.warning(f"WATCHDOG: High memory usage: {mem_mb:.0f}MB — forcing cleanup")
-                        # Trim debug logs
-                        attendance_engine.debug_logs = attendance_engine.debug_logs[-100:]
-                        # Force garbage collection
-                        gc.collect()
-                        # Clean old snapshot files
+
+                    # Tier 1: Normal cleanup (>400MB)
+                    if mem_mb > 400:
+                        stats = attendance_engine.cleanup_memory(aggressive=False)
+                        logger.info(f"WATCHDOG: Memory {mem_mb:.0f}MB — routine cleanup: {stats}")
                         _cleanup_old_snapshots()
+
+                    # Tier 2: Aggressive cleanup (>700MB)
+                    if mem_mb > 700:
+                        stats = attendance_engine.cleanup_memory(aggressive=True)
+                        logger.warning(f"WATCHDOG: High memory {mem_mb:.0f}MB — aggressive cleanup: {stats}")
+
+                    # Tier 3: Critical — force restart (>1200MB)
+                    if mem_mb > 1200:
+                        logger.critical(
+                            f"WATCHDOG: CRITICAL memory {mem_mb:.0f}MB — "
+                            f"forcing process restart to prevent OOM"
+                        )
+                        attendance_engine.add_debug_log(
+                            "memory_restart",
+                            f"Process restarting due to critical memory: {mem_mb:.0f}MB"
+                        )
+                        # Exit with code 1 — run_forever.bat will auto-restart
+                        import sys
+                        sys.exit(1)
+
                 except ImportError:
                     pass
+                except SystemExit:
+                    raise
                 except Exception as e:
                     logger.debug(f"WATCHDOG: Memory check error: {e}")
 
@@ -1646,6 +1666,27 @@ async def health_check():
         if d == __import__("datetime").date.today().isoformat()
     )
     health["cameras_with_errors"] = len(attendance_engine._camera_errors)
+
+    # Memory info
+    try:
+        import psutil
+        proc = psutil.Process()
+        mem = proc.memory_info()
+        health["memory_rss_mb"] = round(mem.rss / (1024 * 1024), 1)
+        health["memory_vms_mb"] = round(mem.vms / (1024 * 1024), 1)
+        health["cpu_percent"] = proc.cpu_percent(interval=0)
+        health["open_files"] = len(proc.open_files())
+        health["threads"] = proc.num_threads()
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Cache sizes
+    health["sighting_cache_entries"] = len(attendance_engine._sightings)
+    health["debug_log_entries"] = len(attendance_engine.debug_logs)
+    health["background_tasks"] = len(attendance_engine._background_tasks)
+    health["daily_marked_entries"] = len(attendance_engine.daily_marked)
 
     # Overall status
     statuses = [health["camera_feed"], health["recognition_engine"],

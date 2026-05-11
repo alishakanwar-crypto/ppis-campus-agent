@@ -1818,6 +1818,8 @@ class AttendanceEngine:
                         self.add_debug_log("off_day_skip",
                                            f"Today is {_day_name} — attendance disabled. "
                                            f"No scanning, no notifications.")
+                    if cycle % 30 == 0:
+                        self.cleanup_memory(aggressive=True)
                     await asyncio.sleep(60)
                     continue
                 if self._is_holiday_today():
@@ -1825,6 +1827,8 @@ class AttendanceEngine:
                         self.add_debug_log("holiday_skip",
                                            "Today is a holiday — attendance disabled. "
                                            "No scanning, no notifications.")
+                    if cycle % 30 == 0:
+                        self.cleanup_memory(aggressive=True)
                     await asyncio.sleep(60)
                     continue
 
@@ -1874,6 +1878,9 @@ class AttendanceEngine:
                                            f"{TEACHER_PHASE_END_HOUR}:{TEACHER_PHASE_END_MIN:02d}) and "
                                            f"student ({STUDENT_PHASE_START_HOUR}:{STUDENT_PHASE_START_MIN:02d}-"
                                            f"{STUDENT_PHASE_END_HOUR}:{STUDENT_PHASE_END_MIN:02d}) windows")
+                    # Memory cleanup during idle — every 5 minutes (10 idle cycles)
+                    if cycle % 10 == 0:
+                        self.cleanup_memory(aggressive=True)
                     await asyncio.sleep(30)
                     continue
 
@@ -2053,8 +2060,14 @@ class AttendanceEngine:
                 if cycle % 10 == 0:
                     await self._report_camera_status_to_backend(cameras)
 
-                # Free memory between cycles and brief cooldown
-                gc.collect()
+                # Periodic memory cleanup every 10 cycles
+                if cycle % 10 == 0:
+                    cleanup = self.cleanup_memory(aggressive=False)
+                    if cleanup.get("memory_mb_after", 0) > 500:
+                        self.add_debug_log("memory_warning",
+                                           f"Memory at {cleanup['memory_mb_after']}MB after cleanup")
+                else:
+                    gc.collect()
                 await asyncio.sleep(2.0)
 
         except asyncio.CancelledError:
@@ -2120,6 +2133,79 @@ class AttendanceEngine:
         if self.classwise_running:
             status["classwise_stats"] = self._classwise_stats.copy()
         return status
+
+    def cleanup_memory(self, aggressive: bool = False) -> dict:
+        """Free memory by pruning caches and collecting garbage.
+
+        Args:
+            aggressive: If True, perform deeper cleanup (used when memory is high).
+
+        Returns:
+            Dict with cleanup stats.
+        """
+        stats: dict = {}
+        now = time.time()
+
+        # 1. Prune stale sightings (older than sighting_window)
+        pruned_sightings = 0
+        cutoff = now - self.sighting_window
+        stale_keys = []
+        for pid, sights in self._sightings.items():
+            before = len(sights)
+            self._sightings[pid] = [s for s in sights if s["time"] >= cutoff]
+            pruned_sightings += before - len(self._sightings[pid])
+            if not self._sightings[pid]:
+                stale_keys.append(pid)
+        for k in stale_keys:
+            del self._sightings[k]
+        stats["pruned_sightings"] = pruned_sightings
+        stats["removed_sighting_keys"] = len(stale_keys)
+
+        # 2. Trim debug logs
+        max_logs = 100 if aggressive else self.max_debug_logs
+        if len(self.debug_logs) > max_logs:
+            trimmed = len(self.debug_logs) - max_logs
+            self.debug_logs = self.debug_logs[-max_logs:]
+            stats["trimmed_debug_logs"] = trimmed
+
+        # 3. Clean up finished background tasks
+        before_tasks = len(self._background_tasks)
+        self._background_tasks = {t for t in self._background_tasks if not t.done()}
+        stats["cleaned_tasks"] = before_tasks - len(self._background_tasks)
+
+        # 4. Prune old daily marks from previous days
+        today = date.today().isoformat()
+        old_marks = {k for k, v in self.daily_marked.items() if v != today}
+        for k in old_marks:
+            del self.daily_marked[k]
+        old_notifs = {k for k, v in self._notification_sent.items() if v != today}
+        for k in old_notifs:
+            del self._notification_sent[k]
+        stats["pruned_old_marks"] = len(old_marks)
+        stats["pruned_old_notifs"] = len(old_notifs)
+
+        # 5. Clear camera error tracking for recovered cameras
+        if aggressive:
+            recovered = [k for k, v in self._camera_errors.items() if v == 0]
+            for k in recovered:
+                del self._camera_errors[k]
+            stats["cleared_recovered_cameras"] = len(recovered)
+            self._camera_recovered.clear()
+
+        # 6. Force garbage collection
+        gc.collect()
+        stats["gc_collected"] = True
+
+        # 7. Report memory after cleanup
+        try:
+            import psutil
+            mem_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+            stats["memory_mb_after"] = round(mem_mb, 1)
+            self._health["memory_mb"] = round(mem_mb, 1)
+        except ImportError:
+            pass
+
+        return stats
 
     def get_debug_logs(self, limit: int = 100) -> list[dict]:
         """Return recent debug logs."""
