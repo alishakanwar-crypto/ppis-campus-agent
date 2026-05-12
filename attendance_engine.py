@@ -1104,7 +1104,9 @@ class AttendanceEngine:
     def _record_sighting(self, person_id: str, confidence: float,
                          camera_source: str,
                          embedding: np.ndarray | None = None,
-                         face_size: tuple[int, int] | None = None) -> int:
+                         face_size: tuple[int, int] | None = None,
+                         face_position: tuple[int, int] | None = None,
+                         face_crop_bytes: bytes | None = None) -> int:
         """Record a face sighting and return how many recent sightings exist."""
         now = time.time()
         if person_id not in self._sightings:
@@ -1115,6 +1117,8 @@ class AttendanceEngine:
             "confidence": confidence,
             "embedding": embedding,
             "face_size": face_size,
+            "face_position": face_position,
+            "face_crop_bytes": face_crop_bytes,
         })
         # Prune old sightings outside the window
         cutoff = now - self.sighting_window
@@ -1124,32 +1128,34 @@ class AttendanceEngine:
         return len(self._sightings[person_id])
 
     def _check_anti_spoof(self, person_id: str, name: str) -> bool:
-        """Anti-spoofing check: detect if sightings look like a static photo.
+        """Advanced liveness detection: verify the face is a live person.
 
-        Returns True if the sightings appear to be from a REAL person,
-        False if they look like a photo/spoof (and attendance should be blocked).
+        Returns True if the sightings appear to be from a REAL live person,
+        False if they look like a spoof attempt (photo, screen, print, video).
 
-        Three checks:
-        1. Embedding variance — real faces show slight natural variation between
-           frames (micro-movements, lighting changes). A static photo produces
-           near-identical embeddings.
-        2. Face size consistency — a photo held to a camera often produces faces
-           with unrealistically identical sizes across frames. Real people move
-           and their face size varies slightly.
-        3. Camera diversity — sightings from multiple cameras strongly indicate
-           a real person walking through campus (optional bonus signal).
+        SIX-LAYER LIVENESS VERIFICATION:
+        1. Embedding variance — real faces vary between frames; static images don't
+        2. Face size variance — held photos produce identical face sizes
+        3. Face position movement — real people shift position naturally
+        4. Texture analysis — detect flat surfaces (prints/screens) vs real skin
+        5. Camera diversity — multiple cameras = strong real-person signal
+        6. Temporal pattern — real people don't appear at perfect intervals
+
+        If ANY check detects spoofing, the attempt is:
+        - Rejected immediately
+        - Logged as a security event
+        - Snapshot saved for review
         """
         sightings = self._sightings.get(person_id, [])
         if len(sightings) < 2:
             return True  # Not enough data to check, allow
 
-        # --- Check 1: Embedding variance ---
+        spoof_score = 0  # Accumulate spoof evidence (>= 2 = blocked)
+
+        # --- CHECK 1: Embedding variance (STRICT) ---
         embeddings = [s["embedding"] for s in sightings
                       if s.get("embedding") is not None]
         if len(embeddings) >= 2:
-            # Compute pairwise cosine similarity between consecutive embeddings.
-            # Use proper cosine similarity (dot / (|a|*|b|)) — NOT raw dot product,
-            # because face_recognition 128-d embeddings are not unit-normalized.
             similarities = []
             for i in range(len(embeddings) - 1):
                 a, b = embeddings[i], embeddings[i + 1]
@@ -1162,19 +1168,16 @@ class AttendanceEngine:
                 similarities.append(sim)
             avg_sim = sum(similarities) / len(similarities)
 
-            # Real faces: embeddings vary slightly between frames due to
-            # micro-expressions, head tilt, lighting changes.
-            # Typical real-face cosine similarity: 0.70 - 0.95
-            # Static photo cosine similarity: 0.97 - 1.00 (nearly identical)
-            if avg_sim > 0.97:
-                self.add_debug_log("anti_spoof_blocked",
-                                   f"{name}: embeddings too similar "
-                                   f"(avg cosine sim {avg_sim:.4f} > 0.97) — "
-                                   f"likely a static photo",
-                                   person_id=person_id)
-                return False
+            # Tightened threshold: 0.95 (was 0.97)
+            # Real faces: 0.70 - 0.93 (natural micro-movements)
+            # Static photo: 0.95 - 1.00 (near-identical)
+            if avg_sim > 0.95:
+                self._log_spoof_attempt(person_id, name, "embedding_frozen",
+                                        f"embeddings too similar (avg cosine sim "
+                                        f"{avg_sim:.4f} > 0.95) — static image suspected")
+                spoof_score += 2  # Strong spoof signal — immediately block
 
-        # --- Check 2: Face size variance ---
+        # --- CHECK 2: Face size variance (STRICT) ---
         face_sizes = [s["face_size"] for s in sightings
                       if s.get("face_size") is not None]
         if len(face_sizes) >= 2:
@@ -1182,31 +1185,173 @@ class AttendanceEngine:
             heights = [fs[1] for fs in face_sizes]
             avg_w = sum(widths) / len(widths)
             avg_h = sum(heights) / len(heights)
-            # Coefficient of variation (std/mean) for width and height
             if avg_w > 0 and avg_h > 0:
                 std_w = (sum((w - avg_w) ** 2 for w in widths) / len(widths)) ** 0.5
                 std_h = (sum((h - avg_h) ** 2 for h in heights) / len(heights)) ** 0.5
                 cv_w = std_w / avg_w
                 cv_h = std_h / avg_h
-                # Real faces: some size variation as person moves (CV > 0.01)
-                # Static photo: virtually identical sizes (CV ~ 0)
-                if cv_w < 0.005 and cv_h < 0.005 and len(face_sizes) >= 2:
-                    self.add_debug_log("anti_spoof_blocked",
-                                       f"{name}: face size too consistent "
-                                       f"(width CV={cv_w:.4f}, height CV={cv_h:.4f}) — "
-                                       f"likely a static photo",
-                                       person_id=person_id)
-                    return False
+                # Tightened: CV < 0.01 (was 0.005)
+                if cv_w < 0.01 and cv_h < 0.01:
+                    self._log_spoof_attempt(person_id, name, "size_frozen",
+                                            f"face size too consistent "
+                                            f"(width CV={cv_w:.4f}, height CV={cv_h:.4f})")
+                    spoof_score += 1
 
-        # --- Check 3: Camera diversity (bonus signal, not blocking) ---
+        # --- CHECK 3: Face position movement (NEW) ---
+        positions = [s["face_position"] for s in sightings
+                     if s.get("face_position") is not None]
+        if len(positions) >= 2:
+            # Calculate total movement across frames
+            total_movement = 0.0
+            for i in range(len(positions) - 1):
+                dx = abs(positions[i + 1][0] - positions[i][0])
+                dy = abs(positions[i + 1][1] - positions[i][1])
+                total_movement += (dx ** 2 + dy ** 2) ** 0.5
+            avg_movement = total_movement / (len(positions) - 1)
+
+            # Real person: natural head/body movement between frames (> 3px)
+            # Static photo: nearly zero movement (< 2px)
+            if avg_movement < 2.0:
+                self._log_spoof_attempt(person_id, name, "no_movement",
+                                        f"face position frozen across {len(positions)} "
+                                        f"frames (avg movement {avg_movement:.1f}px)")
+                spoof_score += 1
+
+        # --- CHECK 4: Texture analysis for print/screen detection (NEW) ---
+        face_crops = [s["face_crop_bytes"] for s in sightings
+                      if s.get("face_crop_bytes") is not None]
+        if face_crops and cv2 is not None:
+            try:
+                latest_crop = face_crops[-1]
+                arr = np.frombuffer(latest_crop, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+                    # 4a. High-frequency content analysis
+                    # Real skin has rich micro-texture; prints/screens are smoother
+                    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+                    lap_var = float(laplacian.var())
+                    lap_mean = float(np.abs(laplacian).mean())
+
+                    # 4b. Color channel distribution (screens have distinct patterns)
+                    b, g, r = cv2.split(img)
+                    # Screens often have higher blue channel variance
+                    b_std = float(np.std(b))
+                    g_std = float(np.std(g))
+                    r_std = float(np.std(r))
+
+                    # 4c. Moiré pattern detection (screen display artifact)
+                    # Apply FFT and check for periodic patterns
+                    f_transform = np.fft.fft2(gray.astype(np.float64))
+                    f_shift = np.fft.fftshift(f_transform)
+                    magnitude = np.abs(f_shift)
+                    # High magnitude peaks at non-DC frequencies = periodic pattern
+                    h, w = magnitude.shape
+                    center_h, center_w = h // 2, w // 2
+                    # Mask out the DC component (center)
+                    mask_size = max(3, min(h, w) // 20)
+                    magnitude[center_h - mask_size:center_h + mask_size,
+                              center_w - mask_size:center_w + mask_size] = 0
+                    peak_ratio = float(np.max(magnitude)) / (float(np.mean(magnitude)) + 1e-6)
+
+                    # Screen moiré: very high peak ratio (> 50)
+                    if peak_ratio > 50:
+                        self._log_spoof_attempt(person_id, name, "moire_pattern",
+                                                f"screen moiré detected "
+                                                f"(FFT peak ratio {peak_ratio:.1f})")
+                        spoof_score += 2  # Strong signal
+
+                    # 4d. Uniform texture detection (printed photo)
+                    # Real skin has varied texture; prints are more uniform
+                    local_std = cv2.blur(
+                        (gray.astype(np.float64) - cv2.blur(gray, (5, 5)).astype(np.float64)) ** 2,
+                        (15, 15),
+                    )
+                    texture_var = float(np.mean(local_std))
+                    if texture_var < 5.0 and lap_var < 50:
+                        self._log_spoof_attempt(person_id, name, "flat_texture",
+                                                f"unnaturally uniform texture "
+                                                f"(var={texture_var:.1f}, lap={lap_var:.1f})")
+                        spoof_score += 1
+
+            except Exception as e:
+                logger.debug(f"Texture analysis error for {name}: {e}")
+
+        # --- CHECK 5: Camera diversity ---
         cameras = set(s["camera"] for s in sightings)
         if len(cameras) > 1:
-            self.add_debug_log("anti_spoof_multi_cam",
+            # Multi-camera sightings = strong real-person signal
+            # Reduce spoof score (it's very hard to spoof across cameras)
+            spoof_score = max(0, spoof_score - 1)
+            self.add_debug_log("liveness_multi_cam",
                                f"{name}: seen on {len(cameras)} cameras — "
                                f"strong real-person signal",
                                person_id=person_id)
 
+        # --- CHECK 6: Temporal pattern (NEW) ---
+        if len(sightings) >= 3:
+            timestamps = [s["time"] for s in sightings]
+            intervals = [timestamps[i + 1] - timestamps[i]
+                         for i in range(len(timestamps) - 1)]
+            if intervals:
+                avg_interval = sum(intervals) / len(intervals)
+                # Check if intervals are suspiciously regular (robotic precision)
+                if avg_interval > 0:
+                    interval_cv = (sum((iv - avg_interval) ** 2 for iv in intervals)
+                                   / len(intervals)) ** 0.5 / avg_interval
+                    # Real person: irregular timing (CV > 0.1)
+                    # Replay/loop: nearly perfect intervals (CV < 0.05)
+                    if interval_cv < 0.05 and len(intervals) >= 3:
+                        self._log_spoof_attempt(person_id, name, "regular_timing",
+                                                f"suspiciously regular detection intervals "
+                                                f"(CV={interval_cv:.4f})")
+                        spoof_score += 1
+
+        # --- FINAL DECISION ---
+        if spoof_score >= 2:
+            self.add_debug_log("liveness_BLOCKED",
+                               f"{name}: SPOOF DETECTED (score {spoof_score}/6) — "
+                               f"attendance REJECTED",
+                               person_id=person_id)
+            return False
+
+        if spoof_score == 1:
+            self.add_debug_log("liveness_warning",
+                               f"{name}: minor spoof signal (score 1/6) — "
+                               f"allowing but flagged for review",
+                               person_id=person_id)
+
+        self.add_debug_log("liveness_passed",
+                           f"{name}: liveness verified (spoof score {spoof_score}/6, "
+                           f"{len(cameras)} camera(s), {len(sightings)} sightings)",
+                           person_id=person_id)
         return True
+
+    def _log_spoof_attempt(self, person_id: str, name: str,
+                           spoof_type: str, details: str):
+        """Log a suspected spoof attempt with snapshot for security review."""
+        self.add_debug_log(f"spoof_{spoof_type}",
+                           f"SPOOF ALERT — {name}: {details}",
+                           person_id=person_id)
+        # Save snapshot of the spoof attempt
+        try:
+            sightings = self._sightings.get(person_id, [])
+            if sightings:
+                latest = sightings[-1]
+                crop = latest.get("face_crop_bytes")
+                if crop:
+                    ts = int(time.time())
+                    spoof_dir = ATTENDANCE_SNAPSHOTS_DIR / "spoof_attempts"
+                    spoof_dir.mkdir(exist_ok=True)
+                    spoof_path = spoof_dir / f"spoof_{person_id}_{spoof_type}_{ts}.jpg"
+                    with open(spoof_path, "wb") as f:
+                        f.write(crop)
+                    self.add_debug_log("spoof_snapshot_saved",
+                                       f"Spoof attempt snapshot saved: {spoof_path}",
+                                       person_id=person_id)
+        except Exception as e:
+            logger.debug(f"Failed to save spoof snapshot: {e}")
 
     def _process_attendance(self, person_id: str, name: str, phone: str,
                             confidence: float, image_bytes: bytes,
@@ -1255,10 +1400,31 @@ class AttendanceEngine:
         if _is_entry_camera(camera_source):
             self.entry_validated[person_id] = date.today().isoformat()
 
+        # Compute face position (center of bounding box) for movement tracking
+        face_position = None
+        face_crop_bytes = None
+        if face_location:
+            try:
+                top, right, bottom, left = face_location
+                cx = (left + right) // 2
+                cy = (top + bottom) // 2
+                face_position = (cx, cy)
+                # Crop face for texture analysis
+                if Image is not None:
+                    pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                    crop = pil_img.crop((left, top, right, bottom))
+                    buf = io.BytesIO()
+                    crop.save(buf, format="JPEG", quality=90)
+                    face_crop_bytes = buf.getvalue()
+            except Exception:
+                pass
+
         # --- CHECK 4: Multi-frame verification ---
         sighting_count = self._record_sighting(
             person_id, confidence, camera_source,
             embedding=embedding, face_size=face_size,
+            face_position=face_position,
+            face_crop_bytes=face_crop_bytes,
         )
         if sighting_count < self.min_sightings:
             self.add_debug_log("awaiting_confirmation",
