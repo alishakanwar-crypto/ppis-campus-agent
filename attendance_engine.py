@@ -1272,10 +1272,11 @@ class AttendanceEngine:
             headers["X-Agent-Secret"] = agent_secret
 
         is_teacher = person_id.startswith("TEACHER_")
+        display_name = name.title() if name == name.upper() else name
         if is_teacher:
-            notif_name = f"Dear {name}, you have been"
+            notif_name = f"Dear {display_name}, you have been"
         else:
-            notif_name = f"Dear Parent, {name} has been"
+            notif_name = f"Dear Parent, {display_name} has been"
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):
