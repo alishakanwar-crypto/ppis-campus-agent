@@ -257,6 +257,8 @@ class AttendanceEngine:
         self._task: asyncio.Task | None = None
         self._classwise_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
+        # Persistent HTTP clients per DVR IP for connection pooling
+        self._dvr_clients: dict[str, httpx.AsyncClient] = {}
         # Disable InsightFace — legacy face_recognition works more reliably
         # with the current DVR setup. Re-enable once InsightFace image
         # compatibility issues with all DVR models are resolved.
@@ -1499,57 +1501,55 @@ class AttendanceEngine:
         except Exception as e:
             logger.warning(f"Camera status report failed (non-fatal): {e}")
 
+    def _get_dvr_client(self, dvr: dict) -> httpx.AsyncClient:
+        """Get or create a persistent HTTP client for a DVR (connection pooling)."""
+        ip = dvr["ip"]
+        if ip not in self._dvr_clients or self._dvr_clients[ip].is_closed:
+            self._dvr_clients[ip] = httpx.AsyncClient(
+                timeout=8.0,
+                auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
+                limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
+            )
+        return self._dvr_clients[ip]
+
     async def capture_frame_from_dvr(self, dvr: dict, channel: int,
-                                     max_retries: int = 3) -> bytes | None:
+                                     max_retries: int = 2) -> bytes | None:
         """Capture a single frame from a Hikvision DVR via ISAPI snapshot.
 
-        Auto-retries on connection failures with exponential backoff.
+        Uses persistent HTTP client with connection pooling for speed.
         """
         ip = dvr["ip"]
         port = dvr.get("port", 80)
-        user = dvr["username"]
-        pwd = dvr["password"]
 
         stream_channel = channel * 100 + 1
-        # Request highest quality JPEG for face recognition
         url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
                f"?snapShotImageType=JPEG&videoResolutionWidth=1920&videoResolutionHeight=1080")
 
+        client = self._get_dvr_client(dvr)
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(url, auth=httpx.DigestAuth(user, pwd))
-                    if resp.status_code == 401:
-                        resp = await client.get(url, auth=httpx.BasicAuth(user, pwd))
-                    if resp.status_code == 200 and resp.headers.get(
-                            "content-type", "").startswith("image"):
-                        # Reset consecutive error count on success
-                        cam_key = f"{ip}:{channel}"
-                        self._camera_errors.pop(cam_key, None)
-                        return resp.content
-                    # Non-exception failure: log and track like exceptions
+                resp = await client.get(url)
+                if resp.status_code == 200 and resp.headers.get(
+                        "content-type", "").startswith("image"):
                     cam_key = f"{ip}:{channel}"
-                    self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
-                    ct = resp.headers.get("content-type", "unknown")
-                    if attempt < max_retries - 1:
-                        backoff = 2 ** attempt
-                        self.add_debug_log(
-                            "dvr_http_error",
-                            f"{ip} ch{channel}: HTTP {resp.status_code} "
-                            f"(content-type={ct}), retrying in {backoff}s")
-                        await asyncio.sleep(backoff)
-                    else:
-                        self.add_debug_log(
-                            "dvr_error",
-                            f"Capture failed from {ip} ch{channel} after "
-                            f"{max_retries} attempts: HTTP {resp.status_code} "
-                            f"(content-type={ct})")
+                    self._camera_errors.pop(cam_key, None)
+                    return resp.content
+                cam_key = f"{ip}:{channel}"
+                self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
+                ct = resp.headers.get("content-type", "unknown")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                else:
+                    self.add_debug_log(
+                        "dvr_error",
+                        f"Capture failed from {ip} ch{channel} after "
+                        f"{max_retries} attempts: HTTP {resp.status_code} "
+                        f"(content-type={ct})")
             except Exception as e:
                 cam_key = f"{ip}:{channel}"
                 self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
                 if attempt < max_retries - 1:
-                    backoff = 2 ** attempt
-                    await asyncio.sleep(backoff)
+                    await asyncio.sleep(1)
                 else:
                     self.add_debug_log("dvr_error",
                                        f"Capture failed from {ip} ch{channel} "
@@ -1884,31 +1884,53 @@ class AttendanceEngine:
                     await asyncio.sleep(30)
                     continue
 
-                # === PHASE 1: Teacher Recognition ===
+                # === PHASE 1: Teacher Recognition (parallel by DVR) ===
                 if in_teacher_phase:
                     if cycle <= 1 or (cycle % 30 == 0):
                         self.add_debug_log("teacher_phase",
                                            f"Phase 1 ACTIVE: scanning {len(teacher_phase_cams)} "
-                                           f"cameras for teacher faces")
+                                           f"cameras for teacher faces (parallel)")
                     teacher_faces = getattr(self, '_teacher_faces_cache', {})
                     teacher_faces_if = getattr(self, '_teacher_faces_cache_insightface', {})
+
+                    # Group cameras by DVR IP for parallel scanning
+                    dvr_groups: dict[str, list] = {}
                     for cam in teacher_phase_cams:
-                        if not self.classwise_running:
-                            break
-                        try:
-                            self._classwise_stats["current_camera"] = cam["label"]
-                            results = await self.scan_camera(
-                                cam["dvr"], cam["channel"], cam["label"],
-                                faces_subset=teacher_faces if teacher_faces else None,
-                                insightface_subset=teacher_faces_if if teacher_faces_if else None,
-                            )
-                            scanned += 1
-                            faces_in_cycle += len(results)
-                        except Exception as e:
-                            self._classwise_stats["errors"] += 1
-                            cycle_errors += 1
-                            logger.error(f"Error scanning {cam['label']}: {e}")
-                        await asyncio.sleep(0.5)
+                        ip = cam["dvr"]["ip"]
+                        dvr_groups.setdefault(ip, []).append(cam)
+
+                    async def _scan_dvr_group(cams, faces, faces_if):
+                        _scanned, _faces_found, _errors = 0, 0, 0
+                        for cam in cams:
+                            if not self.classwise_running:
+                                break
+                            try:
+                                self._classwise_stats["current_camera"] = cam["label"]
+                                results = await self.scan_camera(
+                                    cam["dvr"], cam["channel"], cam["label"],
+                                    faces_subset=faces if faces else None,
+                                    insightface_subset=faces_if if faces_if else None,
+                                )
+                                _scanned += 1
+                                _faces_found += len(results)
+                            except Exception as e:
+                                _errors += 1
+                                logger.error(f"Error scanning {cam['label']}: {e}")
+                            await asyncio.sleep(0.1)
+                        return _scanned, _faces_found, _errors
+
+                    # Scan all DVRs concurrently
+                    tasks = [
+                        _scan_dvr_group(cams, teacher_faces, teacher_faces_if)
+                        for cams in dvr_groups.values()
+                    ]
+                    results_list = await asyncio.gather(*tasks, return_exceptions=True)
+                    for r in results_list:
+                        if isinstance(r, tuple):
+                            scanned += r[0]
+                            faces_in_cycle += r[1]
+                            cycle_errors += r[2]
+                            self._classwise_stats["errors"] += r[2]
                     gc.collect()
 
                 # --- Trigger teacher report email once Phase 1 ends ---
@@ -1948,27 +1970,44 @@ class AttendanceEngine:
                                            f"{len(student_phase_cams_classroom)} classroom cameras "
                                            f"for student faces")
 
-                    # 2a. Scan gate/reception cameras for ALL student faces
-                    for cam in student_phase_cams_gate:
-                        if not self.classwise_running:
-                            break
-                        # Skip if already scanned in teacher phase this cycle
-                        if in_teacher_phase and cam in teacher_phase_cams:
-                            continue
-                        try:
-                            self._classwise_stats["current_camera"] = cam["label"]
-                            results = await self.scan_camera(
-                                cam["dvr"], cam["channel"], cam["label"],
-                                faces_subset=None,
-                                insightface_subset=None,
-                            )
-                            scanned += 1
-                            faces_in_cycle += len(results)
-                        except Exception as e:
-                            self._classwise_stats["errors"] += 1
-                            cycle_errors += 1
-                            logger.error(f"Error scanning {cam['label']}: {e}")
-                        await asyncio.sleep(0.5)
+                    # 2a. Scan gate/reception cameras for ALL student faces (parallel by DVR)
+                    gate_cams_to_scan = [
+                        cam for cam in student_phase_cams_gate
+                        if not (in_teacher_phase and cam in teacher_phase_cams)
+                    ]
+                    if gate_cams_to_scan:
+                        gate_dvr_groups: dict[str, list] = {}
+                        for cam in gate_cams_to_scan:
+                            ip = cam["dvr"]["ip"]
+                            gate_dvr_groups.setdefault(ip, []).append(cam)
+
+                        async def _scan_gate_group(cams):
+                            _s, _f, _e = 0, 0, 0
+                            for cam in cams:
+                                if not self.classwise_running:
+                                    break
+                                try:
+                                    self._classwise_stats["current_camera"] = cam["label"]
+                                    results = await self.scan_camera(
+                                        cam["dvr"], cam["channel"], cam["label"],
+                                        faces_subset=None, insightface_subset=None,
+                                    )
+                                    _s += 1
+                                    _f += len(results)
+                                except Exception as e:
+                                    _e += 1
+                                    logger.error(f"Error scanning {cam['label']}: {e}")
+                                await asyncio.sleep(0.1)
+                            return _s, _f, _e
+
+                        gate_tasks = [_scan_gate_group(cams) for cams in gate_dvr_groups.values()]
+                        gate_results = await asyncio.gather(*gate_tasks, return_exceptions=True)
+                        for r in gate_results:
+                            if isinstance(r, tuple):
+                                scanned += r[0]
+                                faces_in_cycle += r[1]
+                                cycle_errors += r[2]
+                                self._classwise_stats["errors"] += r[2]
                     gc.collect()
 
                     # 2b. Scan classroom cameras (grade-specific students ONLY)
@@ -2011,11 +2050,11 @@ class AttendanceEngine:
                                 self._classwise_stats["errors"] += 1
                                 cycle_errors += 1
                                 logger.error(f"Error scanning {cam['label']}: {e}")
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.1)
 
                         # Free memory between batches
                         gc.collect()
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(0.3)
 
                 cycle_duration = time.time() - cycle_start
                 self._classwise_stats["cameras_scanned"] = scanned
@@ -2068,7 +2107,7 @@ class AttendanceEngine:
                                            f"Memory at {cleanup['memory_mb_after']}MB after cleanup")
                 else:
                     gc.collect()
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
             self.add_debug_log("classwise_cancelled",
@@ -2096,6 +2135,11 @@ class AttendanceEngine:
             self._task.cancel()
         if self._classwise_task and not self._classwise_task.done():
             self._classwise_task.cancel()
+        # Close persistent DVR HTTP clients
+        for client in self._dvr_clients.values():
+            if not client.is_closed:
+                asyncio.ensure_future(client.aclose())
+        self._dvr_clients.clear()
         self.add_debug_log("monitoring_stopped",
                            "Stop requested — auto_start disabled")
 
