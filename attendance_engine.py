@@ -68,15 +68,15 @@ COOLDOWN_SECONDS = 300  # 5 minutes
 ATTENDANCE_START_HOUR = 7
 ATTENDANCE_START_MINUTE = 0
 ATTENDANCE_END_HOUR = 9
-ATTENDANCE_END_MINUTE = 0
+ATTENDANCE_END_MINUTE = 30
 
 # Two-phase attendance windows (production mode)
-# Phase 1: Teacher recognition (7:00 AM - 8:00 AM)
+# Phase 1: Teacher recognition (7:00 AM - 8:30 AM)
 # Cameras: Reception, Entry Gate, Admission Room, Teacher Staff 1 & 2
 TEACHER_PHASE_START_HOUR = 7
 TEACHER_PHASE_START_MIN = 0
 TEACHER_PHASE_END_HOUR = 8
-TEACHER_PHASE_END_MIN = 0
+TEACHER_PHASE_END_MIN = 30
 
 # Phase 2: Student recognition (7:15 AM - 9:00 AM)
 # Cameras: Entry Gate, Reception, Classroom cameras (grade-specific)
