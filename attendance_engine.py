@@ -1650,9 +1650,9 @@ class AttendanceEngine:
 
         Camera types:
         - 'reception': Reception cameras — Phase 1 teacher + Phase 2 students
-        - 'principal': Principal Room — Phase 1 only (principal detection)
+        - 'principal': Principal Room — Phase 1 only
         - 'entry_gate': Entry gates — Phase 2 students only
-        - 'staff': Teacher staff rooms, admin, accounts — NOT used for attendance
+        - 'staff': Teacher Staff, Admission, Admin, Accounts, Academic Coord — Phase 1 only
         - 'classroom': Grade classrooms (NUR, PREP, GRADE) — Phase 2 students
         - 'other': Labs, galleries, parks, etc. — skip
         """
@@ -1683,7 +1683,7 @@ class AttendanceEngine:
         - reception: Reception C1-C4 → Phase 1 teachers + Phase 2 students
         - principal: Principal Room → Phase 1 only
         - entry_gate: Entry Gate → Phase 2 students only
-        - staff: Teacher Staff, Admin, Accounts → skipped
+        - staff: Teacher Staff, Admission, Admin, Accounts, Acad. Coord → Phase 1 only
         - classroom: Grade classrooms → Phase 2 students only
         - other: Labs, galleries, parks → all faces (test mode) / skip (production)
 
@@ -1758,8 +1758,8 @@ class AttendanceEngine:
             all_classroom_cams = [c for c in cameras if c["cam_type"] == "classroom"]
             all_other_cams = [c for c in cameras if c["cam_type"] == "other"]
 
-            # Phase 1 teacher cameras: Reception C1-C4 + Principal Room ONLY
-            teacher_phase_cams = reception_cams + principal_cams
+            # Phase 1 teacher cameras: Reception + Principal + Entry Gate + Staff rooms
+            teacher_phase_cams = reception_cams + principal_cams + entry_gate_cams + all_staff_cams
             # Phase 2 student cameras: Entry Gate + Reception + ALL classrooms
             student_phase_cams_gate = entry_gate_cams + reception_cams
             student_phase_cams_classroom = all_classroom_cams
@@ -1786,10 +1786,11 @@ class AttendanceEngine:
                 "classwise_started",
                 f"Mode: {mode} | "
                 f"Phase1 teacher cams: {len(teacher_phase_cams)} "
-                f"(reception: {len(reception_cams)}, principal: {len(principal_cams)}) | "
+                f"(reception: {len(reception_cams)}, principal: {len(principal_cams)}, "
+                f"gate: {len(entry_gate_cams)}, staff: {len(all_staff_cams)}) | "
                 f"Phase2 student cams: {len(student_phase_cams_gate)} gate/reception + "
                 f"{len(student_phase_cams_classroom)} classroom | "
-                f"Other (skipped): {len(all_other_cams) + len(all_staff_cams)} | "
+                f"Other (skipped): {len(all_other_cams)} | "
                 f"{len(self.known_faces)} total faces loaded, "
                 f"{len(self._grade_face_cache)} grades with faces | "
                 f"Teacher window: {TEACHER_PHASE_START_HOUR}:{TEACHER_PHASE_START_MIN:02d}-"
