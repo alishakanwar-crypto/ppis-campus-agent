@@ -663,7 +663,7 @@ class AttendanceEngine:
                 "confidence": confidence,
             }
 
-            # Send to backend asynchronously
+            # Send to backend asynchronously (safe from thread pool)
             async def _send():
                 try:
                     import httpx
@@ -678,9 +678,16 @@ class AttendanceEngine:
                 except Exception as e:
                     logger.warning(f"Failed to queue manual review: {e}")
 
-            task = asyncio.create_task(_send())
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+            loop = getattr(self, '_event_loop', None)
+            if loop is not None:
+                asyncio.run_coroutine_threadsafe(_send(), loop)
+            else:
+                try:
+                    task = asyncio.create_task(_send())
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                except RuntimeError:
+                    logger.warning("Manual review skipped: no event loop")
         except Exception as e:
             logger.warning(f"Manual review queue error: {e}")
 
