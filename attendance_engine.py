@@ -571,7 +571,7 @@ class AttendanceEngine:
             top, right, bottom, left = location
             face_w = right - left
             face_h = bottom - top
-            min_face_px = 40
+            min_face_px = 20
             if face_w < min_face_px or face_h < min_face_px:
                 self.add_debug_log("face_too_small",
                                    f"Face {face_w}x{face_h}px < {min_face_px}px "
@@ -769,7 +769,7 @@ class AttendanceEngine:
             bbox = face_obj.bbox  # [x1, y1, x2, y2]
             face_w = bbox[2] - bbox[0]
             face_h = bbox[3] - bbox[1]
-            min_face_px = 40  # minimum face size in pixels
+            min_face_px = 20  # minimum face size in pixels
             if face_w < min_face_px or face_h < min_face_px:
                 self.add_debug_log("face_too_small",
                                    f"Face {face_w:.0f}x{face_h:.0f}px < {min_face_px}px "
