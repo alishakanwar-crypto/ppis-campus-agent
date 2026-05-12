@@ -10,6 +10,8 @@ Supports:
   Each camera only checks faces of students in that class.
 """
 
+from __future__ import annotations
+
 import asyncio
 import gc
 import io

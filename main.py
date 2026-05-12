@@ -9,6 +9,8 @@ Features:
 - On-demand child photo capture and delivery
 """
 
+from __future__ import annotations
+
 import faulthandler
 faulthandler.enable()  # Print C-level crash tracebacks
 
