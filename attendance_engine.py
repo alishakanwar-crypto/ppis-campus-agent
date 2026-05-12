@@ -64,26 +64,43 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (overall: 7:00 AM to 9:00 AM IST)
+# Attendance time window (overall: 7:00 AM to 8:30 AM IST)
 ATTENDANCE_START_HOUR = 7
 ATTENDANCE_START_MINUTE = 0
-ATTENDANCE_END_HOUR = 9
-ATTENDANCE_END_MINUTE = 0
+ATTENDANCE_END_HOUR = 8
+ATTENDANCE_END_MINUTE = 30
 
 # Two-phase attendance windows (production mode)
 # Phase 1: Teacher recognition (7:00 AM - 8:00 AM)
-# Cameras: Reception C1-C4, Principal Room
+# Cameras: Reception C1-C4, Principal Room, Entry Gate, Staff rooms
 TEACHER_PHASE_START_HOUR = 7
 TEACHER_PHASE_START_MIN = 0
 TEACHER_PHASE_END_HOUR = 8
 TEACHER_PHASE_END_MIN = 0
 
-# Phase 2: Student recognition (7:15 AM - 9:00 AM)
+# Phase 2: Student recognition (7:00 AM - 8:30 AM)
 # Cameras: Entry Gate, Reception, Classroom cameras (grade-specific)
 STUDENT_PHASE_START_HOUR = 7
-STUDENT_PHASE_START_MIN = 15
-STUDENT_PHASE_END_HOUR = 9
-STUDENT_PHASE_END_MIN = 0
+STUDENT_PHASE_START_MIN = 0
+STUDENT_PHASE_END_HOUR = 8
+STUDENT_PHASE_END_MIN = 30
+
+# ---------------------------------------------------------------------------
+# HIGH-ACCURACY CONFIGURATION
+# ---------------------------------------------------------------------------
+# Minimum face pixel dimensions for quality filtering
+MIN_FACE_WIDTH = 40
+MIN_FACE_HEIGHT = 40
+
+# Image quality thresholds (Laplacian variance for sharpness)
+MIN_SHARPNESS_SCORE = 30.0  # Reject blurry faces below this
+MIN_BRIGHTNESS = 40         # Reject underexposed faces
+MAX_BRIGHTNESS = 230        # Reject overexposed faces
+
+# Entry gate / reception camera labels (for entry validation)
+ENTRY_VALIDATION_CAMERAS = {
+    "entry_gate", "reception",
+}
 
 # TEMPORARY TEST FLAG: Force re-send notifications even if already sent today
 # Set to True for testing, False for production
@@ -231,6 +248,57 @@ def _preprocess_image(image_bytes: bytes) -> bytes:
         return image_bytes
 
 
+def _assess_face_quality(face_crop_bytes: bytes) -> dict:
+    """Assess quality of a cropped face image.
+
+    Returns dict with:
+        sharpness: float (Laplacian variance — higher = sharper)
+        brightness: float (mean pixel value 0-255)
+        is_acceptable: bool (passes all quality checks)
+        rejection_reason: str or None
+    """
+    result = {"sharpness": 0.0, "brightness": 128.0,
+              "is_acceptable": True, "rejection_reason": None}
+    if cv2 is None:
+        return result
+    try:
+        arr = np.frombuffer(face_crop_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            result["is_acceptable"] = False
+            result["rejection_reason"] = "could not decode face crop"
+            return result
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # Sharpness via Laplacian variance
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        sharpness = float(laplacian.var())
+        result["sharpness"] = round(sharpness, 1)
+        # Brightness
+        brightness = float(gray.mean())
+        result["brightness"] = round(brightness, 1)
+        if sharpness < MIN_SHARPNESS_SCORE:
+            result["is_acceptable"] = False
+            result["rejection_reason"] = f"blurry (sharpness {sharpness:.1f} < {MIN_SHARPNESS_SCORE})"
+        elif brightness < MIN_BRIGHTNESS:
+            result["is_acceptable"] = False
+            result["rejection_reason"] = f"too dark (brightness {brightness:.0f} < {MIN_BRIGHTNESS})"
+        elif brightness > MAX_BRIGHTNESS:
+            result["is_acceptable"] = False
+            result["rejection_reason"] = f"overexposed (brightness {brightness:.0f} > {MAX_BRIGHTNESS})"
+    except Exception:
+        pass
+    return result
+
+
+def _is_entry_camera(camera_source: str) -> bool:
+    """Check if camera_source is an entry gate or reception camera."""
+    src_lower = camera_source.lower()
+    for keyword in ENTRY_VALIDATION_CAMERAS:
+        if keyword in src_lower:
+            return True
+    return False
+
+
 class AttendanceEngine:
     """Runs face recognition attendance monitoring."""
 
@@ -239,10 +307,12 @@ class AttendanceEngine:
         self.classwise_running = False
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
-        self.confidence_threshold = 0.33  # Match confidence > 33%
-        self.review_threshold = 0.28  # 28-33% goes to manual review queue
-        self.min_sightings = 2  # Must be seen 2+ times before marking present
-        self.sighting_window = 300  # 5-minute window for sightings to accumulate
+        self.confidence_threshold = 0.45  # Match confidence > 45% (raised for accuracy)
+        self.review_threshold = 0.38  # 38-45% goes to manual review queue
+        self.min_sightings = 3  # Must be seen 3+ times before marking present
+        self.sighting_window = 600  # 10-minute window for sightings to accumulate
+        self.teacher_confidence_threshold = 0.50  # Higher threshold for teachers
+        self.entry_validated: dict[str, str] = {}  # person_id -> date (seen at entry/reception)
         self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
         self.known_faces: dict = {}
         self.known_faces_insightface: dict = {}  # person_id -> {name, phone, embeddings: [...]}
@@ -567,15 +637,33 @@ class AttendanceEngine:
         results = []
 
         for i, (encoding, location) in enumerate(zip(face_encodings, face_locations)):
-            # Face quality filter: reject tiny/distant faces (legacy)
+            # Face quality filter: reject tiny/distant/blurry faces
             top, right, bottom, left = location
             face_w = right - left
             face_h = bottom - top
-            min_face_px = 20
-            if face_w < min_face_px or face_h < min_face_px:
+            if face_w < MIN_FACE_WIDTH or face_h < MIN_FACE_HEIGHT:
                 self.add_debug_log("face_too_small",
-                                   f"Face {face_w}x{face_h}px < {min_face_px}px "
+                                   f"Face {face_w}x{face_h}px < {MIN_FACE_WIDTH}x{MIN_FACE_HEIGHT}px "
                                    f"minimum from {camera_source} — skipping",
+                                   confidence=0.0)
+                continue
+
+            # Assess face crop quality (sharpness, brightness)
+            face_crop = image_bytes  # Use full image for quality check
+            try:
+                if Image is not None:
+                    pil_crop = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                    crop_region = pil_crop.crop((left, top, right, bottom))
+                    buf = io.BytesIO()
+                    crop_region.save(buf, format="JPEG", quality=95)
+                    face_crop = buf.getvalue()
+            except Exception:
+                pass
+            quality = _assess_face_quality(face_crop)
+            if not quality["is_acceptable"]:
+                self.add_debug_log("face_quality_rejected",
+                                   f"Face from {camera_source} rejected: "
+                                   f"{quality['rejection_reason']}",
                                    confidence=0.0)
                 continue
 
@@ -1126,14 +1214,35 @@ class AttendanceEngine:
                             camera_source: str,
                             embedding: np.ndarray | None = None,
                             face_size: tuple[int, int] | None = None) -> dict | None:
-        """Process an attendance detection: check time window, cooldown/daily dedup, log, and notify."""
-        now = time.time()
+        """Process an attendance detection with multi-layer verification.
 
-        # Time window check: only mark attendance between 7:00 AM and 8:30 AM
+        All checks must pass before marking attendance:
+        CHECK 1: High-confidence facial recognition (threshold depends on role)
+        CHECK 2: Detection from authorized cameras
+        CHECK 3: Detection within attendance time window
+        CHECK 4: Repeated face confirmation across frames (min_sightings)
+        CHECK 5: Entry gate / reception validation
+        CHECK 6: Anti-spoofing / liveness checks
+        """
+        now = time.time()
+        is_teacher = person_id.startswith("TEACHER_")
+
+        # --- CHECK 1: High-confidence match ---
+        effective_threshold = (self.teacher_confidence_threshold
+                               if is_teacher else self.confidence_threshold)
+        if confidence < effective_threshold:
+            self.add_debug_log("confidence_rejected",
+                               f"{name} confidence {confidence:.1%} < "
+                               f"{effective_threshold:.0%} threshold "
+                               f"({'teacher' if is_teacher else 'student'})",
+                               person_id=person_id, confidence=confidence)
+            return None
+
+        # --- CHECK 3: Time window ---
         if not self._is_within_attendance_window():
             return None
 
-        # Daily dedup: one entry per student per day
+        # --- Daily dedup: one entry per student per day ---
         if self._is_already_marked_today(person_id):
             self.add_debug_log("daily_already_marked",
                                f"{name} already marked today",
@@ -1141,8 +1250,12 @@ class AttendanceEngine:
                                confidence=confidence)
             return None
 
-        # Multi-detection: require 2+ sightings within the sighting window
-        # to prevent false positives from one-off camera noise/artifacts.
+        # --- CHECK 5: Entry gate / reception validation ---
+        # Record entry validation if detected on entry/reception camera
+        if _is_entry_camera(camera_source):
+            self.entry_validated[person_id] = date.today().isoformat()
+
+        # --- CHECK 4: Multi-frame verification ---
         sighting_count = self._record_sighting(
             person_id, confidence, camera_source,
             embedding=embedding, face_size=face_size,
@@ -1156,16 +1269,48 @@ class AttendanceEngine:
                                confidence=confidence)
             return None
 
-        # Anti-spoofing: check that sightings look like a real person,
-        # not a static photo held up to the camera.
+        # --- CHECK 5b: Verify entry validation for non-entry cameras ---
+        # If person was never seen at entry/reception today, reduce confidence
+        entry_ok = self.entry_validated.get(person_id) == date.today().isoformat()
+        if not entry_ok:
+            # Check sightings for any entry camera detection
+            sightings = self._sightings.get(person_id, [])
+            for s in sightings:
+                if _is_entry_camera(s.get("camera", "")):
+                    entry_ok = True
+                    self.entry_validated[person_id] = date.today().isoformat()
+                    break
+        if not entry_ok and not _is_entry_camera(camera_source):
+            # No entry validation — hold attendance, don't mark yet
+            self.add_debug_log("no_entry_validation",
+                               f"{name} detected on {camera_source} but NOT seen at "
+                               f"entry gate/reception today — attendance held",
+                               person_id=person_id, confidence=confidence)
+            return None
+
+        # --- CHECK 6: Anti-spoofing ---
         if not self._check_anti_spoof(person_id, name):
             self.add_debug_log("spoof_rejected",
                                f"{name} blocked by anti-spoof check — "
                                f"resetting sightings",
                                person_id=person_id,
                                confidence=confidence)
-            # Clear sightings so they can't just wait and try again
             self._sightings.pop(person_id, None)
+            return None
+
+        # --- Compute average confidence from all sightings ---
+        sightings = self._sightings.get(person_id, [])
+        avg_confidence = confidence
+        if sightings:
+            confs = [s["confidence"] for s in sightings if s.get("confidence")]
+            if confs:
+                avg_confidence = sum(confs) / len(confs)
+        # Use average confidence for final check
+        if avg_confidence < effective_threshold:
+            self.add_debug_log("avg_confidence_low",
+                               f"{name} average confidence {avg_confidence:.1%} across "
+                               f"{len(sightings)} sightings < {effective_threshold:.0%}",
+                               person_id=person_id, confidence=avg_confidence)
             return None
 
         # Cooldown check (prevents rapid duplicate detections)
@@ -1277,6 +1422,10 @@ class AttendanceEngine:
             notif_name = f"Dear {display_name}, you have been"
         else:
             notif_name = f"Dear Parent, {display_name} has been"
+
+        # Log confidence level for monitoring
+        logger.info(f"[NOTIFICATION] Sending to {phone} for {display_name} "
+                     f"(confidence verified, entry validated)")
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):
@@ -1858,9 +2007,10 @@ class AttendanceEngine:
                     self._sightings.clear()
                     self._camera_errors.clear()
                     self._admin_alerted.clear()
+                    self.entry_validated.clear()
                     self.add_debug_log("daily_reset",
                                        f"New day {today}: cleared attendance marks, "
-                                       f"notifications, and sightings")
+                                       f"notifications, sightings, and entry validations")
 
                 # Periodically reload faces (picks up new registrations)
                 if cycle % 20 == 0:
@@ -2190,6 +2340,23 @@ class AttendanceEngine:
             "grades_with_faces": len(self._grade_face_cache),
             "health": self._health.copy(),
             "anti_spoof_enabled": True,
+            "entry_validation_enabled": True,
+            "quality_filtering_enabled": True,
+            "teacher_confidence_threshold": self.teacher_confidence_threshold,
+            "entry_validated_today": sum(
+                1 for d in self.entry_validated.values()
+                if d == date.today().isoformat()
+            ),
+            "multi_layer_checks": [
+                "high_confidence_match",
+                "authorized_camera",
+                "time_window",
+                "multi_frame_verification",
+                "entry_gate_validation",
+                "anti_spoofing",
+                "average_confidence_check",
+                "face_quality_filter",
+            ],
         }
         if self.classwise_running:
             status["classwise_stats"] = self._classwise_stats.copy()
