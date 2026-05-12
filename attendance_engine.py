@@ -68,15 +68,15 @@ COOLDOWN_SECONDS = 300  # 5 minutes
 ATTENDANCE_START_HOUR = 7
 ATTENDANCE_START_MINUTE = 0
 ATTENDANCE_END_HOUR = 9
-ATTENDANCE_END_MINUTE = 30
+ATTENDANCE_END_MINUTE = 0
 
 # Two-phase attendance windows (production mode)
-# Phase 1: Teacher recognition (7:00 AM - 8:30 AM)
-# Cameras: Reception, Entry Gate, Admission Room, Teacher Staff 1 & 2
+# Phase 1: Teacher recognition (7:00 AM - 8:00 AM)
+# Cameras: Reception C1-C4, Principal Room
 TEACHER_PHASE_START_HOUR = 7
 TEACHER_PHASE_START_MIN = 0
 TEACHER_PHASE_END_HOUR = 8
-TEACHER_PHASE_END_MIN = 30
+TEACHER_PHASE_END_MIN = 0
 
 # Phase 2: Student recognition (7:15 AM - 9:00 AM)
 # Cameras: Entry Gate, Reception, Classroom cameras (grade-specific)
@@ -1649,19 +1649,23 @@ class AttendanceEngine:
         """Classify a camera into a type for attendance scanning rules.
 
         Camera types:
-        - 'gate_reception': Entry gates, reception — scan ALL faces (teachers + students)
-        - 'staff': Teacher staff rooms — scan ONLY teacher/staff faces
-        - 'classroom': Grade classrooms (NUR, PREP, GRADE) — scan ONLY grade students
-        - 'other': Labs, galleries, parks, etc. — scan ALL faces in test mode only
+        - 'reception': Reception cameras — Phase 1 teacher + Phase 2 students
+        - 'principal': Principal Room — Phase 1 only (principal detection)
+        - 'entry_gate': Entry gates — Phase 2 students only
+        - 'staff': Teacher staff rooms, admin, accounts — NOT used for attendance
+        - 'classroom': Grade classrooms (NUR, PREP, GRADE) — Phase 2 students
+        - 'other': Labs, galleries, parks, etc. — skip
         """
         loc_upper = location.upper()
-        _GATE_RECEPTION_KEYWORDS = {"ENTRY", "ENTRANCE", "DISPERSAL",
-                                    "ADMISSION", "RECEPTION"}
-        _STAFF_KEYWORDS = {"TEACHER STAFF", "STAFF ROOM", "PRINCIPAL",
-                           "ACADEMIC COORDINATOR", "ADMIN ROOM", "ACCOUNTS ROOM"}
-        if any(kw in loc_upper for kw in _GATE_RECEPTION_KEYWORDS):
-            return "gate_reception"
-        if any(kw in loc_upper for kw in _STAFF_KEYWORDS):
+        if "RECEPTION" in loc_upper:
+            return "reception"
+        if "PRINCIPAL" in loc_upper:
+            return "principal"
+        if any(kw in loc_upper for kw in {"ENTRY", "ENTRANCE", "DISPERSAL"}):
+            return "entry_gate"
+        if any(kw in loc_upper for kw in {"TEACHER STAFF", "STAFF ROOM",
+                                           "ACADEMIC COORDINATOR", "ADMIN ROOM",
+                                           "ACCOUNTS ROOM", "ADMISSION"}):
             return "staff"
         grade = _extract_grade_from_location(location)
         if grade is not None:
@@ -1676,9 +1680,11 @@ class AttendanceEngine:
         ALL camera feeds per classroom from the all_cameras field.
 
         Camera types for attendance:
-        - gate_reception: Entry Gate, Reception → teachers + students
-        - staff: Teacher Staff rooms → teachers only
-        - classroom: Grade classrooms → grade students only
+        - reception: Reception C1-C4 → Phase 1 teachers + Phase 2 students
+        - principal: Principal Room → Phase 1 only
+        - entry_gate: Entry Gate → Phase 2 students only
+        - staff: Teacher Staff, Admin, Accounts → skipped
+        - classroom: Grade classrooms → Phase 2 students only
         - other: Labs, galleries, parks → all faces (test mode) / skip (production)
 
         Returns list of dicts:
@@ -1718,7 +1724,7 @@ class AttendanceEngine:
                     "channel": channel,
                     "dvr": dvrs[dvr_idx],
                     "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
-                    "is_gate": cam_type == "gate_reception",
+                    "is_gate": cam_type in ("reception", "entry_gate"),
                     "cam_type": cam_type,
                 })
 
@@ -1745,15 +1751,17 @@ class AttendanceEngine:
             cameras = self.build_classroom_camera_list(camera_mapping, dvrs)
 
             # Categorize cameras by type
-            all_gate_reception_cams = [c for c in cameras if c["cam_type"] == "gate_reception"]
+            reception_cams = [c for c in cameras if c["cam_type"] == "reception"]
+            principal_cams = [c for c in cameras if c["cam_type"] == "principal"]
+            entry_gate_cams = [c for c in cameras if c["cam_type"] == "entry_gate"]
             all_staff_cams = [c for c in cameras if c["cam_type"] == "staff"]
             all_classroom_cams = [c for c in cameras if c["cam_type"] == "classroom"]
             all_other_cams = [c for c in cameras if c["cam_type"] == "other"]
 
-            # Phase 1 teacher cameras: gate/reception + staff + admission
-            teacher_phase_cams = all_gate_reception_cams + all_staff_cams
-            # Phase 2 student cameras: gate/reception + classrooms
-            student_phase_cams_gate = all_gate_reception_cams
+            # Phase 1 teacher cameras: Reception C1-C4 + Principal Room ONLY
+            teacher_phase_cams = reception_cams + principal_cams
+            # Phase 2 student cameras: Entry Gate + Reception + ALL classrooms
+            student_phase_cams_gate = entry_gate_cams + reception_cams
             student_phase_cams_classroom = all_classroom_cams
 
             active_cam_count = len(set(
@@ -1778,10 +1786,10 @@ class AttendanceEngine:
                 "classwise_started",
                 f"Mode: {mode} | "
                 f"Phase1 teacher cams: {len(teacher_phase_cams)} "
-                f"(gate/reception: {len(all_gate_reception_cams)}, staff: {len(all_staff_cams)}) | "
-                f"Phase2 student cams: {len(student_phase_cams_gate)} gate + "
+                f"(reception: {len(reception_cams)}, principal: {len(principal_cams)}) | "
+                f"Phase2 student cams: {len(student_phase_cams_gate)} gate/reception + "
                 f"{len(student_phase_cams_classroom)} classroom | "
-                f"Other (skipped): {len(all_other_cams)} | "
+                f"Other (skipped): {len(all_other_cams) + len(all_staff_cams)} | "
                 f"{len(self.known_faces)} total faces loaded, "
                 f"{len(self._grade_face_cache)} grades with faces | "
                 f"Teacher window: {TEACHER_PHASE_START_HOUR}:{TEACHER_PHASE_START_MIN:02d}-"
