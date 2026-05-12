@@ -1760,8 +1760,8 @@ class AttendanceEngine:
 
             # Phase 1 teacher cameras: Reception + Principal + Entry Gate + Staff rooms
             teacher_phase_cams = reception_cams + principal_cams + entry_gate_cams + all_staff_cams
-            # Phase 2 student cameras: Entry Gate + Reception + ALL classrooms
-            student_phase_cams_gate = entry_gate_cams + reception_cams
+            # Phase 2 student cameras: ALL cameras (gate + reception + staff + classrooms)
+            student_phase_cams_gate = entry_gate_cams + reception_cams + principal_cams + all_staff_cams
             student_phase_cams_classroom = all_classroom_cams
 
             active_cam_count = len(set(
