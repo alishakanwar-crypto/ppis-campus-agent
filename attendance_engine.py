@@ -18,7 +18,7 @@ import os
 import re
 import tempfile
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -1215,7 +1215,7 @@ class AttendanceEngine:
                 "confidence": record.get("confidence", 0),
                 "notification_sent": bool(parent_phones),
                 "parent_phones": parent_phones,
-                "logged_at": datetime.now().isoformat(),
+                "logged_at": datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat(),
             }]
         }
         try:
@@ -1278,8 +1278,8 @@ class AttendanceEngine:
                     "camera_source": camera,
                 }, phone)
 
-                # Always re-send notifications with correct IST time on re-sync
-                if phone:
+                # Re-send notifications only for records that weren't notified
+                if phone and not whatsapp_sent:
                     # Convert logged_at (UTC in DB) to IST for notification
                     try:
                         from datetime import timezone, timedelta as _td
