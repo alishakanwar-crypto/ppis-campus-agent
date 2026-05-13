@@ -66,33 +66,33 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (overall: 7:00 AM to 8:30 AM IST)
+# Attendance time window (overall: 7:00 AM to 9:30 AM IST)
 ATTENDANCE_START_HOUR = 7
 ATTENDANCE_START_MINUTE = 0
-ATTENDANCE_END_HOUR = 8
+ATTENDANCE_END_HOUR = 9
 ATTENDANCE_END_MINUTE = 30
 
 # Two-phase attendance windows (production mode)
-# Phase 1: Teacher recognition (7:00 AM - 8:00 AM)
+# Phase 1: Teacher recognition (7:00 AM - 9:30 AM)
 # Cameras: Reception C1-C4, Principal Room, Entry Gate, Staff rooms
 TEACHER_PHASE_START_HOUR = 7
 TEACHER_PHASE_START_MIN = 0
-TEACHER_PHASE_END_HOUR = 8
-TEACHER_PHASE_END_MIN = 0
+TEACHER_PHASE_END_HOUR = 9
+TEACHER_PHASE_END_MIN = 30
 
-# Phase 2: Student recognition (7:00 AM - 8:30 AM)
+# Phase 2: Student recognition (7:00 AM - 9:30 AM)
 # Cameras: Entry Gate, Reception, Classroom cameras (grade-specific)
 STUDENT_PHASE_START_HOUR = 7
 STUDENT_PHASE_START_MIN = 0
-STUDENT_PHASE_END_HOUR = 8
+STUDENT_PHASE_END_HOUR = 9
 STUDENT_PHASE_END_MIN = 30
 
 # ---------------------------------------------------------------------------
 # HIGH-ACCURACY CONFIGURATION
 # ---------------------------------------------------------------------------
 # Minimum face pixel dimensions for quality filtering
-MIN_FACE_WIDTH = 25
-MIN_FACE_HEIGHT = 25
+MIN_FACE_WIDTH = 40
+MIN_FACE_HEIGHT = 40
 
 # Image quality thresholds (Laplacian variance for sharpness)
 MIN_SHARPNESS_SCORE = 30.0  # Reject blurry faces below this
@@ -311,7 +311,7 @@ class AttendanceEngine:
         self.test_person_id = "TEST001"
         self.confidence_threshold = 0.40  # Match confidence > 40% (raised from 33%)
         self.review_threshold = 0.35  # 35-40% goes to manual review queue
-        self.min_sightings = 3  # Must be seen 3+ times before marking present
+        self.min_sightings = 2  # Must be seen 2+ times before marking present (students)
         self.sighting_window = 600  # 10-minute window for sightings to accumulate
         self.teacher_confidence_threshold = 0.45  # Higher threshold for teachers
         self.entry_validated: dict[str, str] = {}  # person_id -> date (seen at entry/reception)
