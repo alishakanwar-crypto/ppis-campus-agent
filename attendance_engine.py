@@ -309,8 +309,8 @@ class AttendanceEngine:
         self.classwise_running = False
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
-        self.confidence_threshold = 0.40  # Match confidence > 40% (raised from 33%)
-        self.review_threshold = 0.35  # 35-40% goes to manual review queue
+        self.confidence_threshold = 0.35  # Match confidence > 35% for students
+        self.review_threshold = 0.30  # 30-35% goes to manual review queue
         self.min_sightings = 2  # Must be seen 2+ times before marking present (students)
         self.sighting_window = 600  # 10-minute window for sightings to accumulate
         self.teacher_confidence_threshold = 0.45  # Higher threshold for teachers
@@ -643,9 +643,13 @@ class AttendanceEngine:
             top, right, bottom, left = location
             face_w = right - left
             face_h = bottom - top
-            if face_w < MIN_FACE_WIDTH or face_h < MIN_FACE_HEIGHT:
+            # Use smaller min face size for classroom cameras, stricter for gates
+            is_gate_cam = _is_entry_camera(camera_source)
+            min_w = MIN_FACE_WIDTH if is_gate_cam else 25
+            min_h = MIN_FACE_HEIGHT if is_gate_cam else 25
+            if face_w < min_w or face_h < min_h:
                 self.add_debug_log("face_too_small",
-                                   f"Face {face_w}x{face_h}px < {MIN_FACE_WIDTH}x{MIN_FACE_HEIGHT}px "
+                                   f"Face {face_w}x{face_h}px < {min_w}x{min_h}px "
                                    f"minimum from {camera_source} — skipping",
                                    confidence=0.0)
                 continue
