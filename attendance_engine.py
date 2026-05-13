@@ -1441,23 +1441,28 @@ class AttendanceEngine:
             return None
 
         # --- CHECK 5b: Verify entry validation for non-entry cameras ---
-        # If person was never seen at entry/reception today, reduce confidence
-        entry_ok = self.entry_validated.get(person_id) == date.today().isoformat()
-        if not entry_ok:
-            # Check sightings for any entry camera detection
-            sightings = self._sightings.get(person_id, [])
-            for s in sightings:
-                if _is_entry_camera(s.get("camera", "")):
-                    entry_ok = True
-                    self.entry_validated[person_id] = date.today().isoformat()
-                    break
-        if not entry_ok and not _is_entry_camera(camera_source):
-            # No entry validation — hold attendance, don't mark yet
-            self.add_debug_log("no_entry_validation",
-                               f"{name} detected on {camera_source} but NOT seen at "
-                               f"entry gate/reception today — attendance held",
-                               person_id=person_id, confidence=confidence)
-            return None
+        # Teachers: skip entry gate validation — mark wherever detected
+        # Students: require entry gate/reception sighting first
+        if not is_teacher:
+            entry_ok = self.entry_validated.get(person_id) == date.today().isoformat()
+            if not entry_ok:
+                # Check sightings for any entry camera detection
+                sightings = self._sightings.get(person_id, [])
+                for s in sightings:
+                    if _is_entry_camera(s.get("camera", "")):
+                        entry_ok = True
+                        self.entry_validated[person_id] = date.today().isoformat()
+                        break
+            if not entry_ok and not _is_entry_camera(camera_source):
+                # No entry validation — hold attendance, don't mark yet
+                self.add_debug_log("no_entry_validation",
+                                   f"{name} detected on {camera_source} but NOT seen at "
+                                   f"entry gate/reception today — attendance held",
+                                   person_id=person_id, confidence=confidence)
+                return None
+        else:
+            # Teachers auto-validated
+            self.entry_validated[person_id] = date.today().isoformat()
 
         # --- CHECK 6: Anti-spoofing ---
         if not self._check_anti_spoof(person_id, name):
