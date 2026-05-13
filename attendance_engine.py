@@ -64,11 +64,17 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (7:00 AM to 9:30 AM IST)
+# Attendance time window defaults (overridden by cloud settings if available)
+# Teacher window: 7:00 AM to 8:00 AM IST
+# Student window: 7:00 AM to 9:30 AM IST
 ATTENDANCE_START_HOUR = 7
 ATTENDANCE_START_MINUTE = 0
 ATTENDANCE_END_HOUR = 9
 ATTENDANCE_END_MINUTE = 30
+
+# Teacher-specific window (used when person_id starts with TEACHER_)
+TEACHER_END_HOUR = 8
+TEACHER_END_MINUTE = 0
 
 # Grade pattern to extract grade from camera location names
 _GRADE_RE = re.compile(
@@ -810,9 +816,10 @@ class AttendanceEngine:
             return saturday_number == 2  # Only 2nd Saturday is off
         return False
 
-    def _is_within_attendance_window(self) -> bool:
+    def _is_within_attendance_window(self, person_id: str = "") -> bool:
         """Check if the current IST time is within the attendance window.
 
+        Uses a shorter window (7:00-8:00) for teachers vs students (7:00-9:30).
         Returns False on off-days (Sundays, 2nd Saturday) and holidays.
         """
         from datetime import timezone, timedelta as _td
@@ -829,8 +836,14 @@ class AttendanceEngine:
 
         start = now.replace(hour=ATTENDANCE_START_HOUR, minute=ATTENDANCE_START_MINUTE,
                             second=0, microsecond=0)
-        end = now.replace(hour=ATTENDANCE_END_HOUR, minute=ATTENDANCE_END_MINUTE,
-                          second=0, microsecond=0)
+
+        # Teachers have a shorter attendance window (7:00-8:00 AM)
+        if person_id.startswith("TEACHER_"):
+            end = now.replace(hour=TEACHER_END_HOUR, minute=TEACHER_END_MINUTE,
+                              second=0, microsecond=0)
+        else:
+            end = now.replace(hour=ATTENDANCE_END_HOUR, minute=ATTENDANCE_END_MINUTE,
+                              second=0, microsecond=0)
         return start <= now <= end
 
     def _is_holiday_today(self) -> bool:
@@ -990,8 +1003,8 @@ class AttendanceEngine:
         """Process an attendance detection: check time window, cooldown/daily dedup, log, and notify."""
         now = time.time()
 
-        # Time window check: only mark attendance between 7:00 AM and 8:30 AM
-        if not self._is_within_attendance_window():
+        # Time window check: teachers 7:00-8:00 AM, students 7:00-9:30 AM
+        if not self._is_within_attendance_window(person_id):
             return None
 
         # Daily dedup: one entry per student per day
