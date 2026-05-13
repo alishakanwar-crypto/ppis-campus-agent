@@ -91,8 +91,8 @@ STUDENT_PHASE_END_MIN = 30
 # HIGH-ACCURACY CONFIGURATION
 # ---------------------------------------------------------------------------
 # Minimum face pixel dimensions for quality filtering
-MIN_FACE_WIDTH = 40
-MIN_FACE_HEIGHT = 40
+MIN_FACE_WIDTH = 25
+MIN_FACE_HEIGHT = 25
 
 # Image quality thresholds (Laplacian variance for sharpness)
 MIN_SHARPNESS_SCORE = 30.0  # Reject blurry faces below this
@@ -1422,16 +1422,19 @@ class AttendanceEngine:
                 pass
 
         # --- CHECK 4: Multi-frame verification ---
+        # Teachers: 1 sighting (immediate marking)
+        # Students: 3 sightings (multi-frame confirmation)
+        required_sightings = 1 if is_teacher else self.min_sightings
         sighting_count = self._record_sighting(
             person_id, confidence, camera_source,
             embedding=embedding, face_size=face_size,
             face_position=face_position,
             face_crop_bytes=face_crop_bytes,
         )
-        if sighting_count < self.min_sightings:
+        if sighting_count < required_sightings:
             self.add_debug_log("awaiting_confirmation",
-                               f"{name} sighting {sighting_count}/{self.min_sightings} "
-                               f"(need {self.min_sightings} within {self.sighting_window}s "
+                               f"{name} sighting {sighting_count}/{required_sightings} "
+                               f"(need {required_sightings} within {self.sighting_window}s "
                                f"to confirm presence)",
                                person_id=person_id,
                                confidence=confidence)
