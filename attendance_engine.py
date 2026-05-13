@@ -2083,8 +2083,11 @@ class AttendanceEngine:
             all_classroom_cams = [c for c in cameras if c["cam_type"] == "classroom"]
             all_other_cams = [c for c in cameras if c["cam_type"] == "other"]
 
-            # Phase 1 teacher cameras: Reception + Principal + Entry Gate + Staff rooms
-            teacher_phase_cams = reception_cams + principal_cams + entry_gate_cams + all_staff_cams
+            # Phase 1 teacher cameras: Entry Gate + Reception FIRST (quick detection),
+            # then fallback to Principal + Staff rooms + Admin/other cameras
+            teacher_priority_cams = entry_gate_cams + reception_cams  # scanned first
+            teacher_fallback_cams = principal_cams + all_staff_cams  # scanned after
+            teacher_phase_cams = teacher_priority_cams + teacher_fallback_cams
             # Phase 2 student cameras: Entry Gate + Reception + ALL classrooms
             student_phase_cams_gate = entry_gate_cams + reception_cams
             student_phase_cams_classroom = all_classroom_cams
@@ -2111,8 +2114,8 @@ class AttendanceEngine:
                 "classwise_started",
                 f"Mode: {mode} | "
                 f"Phase1 teacher cams: {len(teacher_phase_cams)} "
-                f"(reception: {len(reception_cams)}, principal: {len(principal_cams)}, "
-                f"gate: {len(entry_gate_cams)}, staff: {len(all_staff_cams)}) | "
+                f"(PRIORITY: gate={len(entry_gate_cams)}, reception={len(reception_cams)} | "
+                f"FALLBACK: principal={len(principal_cams)}, staff={len(all_staff_cams)}) | "
                 f"Phase2 student cams: {len(student_phase_cams_gate)} gate/reception + "
                 f"{len(student_phase_cams_classroom)} classroom | "
                 f"Other (skipped): {len(all_other_cams)} | "
@@ -2227,22 +2230,19 @@ class AttendanceEngine:
                     await asyncio.sleep(30)
                     continue
 
-                # === PHASE 1: Teacher Recognition (parallel by DVR) ===
+                # === PHASE 1: Teacher Recognition ===
+                # Priority: Entry Gate + Reception cameras FIRST (fastest detection)
+                # Fallback: Principal + Staff rooms + Admin (for teachers missed at gate)
                 if in_teacher_phase:
                     if cycle <= 1 or (cycle % 30 == 0):
                         self.add_debug_log("teacher_phase",
-                                           f"Phase 1 ACTIVE: scanning {len(teacher_phase_cams)} "
-                                           f"cameras for teacher faces (parallel)")
+                                           f"Phase 1 ACTIVE: scanning "
+                                           f"{len(teacher_priority_cams)} priority (gate/reception) + "
+                                           f"{len(teacher_fallback_cams)} fallback cameras")
                     teacher_faces = getattr(self, '_teacher_faces_cache', {})
                     teacher_faces_if = getattr(self, '_teacher_faces_cache_insightface', {})
 
-                    # Group cameras by DVR IP for parallel scanning
-                    dvr_groups: dict[str, list] = {}
-                    for cam in teacher_phase_cams:
-                        ip = cam["dvr"]["ip"]
-                        dvr_groups.setdefault(ip, []).append(cam)
-
-                    async def _scan_dvr_group(cams, faces, faces_if):
+                    async def _scan_cam_list(cams, faces, faces_if):
                         _scanned, _faces_found, _errors = 0, 0, 0
                         for cam in cams:
                             if not self.classwise_running:
@@ -2262,18 +2262,23 @@ class AttendanceEngine:
                             await asyncio.sleep(0.1)
                         return _scanned, _faces_found, _errors
 
-                    # Scan all DVRs concurrently
-                    tasks = [
-                        _scan_dvr_group(cams, teacher_faces, teacher_faces_if)
-                        for cams in dvr_groups.values()
-                    ]
-                    results_list = await asyncio.gather(*tasks, return_exceptions=True)
-                    for r in results_list:
-                        if isinstance(r, tuple):
-                            scanned += r[0]
-                            faces_in_cycle += r[1]
-                            cycle_errors += r[2]
-                            self._classwise_stats["errors"] += r[2]
+                    # Step 1: Scan priority cameras FIRST (entry gate + reception)
+                    if teacher_priority_cams:
+                        pr = await _scan_cam_list(
+                            teacher_priority_cams, teacher_faces, teacher_faces_if)
+                        scanned += pr[0]
+                        faces_in_cycle += pr[1]
+                        cycle_errors += pr[2]
+
+                    # Step 2: Scan fallback cameras (principal, staff, admin)
+                    if teacher_fallback_cams:
+                        fr = await _scan_cam_list(
+                            teacher_fallback_cams, teacher_faces, teacher_faces_if)
+                        scanned += fr[0]
+                        faces_in_cycle += fr[1]
+                        cycle_errors += fr[2]
+                        self._classwise_stats["errors"] += fr[2]
+
                     gc.collect()
 
                 # --- Trigger teacher report email once Phase 1 ends ---
