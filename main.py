@@ -10,8 +10,6 @@ Features:
 """
 
 from __future__ import annotations
-import sys as _sys
-print('MAIN.PY LOAD: start', flush=True)
 
 import faulthandler
 faulthandler.enable()  # Print C-level crash tracebacks
@@ -38,18 +36,14 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-print('MAIN.PY LOAD: stdlib done', flush=True)
 import httpx
-print('MAIN.PY LOAD: httpx done', flush=True)
 import websockets
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-print('MAIN.PY LOAD: fastapi done', flush=True)
 
 from attendance_engine import engine as attendance_engine
 import face_db
-print('MAIN.PY LOAD: engine+facedb done', flush=True)
 
 try:
     from PIL import Image
@@ -65,7 +59,6 @@ logger = logging.getLogger("ppis-agent")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-print('MAIN.PY LOAD: logging done', flush=True)
 CLOUD_API_BASE = "https://ppis-whatsapp-bot.fly.dev"
 CONFIG_FILE = Path(__file__).parent / "config.json"
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
@@ -263,9 +256,7 @@ async def load_config() -> dict:
 
 
 # Config will be loaded async in lifespan; use local as placeholder
-print('MAIN.PY LOAD: functions defined, loading config...', flush=True)
 config = load_config_local()
-print('MAIN.PY LOAD: config loaded', flush=True)
 
 # ---------------------------------------------------------------------------
 # Hikvision ISAPI — Snapshot capture
@@ -989,9 +980,7 @@ async def lifespan(app: FastAPI):
     logger.info("PPIS Campus Agent stopped")
 
 
-print('MAIN.PY LOAD: creating FastAPI app...', flush=True)
 app = FastAPI(title="PPIS Campus Agent", lifespan=lifespan)
-print('MAIN.PY LOAD: FastAPI app created', flush=True)
 
 # Ensure static directories exist
 (Path(__file__).parent / "static").mkdir(exist_ok=True)
