@@ -91,8 +91,8 @@ STUDENT_PHASE_END_MIN = 30
 # HIGH-ACCURACY CONFIGURATION
 # ---------------------------------------------------------------------------
 # Minimum face pixel dimensions for quality filtering
-MIN_FACE_WIDTH = 40
-MIN_FACE_HEIGHT = 40
+MIN_FACE_WIDTH = 25
+MIN_FACE_HEIGHT = 25
 
 # Image quality thresholds (Laplacian variance for sharpness)
 MIN_SHARPNESS_SCORE = 30.0  # Reject blurry faces below this
@@ -313,7 +313,7 @@ class AttendanceEngine:
         self.review_threshold = 0.30  # 30-35% goes to manual review queue
         self.min_sightings = 2  # Must be seen 2+ times before marking present (students)
         self.sighting_window = 600  # 10-minute window for sightings to accumulate
-        self.teacher_confidence_threshold = 0.45  # Higher threshold for teachers
+        self.teacher_confidence_threshold = 0.30  # Lower threshold — reception cameras are far
         self.entry_validated: dict[str, str] = {}  # person_id -> date (seen at entry/reception)
         self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
         self.known_faces: dict = {}
@@ -643,13 +643,9 @@ class AttendanceEngine:
             top, right, bottom, left = location
             face_w = right - left
             face_h = bottom - top
-            # Use smaller min face size for classroom cameras, stricter for gates
-            is_gate_cam = _is_entry_camera(camera_source)
-            min_w = MIN_FACE_WIDTH if is_gate_cam else 25
-            min_h = MIN_FACE_HEIGHT if is_gate_cam else 25
-            if face_w < min_w or face_h < min_h:
+            if face_w < MIN_FACE_WIDTH or face_h < MIN_FACE_HEIGHT:
                 self.add_debug_log("face_too_small",
-                                   f"Face {face_w}x{face_h}px < {min_w}x{min_h}px "
+                                   f"Face {face_w}x{face_h}px < {MIN_FACE_WIDTH}x{MIN_FACE_HEIGHT}px "
                                    f"minimum from {camera_source} — skipping",
                                    confidence=0.0)
                 continue
