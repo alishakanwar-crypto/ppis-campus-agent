@@ -36,14 +36,9 @@ timeout /t 3 /nobreak >nul
 echo ============================================
 echo [%DATE% %TIME%] Pulling latest code...
 echo ============================================
-REM Reset local changes to avoid conflicts (preserves config.json)
-git checkout -- . 2>nul
-git pull origin devin/1778414374-enterprise-hardening 2>nul
-REM Verify main.py is not empty (git stash sometimes corrupts files)
-for %%F in (main.py) do if %%~zF==0 (
-    echo [WARNING] main.py is empty! Restoring from git...
-    git checkout origin/devin/1778414374-enterprise-hardening -- main.py 2>nul
-)
+REM Force-sync to latest remote code (nuclear but reliable)
+git fetch origin 2>nul
+git reset --hard origin/devin/1778414374-enterprise-hardening 2>nul
 
 REM Clean up old snapshot files (older than 1 day) to prevent disk fill
 echo [%DATE% %TIME%] Cleaning old snapshots...
