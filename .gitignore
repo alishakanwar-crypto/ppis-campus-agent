@@ -4,3 +4,4 @@ snapshots/
 face_images/
 attendance_snapshots/
 *.db
+agent.lock

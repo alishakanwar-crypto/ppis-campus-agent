@@ -18,7 +18,18 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
+
+# Suppress Windows crash dialogs so the process exits silently on errors
+# (allows run_forever.bat to auto-restart without a popup blocking it)
+if sys.platform == "win32":
+    try:
+        import ctypes
+        # SEM_FAILCRITICALERRORS=1 | SEM_NOGPFAULTERRORBOX=2 | SEM_NOOPENFILEERRORBOX=0x8000
+        ctypes.windll.kernel32.SetErrorMode(0x8003)  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 import httpx
 import websockets
@@ -43,7 +54,7 @@ logger = logging.getLogger("ppis-agent")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-CLOUD_API_BASE = "https://app-itszlsnn.fly.dev"
+CLOUD_API_BASE = "https://ppis-whatsapp-bot.fly.dev"
 CONFIG_FILE = Path(__file__).parent / "config.json"
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 SNAPSHOT_DIR.mkdir(exist_ok=True)
@@ -76,7 +87,7 @@ def load_config_local() -> dict:
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
     return {
-        "cloud_bot_url": "wss://app-itszlsnn.fly.dev/ws/agent",
+        "cloud_bot_url": "wss://ppis-whatsapp-bot.fly.dev/ws/agent",
         "agent_secret": os.environ.get("AGENT_SECRET", ""),
         "dvrs": [],
         "camera_mapping": {},
@@ -94,52 +105,84 @@ def save_config(cfg: dict):
 async def sync_faces_from_cloud() -> int:
     """Download registered face images from cloud and register locally.
 
+    Uses incremental sync: first fetches lightweight manifest (no images),
+    compares with local DB, then downloads only missing faces one-by-one.
+    This prevents OOM on the school PC by avoiding bulk image downloads.
+
     Returns the number of faces synced.
     """
-    url = f"{CLOUD_API_BASE}/api/face/images"
     agent_secret = os.environ.get("AGENT_SECRET", "")
     headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
     try:
+        import gc
+        import database as db_mod
+
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(url, headers=headers)
+            # Step 1: Get manifest (metadata only — no images, ~1KB)
+            manifest_url = f"{CLOUD_API_BASE}/api/face/manifest"
+            resp = await client.get(manifest_url, headers=headers)
+            if resp.status_code == 404:
+                # Fallback to old /images endpoint if manifest not available
+                return await _sync_faces_legacy(client, headers)
             if resp.status_code != 200:
-                logger.warning(f"Cloud face sync: API returned {resp.status_code}")
+                logger.warning(f"Cloud face sync: manifest returned {resp.status_code}")
                 return 0
-            faces = resp.json()
-            if not faces:
+            manifest = resp.json()
+            if not manifest:
                 logger.info("Cloud face sync: no faces registered in cloud")
                 return 0
 
-            import database as db_mod
-            synced = 0
-            # Fetch existing faces once before the loop (avoid N+1 queries)
+            # Step 2: Find which faces we're missing locally
             existing = db_mod.get_all_face_encodings()
             existing_keys = {
                 (r["person_id"], r.get("angle", ""))
                 for r in existing
             }
-            for face_data in faces:
-                person_id = face_data["person_id"]
-                angle = face_data["angle"]
-                if (person_id, angle) in existing_keys:
-                    continue
+            missing = [
+                f for f in manifest
+                if (f["person_id"], f["angle"]) not in existing_keys
+            ]
+            if not missing:
+                logger.info(f"Cloud face sync: all {len(manifest)} faces already local")
+                return 0
 
-                # Decode image and register locally
-                image_bytes = base64.b64decode(face_data["image_base64"])
-                result = face_db.register_face(
-                    person_id=person_id,
-                    name=face_data["name"],
-                    role=face_data["role"],
-                    phone=face_data["phone"],
-                    angle=angle,
-                    image_bytes=image_bytes,
-                )
-                if result.get("success"):
-                    synced += 1
-                    existing_keys.add((person_id, angle))
-                    logger.info(f"Cloud face sync: registered {face_data['name']} ({person_id}) angle={angle}")
-                else:
-                    logger.warning(f"Cloud face sync: failed to register {person_id}: {result.get('error')}")
+            logger.info(f"Cloud face sync: {len(missing)} new face(s) to download")
+
+            # Step 3: Download missing faces ONE AT A TIME (low memory)
+            synced = 0
+            for face_meta in missing:
+                face_id = face_meta["id"]
+                person_id = face_meta["person_id"]
+                try:
+                    img_resp = await client.get(
+                        f"{CLOUD_API_BASE}/api/face/image/{face_id}",
+                        headers=headers,
+                    )
+                    if img_resp.status_code != 200:
+                        logger.warning(f"Cloud face sync: image {face_id} returned {img_resp.status_code}")
+                        continue
+                    image_bytes = img_resp.content
+                    result = face_db.register_face(
+                        person_id=person_id,
+                        name=face_meta["name"],
+                        role=face_meta["role"],
+                        phone=face_meta["phone"],
+                        angle=face_meta["angle"],
+                        image_bytes=image_bytes,
+                    )
+                    del image_bytes
+                    gc.collect()
+                    if result.get("success"):
+                        synced += 1
+                        logger.info(f"Cloud face sync: registered {face_meta['name']} ({person_id})")
+                    else:
+                        logger.warning(f"Cloud face sync: failed {person_id}: {result.get('error')}")
+                except (MemoryError, OSError) as e:
+                    logger.error(f"Cloud face sync: MEMORY ERROR for {person_id}, skipping: {e}")
+                    import gc as _gc; _gc.collect()
+                    continue
+                except Exception as e:
+                    logger.warning(f"Cloud face sync: error downloading {person_id}: {e}")
 
             logger.info(f"Cloud face sync complete: {synced} new face(s) synced")
             return synced
@@ -148,13 +191,51 @@ async def sync_faces_from_cloud() -> int:
         return 0
 
 
+async def _sync_faces_legacy(client: httpx.AsyncClient, headers: dict) -> int:
+    """Fallback: download all faces via /api/face/images (old endpoint)."""
+    import gc
+    import database as db_mod
+
+    url = f"{CLOUD_API_BASE}/api/face/images"
+    resp = await client.get(url, headers=headers)
+    if resp.status_code != 200:
+        return 0
+    faces = resp.json()
+    if not faces:
+        return 0
+    existing = db_mod.get_all_face_encodings()
+    existing_keys = {(r["person_id"], r.get("angle", "")) for r in existing}
+    synced = 0
+    for face_data in faces:
+        person_id = face_data["person_id"]
+        angle = face_data["angle"]
+        if (person_id, angle) in existing_keys:
+            continue
+        image_bytes = base64.b64decode(face_data["image_base64"])
+        result = face_db.register_face(
+            person_id=person_id,
+            name=face_data["name"],
+            role=face_data["role"],
+            phone=face_data["phone"],
+            angle=angle,
+            image_bytes=image_bytes,
+        )
+        del image_bytes
+        gc.collect()
+        if result.get("success"):
+            synced += 1
+            existing_keys.add((person_id, angle))
+    logger.info(f"Cloud face sync (legacy): {synced} new face(s)")
+    return synced
+
+
 async def load_config() -> dict:
     """Load config: try cloud first, fall back to local config.json."""
     cloud_cfg = await fetch_config_from_cloud()
     if cloud_cfg and cloud_cfg.get("dvrs"):
         # Merge cloud data into a usable config dict
         cfg = {
-            "cloud_bot_url": cloud_cfg.get("cloud_bot_url", "wss://app-itszlsnn.fly.dev/ws/agent"),
+            "cloud_bot_url": cloud_cfg.get("cloud_bot_url", "wss://ppis-whatsapp-bot.fly.dev/ws/agent"),
             "agent_secret": cloud_cfg.get("agent_secret", os.environ.get("AGENT_SECRET", "")),
             "dvrs": cloud_cfg.get("dvrs", []),
             "camera_mapping": cloud_cfg.get("camera_mapping", {}),
@@ -210,6 +291,9 @@ def compress_jpeg(data: bytes, max_bytes: int = 200_000, quality_start: int = 70
         return data
 
 
+_last_capture_error: str = ""
+
+
 async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
     """Capture a JPEG snapshot from a Hikvision NVR via ISAPI.
 
@@ -218,7 +302,9 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
     where channel is 1-based (1..64 per NVR).
 
     Returns JPEG bytes or None on failure.
+    Sets _last_capture_error with diagnostic details.
     """
+    global _last_capture_error
     ip = dvr["ip"]
     port = dvr.get("port", 80)
     user = dvr["username"]
@@ -241,18 +327,20 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
 
             if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
                 logger.info(f"Snapshot captured: {len(resp.content)} bytes from {ip} ch{channel}")
+                _last_capture_error = ""
                 return resp.content
             else:
-                logger.error(
-                    f"Snapshot failed from {ip} ch{channel}: "
-                    f"HTTP {resp.status_code}, content-type={resp.headers.get('content-type', 'unknown')}"
-                )
+                err = (f"HTTP {resp.status_code}, content-type="
+                       f"{resp.headers.get('content-type', 'unknown')}")
+                logger.error(f"Snapshot failed from {ip} ch{channel}: {err}")
+                _last_capture_error = f"{ip} ch{channel}: {err}"
                 # Try alternate URL format (sub-stream: channel*100 + 2)
                 alt_stream = channel * 100 + 2
                 alt_url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{alt_stream}/picture"
                 resp2 = await client.get(alt_url, auth=httpx.DigestAuth(user, pwd))
                 if resp2.status_code == 200 and resp2.headers.get("content-type", "").startswith("image"):
                     logger.info(f"Snapshot captured (sub-stream): {len(resp2.content)} bytes")
+                    _last_capture_error = ""
                     return resp2.content
 
                 # Try without /ISAPI prefix
@@ -260,10 +348,24 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
                 resp3 = await client.get(alt_url2, auth=httpx.DigestAuth(user, pwd))
                 if resp3.status_code == 200 and resp3.headers.get("content-type", "").startswith("image"):
                     logger.info(f"Snapshot captured (alt2 URL): {len(resp3.content)} bytes")
+                    _last_capture_error = ""
                     return resp3.content
 
                 return None
+    except httpx.ConnectError as e:
+        _last_capture_error = f"{ip} ch{channel}: connection_refused ({e})"
+        logger.error(f"Snapshot connection error from {ip} ch{channel}: {e}")
+        return None
+    except httpx.ConnectTimeout as e:
+        _last_capture_error = f"{ip} ch{channel}: connect_timeout ({e})"
+        logger.error(f"Snapshot connect timeout from {ip} ch{channel}: {e}")
+        return None
+    except httpx.ReadTimeout as e:
+        _last_capture_error = f"{ip} ch{channel}: read_timeout ({e})"
+        logger.error(f"Snapshot read timeout from {ip} ch{channel}: {e}")
+        return None
     except Exception as e:
+        _last_capture_error = f"{ip} ch{channel}: {type(e).__name__}: {e}"
         logger.error(f"Snapshot error from {ip} ch{channel}: {e}")
         return None
 
@@ -362,7 +464,27 @@ def find_all_cameras_for_classroom(classroom: str) -> list[tuple[dict, int, str]
                 if key_clean == grade_no_section_clean:
                     logger.info(f"Fuzzy camera match: {target} -> {key} (section stripped)")
                     return val
-        # 4. Strip number from Nursery/Prep: "NURSERY 4" → "NURSERY"
+        # 4. Grade without section: "GRADE 9" → find "GRADE 9A" if it's the only match
+        m3 = re.match(r'^GRADE\s*(\d{1,2})$', target)
+        if m3:
+            grade_num = m3.group(1)
+            candidates = []
+            for key, val in mapping.items():
+                km = re.match(r'^GRADE\s*' + grade_num + r'\s*[A-D]$', key.strip().upper())
+                if km:
+                    candidates.append((key, val))
+            if len(candidates) == 1:
+                logger.info(f"Fuzzy camera match: {target} -> {candidates[0][0]} (section inferred)")
+                return candidates[0][1]
+            elif candidates:
+                # Multiple sections exist — pick section A as default
+                for key, val in candidates:
+                    if key.strip().upper().endswith('A'):
+                        logger.info(f"Fuzzy camera match: {target} -> {key} (default section A)")
+                        return val
+                logger.info(f"Fuzzy camera match: {target} -> {candidates[0][0]} (first of {len(candidates)})")
+                return candidates[0][1]
+        # 5. Strip number from Nursery/Prep: "NURSERY 4" → "NURSERY"
         m2 = re.match(r'^(NURSERY|NUR|PREP)\s*[-]?\s*\d+$', target)
         if m2:
             base_name = m2.group(1)
@@ -393,9 +515,10 @@ async def websocket_client():
     """Persistent WebSocket connection to the cloud bot.
     Receives snapshot requests and sends back images."""
     global ws_connection
-    url = config.get("cloud_bot_url", "wss://app-itszlsnn.fly.dev/ws/agent")
+    url = config.get("cloud_bot_url", "wss://ppis-whatsapp-bot.fly.dev/ws/agent")
     secret = config.get("agent_secret", os.environ.get("AGENT_SECRET", ""))
 
+    ws_backoff = 5
     while True:
         try:
             logger.info(f"Connecting to cloud bot WebSocket: {url}")
@@ -407,6 +530,7 @@ async def websocket_client():
                 max_size=10 * 1024 * 1024,  # 10 MB max message size
             ) as ws:
                 ws_connection = ws
+                ws_backoff = 5  # Reset backoff on successful connect
                 logger.info("Connected to cloud bot WebSocket")
 
                 # Send hello
@@ -436,6 +560,21 @@ async def websocket_client():
                             if 0 <= dvr_idx < len(dvrs):
                                 result = await test_dvr_connection(dvrs[dvr_idx])
                                 await ws.send(json.dumps({"type": "test_result", **result}))
+
+                        elif msg_type == "test_all_dvrs":
+                            request_id = data.get("request_id", "")
+                            dvrs = config.get("dvrs", [])
+                            results = []
+                            for i, dvr in enumerate(dvrs):
+                                result = await test_dvr_connection(dvr)
+                                result["dvr_index"] = i
+                                result["name"] = dvr.get("name", f"DVR {i}")
+                                results.append(result)
+                            await ws.send(json.dumps({
+                                "type": "test_all_dvrs_result",
+                                "request_id": request_id,
+                                "results": results,
+                            }))
 
                         elif msg_type == "update_camera_mapping":
                             new_mapping = data.get("camera_mapping", {})
@@ -473,6 +612,25 @@ async def websocket_client():
                                     "error": "Empty DVR data",
                                 }))
 
+                        elif msg_type == "restart":
+                            logger.info("REMOTE RESTART requested via WebSocket")
+                            await ws.send(json.dumps({
+                                "type": "restart_ack",
+                                "success": True,
+                            }))
+                            await ws.close()
+                            os._exit(0)  # run_forever.bat will restart with git pull
+
+                        elif msg_type == "sync_faces":
+                            logger.info("REMOTE FACE SYNC requested via WebSocket")
+                            synced = await sync_faces_from_cloud()
+                            if synced > 0:
+                                attendance_engine.reload_faces()
+                            await ws.send(json.dumps({
+                                "type": "sync_faces_result",
+                                "synced": synced,
+                            }))
+
                         else:
                             logger.warning(f"Unknown WS message type: {msg_type}")
 
@@ -482,11 +640,13 @@ async def websocket_client():
         except websockets.exceptions.ConnectionClosed as e:
             logger.warning(f"WebSocket closed: {e}. Reconnecting in 5s...")
             ws_connection = None
+            ws_backoff = 5
         except Exception as e:
-            logger.error(f"WebSocket error: {e}. Reconnecting in 5s...")
+            logger.error(f"WebSocket error: {e}. Reconnecting in {ws_backoff}s...")
             ws_connection = None
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(ws_backoff)
+        ws_backoff = min(ws_backoff * 2, 60)
 
 
 async def handle_snapshot_request(ws, classroom: str, request_id: str):
@@ -534,6 +694,7 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
             "request_id": request_id,
             "success": False,
             "error": f"Failed to capture snapshot from any camera for {classroom}",
+            "detail": _last_capture_error,
         }))
         return
 
@@ -589,8 +750,15 @@ async def _auto_start_classwise():
         return
 
     attendance_engine.test_mode = False
-    attendance_engine.confidence_threshold = 0.30
     attendance_engine.reload_faces()
+
+    # Configure camera alert phones from agent settings
+    import database as db_mod
+    alert_phones_str = db_mod.get_attendance_setting("camera_alert_phones", "")
+    if alert_phones_str:
+        attendance_engine._admin_phones = [p.strip() for p in alert_phones_str.split(",") if p.strip()]
+        logger.info(f"Camera alerts configured for: {attendance_engine._admin_phones}")
+
     attendance_engine.classwise_running = True
     attendance_engine._classwise_task = asyncio.create_task(
         attendance_engine.classwise_monitoring_loop(dvrs, camera_mapping)
@@ -606,8 +774,12 @@ async def _health_watchdog():
     - Are cameras responding?
     - Is the notification system reachable?
     - Periodically sync new faces from cloud.
+    - Monitor memory usage and force cleanup if too high.
+    - Clean stale snapshot files.
     """
+    import gc
     face_sync_counter = 0
+    cleanup_counter = 0
     while True:
         await asyncio.sleep(60)
         try:
@@ -620,7 +792,6 @@ async def _health_watchdog():
                         logger.warning("WATCHDOG: Classwise monitoring stopped — restarting")
                         attendance_engine._health["total_recoveries"] += 1
                         attendance_engine.test_mode = False
-                        attendance_engine.confidence_threshold = 0.30
                         attendance_engine.reload_faces()
                         attendance_engine.classwise_running = True
                         attendance_engine._classwise_task = asyncio.create_task(
@@ -629,7 +800,7 @@ async def _health_watchdog():
 
             # --- Check 2: Notification system reachable ---
             try:
-                api_url = attendance_engine.whatsapp_api_url or "https://app-itszlsnn.fly.dev"
+                api_url = attendance_engine.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
                 async with httpx.AsyncClient(timeout=10) as client:
                     resp = await client.get(f"{api_url}/debug/version")
                     if resp.status_code == 200:
@@ -648,11 +819,51 @@ async def _health_watchdog():
                     attendance_engine.reload_faces()
                     logger.info(f"WATCHDOG: Synced {synced} new face(s) from cloud")
 
+            # --- Check 4: Memory monitoring (every 5 min) ---
+            cleanup_counter += 1
+            if cleanup_counter >= 5:
+                cleanup_counter = 0
+                try:
+                    import psutil
+                    proc = psutil.Process()
+                    mem_mb = proc.memory_info().rss / (1024 * 1024)
+                    attendance_engine._health["memory_mb"] = round(mem_mb, 1)
+                    if mem_mb > 800:
+                        logger.warning(f"WATCHDOG: High memory usage: {mem_mb:.0f}MB — forcing cleanup")
+                        # Trim debug logs
+                        attendance_engine.debug_logs = attendance_engine.debug_logs[-100:]
+                        # Force garbage collection
+                        gc.collect()
+                        # Clean old snapshot files
+                        _cleanup_old_snapshots()
+                except ImportError:
+                    pass
+                except Exception as e:
+                    logger.debug(f"WATCHDOG: Memory check error: {e}")
+
+            # --- Check 5: Clean stale snapshots (every 30 min) ---
+            if face_sync_counter == 0 and cleanup_counter == 0:
+                _cleanup_old_snapshots()
+
             attendance_engine._health["last_health_check"] = (
                 __import__("datetime").datetime.now().isoformat()
             )
         except Exception as e:
             logger.error(f"WATCHDOG error: {e}")
+
+
+def _cleanup_old_snapshots():
+    """Remove snapshot files older than 2 hours to prevent disk fill."""
+    cutoff = time.time() - 7200  # 2 hours
+    for snap_dir in [SNAPSHOT_DIR, Path(__file__).parent / "attendance_snapshots"]:
+        if not snap_dir.exists():
+            continue
+        try:
+            for f in snap_dir.iterdir():
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+        except Exception:
+            pass
 
 
 @asynccontextmanager
@@ -664,13 +875,16 @@ async def lifespan(app: FastAPI):
     # Load config from cloud DB (falls back to local config.json)
     config = await load_config()
     # ALWAYS enforce the correct cloud bot URL (prevents stale config.json issues)
-    config["cloud_bot_url"] = "wss://app-itszlsnn.fly.dev/ws/agent"
+    config["cloud_bot_url"] = "wss://ppis-whatsapp-bot.fly.dev/ws/agent"
     logger.info(
         f"Config loaded: {len(config.get('dvrs', []))} DVRs, "
         f"{len(config.get('camera_mapping', {}))} camera mappings"
     )
     # Sync face registrations from cloud DB (downloads images, computes encodings)
-    await sync_faces_from_cloud()
+    try:
+        await sync_faces_from_cloud()
+    except Exception as e:
+        logger.error(f"Face sync crashed during startup (non-fatal): {e}")
     # Pre-load registered faces into attendance engine
     attendance_engine.reload_faces()
     # Start WebSocket client in background
@@ -1142,6 +1356,28 @@ async def list_registered_faces():
     return face_db.get_registered_list()
 
 
+@app.put("/api/face/{person_id}/phone")
+async def update_face_phone(person_id: str, request: Request):
+    """Update the phone number for a registered face."""
+    body = await request.json()
+    new_phone = body.get("phone", "")
+    if not new_phone:
+        return {"status": "error", "error": "Missing phone"}
+    import database as db_mod
+    conn = db_mod.get_conn()
+    try:
+        cursor = conn.execute(
+            "UPDATE registered_faces SET phone = ? WHERE person_id = ?",
+            (new_phone, person_id),
+        )
+        conn.commit()
+        updated = cursor.rowcount
+    finally:
+        conn.close()
+    attendance_engine.reload_faces()
+    return {"status": "ok", "updated": updated, "person_id": person_id, "phone": new_phone}
+
+
 @app.delete("/api/face/{person_id}")
 async def delete_registered_face(person_id: str):
     """Delete all face encodings for a person."""
@@ -1281,6 +1517,61 @@ async def stop_attendance_monitoring():
     return {"status": "stopped", "auto_start_enabled": False}
 
 
+@app.post("/api/attendance/resend-notification")
+async def resend_notification(person_id: str):
+    """Clear notification dedup for a student so their next detection re-sends."""
+    today = date.today().isoformat()
+    cleared = []
+    if attendance_engine._notification_sent.get(person_id) == today:
+        del attendance_engine._notification_sent[person_id]
+        cleared.append("notification_sent")
+    if attendance_engine.daily_marked.get(person_id) == today:
+        del attendance_engine.daily_marked[person_id]
+        cleared.append("daily_marked")
+    return {"person_id": person_id, "cleared": cleared}
+
+
+@app.post("/api/attendance/scan-camera")
+async def scan_specific_camera(location: str):
+    """Manually trigger face recognition scan on a specific camera location."""
+    mapping = attendance_engine._last_camera_mapping or {}
+    dvrs = attendance_engine._last_dvrs or []
+    # Find the camera
+    target = location.strip()
+    cam_data = None
+    for key, val in mapping.items():
+        if key.upper() == target.upper() or target.upper() in key.upper():
+            cam_data = val
+            target = key
+            break
+    if not cam_data:
+        return {"error": f"Camera '{location}' not found", "available": list(mapping.keys())[:20]}
+    dvr_idx = cam_data.get("dvr_index", 0)
+    channel = cam_data.get("channel", 1)
+    if dvr_idx >= len(dvrs):
+        return {"error": f"DVR index {dvr_idx} out of range"}
+    dvr = dvrs[dvr_idx]
+    label = f"{target} (DVR {dvr_idx + 1} Ch {channel})"
+    logger.info(f"Manual scan triggered for {label}")
+    try:
+        results = await attendance_engine.scan_camera(
+            dvr, channel, label,
+            faces_subset=None,  # Check ALL faces
+            insightface_subset=None,
+        )
+        return {
+            "camera": label,
+            "faces_detected": len(results),
+            "results": [
+                {"person_id": r.get("person_id", ""), "name": r.get("name", ""),
+                 "confidence": r.get("confidence", 0)}
+                for r in results
+            ] if results else [],
+        }
+    except Exception as e:
+        return {"error": str(e), "camera": label}
+
+
 @app.get("/api/attendance/status")
 async def get_attendance_status():
     """Get attendance engine status."""
@@ -1326,6 +1617,261 @@ async def get_debug_logs(limit: int = 100):
     return attendance_engine.get_debug_logs(limit)
 
 
+@app.post("/api/camera-alerts/configure")
+async def configure_camera_alerts(request: Request):
+    """Configure admin phones to receive camera offline/recovery alerts."""
+    import database as db_mod
+    body = await request.json()
+    phones = body.get("phones", [])
+    threshold = body.get("threshold", 5)
+    if isinstance(phones, str):
+        phones = [p.strip() for p in phones.split(",") if p.strip()]
+    attendance_engine._admin_phones = phones
+    attendance_engine._camera_alert_threshold = threshold
+    # Persist to DB so it survives restarts
+    db_mod.set_attendance_setting("camera_alert_phones", ",".join(phones))
+    logger.info(f"Camera alerts configured: phones={phones}, threshold={threshold}")
+    return {
+        "status": "ok",
+        "alert_phones": phones,
+        "failure_threshold": threshold,
+    }
+
+
+@app.get("/api/camera-alerts/status")
+async def camera_alerts_status():
+    """Get current camera health and alert status."""
+    errors = {}
+    for cam_key, count in attendance_engine._camera_errors.items():
+        label = attendance_engine._cam_key_to_label(cam_key)
+        errors[label] = {"consecutive_failures": count, "alerted": cam_key in attendance_engine._admin_alerted}
+    return {
+        "alert_phones": attendance_engine._admin_phones,
+        "failure_threshold": attendance_engine._camera_alert_threshold,
+        "cameras_with_errors": errors,
+        "total_alerted": len(attendance_engine._admin_alerted),
+    }
+
+
+@app.post("/api/attendance/sync-to-cloud")
+async def sync_attendance_to_cloud():
+    """Push all of today's attendance records to the cloud dashboard."""
+    import database as db_mod
+    from datetime import date, datetime, timedelta
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+    records = db_mod.get_attendance_log(limit=500)
+    today = date.today().isoformat()
+    # Match both IST and UTC dates for today
+    today_records = [r for r in records if today in str(r.get("logged_at", ""))]
+
+    if not today_records:
+        return {
+            "status": "ok", "synced": 0,
+            "message": "No attendance records today",
+            "total_in_db": len(records),
+            "today_str": today,
+            "sample_dates": [str(r.get("logged_at", ""))[:16] for r in records[:5]],
+        }
+
+    api_url = os.environ.get("CLOUD_BOT_URL", "https://ppis-whatsapp-bot.fly.dev")
+    agent_secret = os.environ.get("AGENT_SECRET", "")
+    headers = {"Content-Type": "application/json"}
+    if agent_secret:
+        headers["X-Agent-Secret"] = agent_secret
+
+    payload_records = []
+    for r in today_records:
+        pid = r.get("person_id", "")
+        grade = ""
+        for part in pid.split("_"):
+            if part.startswith("GRADE") or part.startswith("NUR") or part.startswith("PREP"):
+                grade = part
+                break
+        # Convert UTC DB time to IST for cloud display
+        raw_time = str(r.get("logged_at", ""))
+        try:
+            dt = datetime.fromisoformat(raw_time)
+            # If hour < 4, it's likely UTC — convert to IST
+            if dt.hour < 4:
+                dt = dt + IST_OFFSET
+            raw_time = dt.isoformat()
+        except Exception:
+            pass
+        payload_records.append({
+            "person_id": pid,
+            "name": r.get("name", ""),
+            "grade": grade,
+            "camera": r.get("camera_source", ""),
+            "confidence": r.get("confidence", 0),
+            "notification_sent": bool(r.get("whatsapp_sent")),
+            "parent_phones": "",
+            "logged_at": raw_time,
+        })
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{api_url}/api/dashboard/attendance/report",
+                json={"records": payload_records},
+                headers=headers,
+            )
+            data = resp.json()
+            return {"status": "ok", "synced": data.get("inserted", 0), "total_today": len(today_records)}
+    except Exception as e:
+        logger.error(f"Cloud sync error: {type(e).__name__}: {e}")
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/api/attendance/reset-dedup")
+async def reset_dedup():
+    """Clear attendance dedup caches so students can be re-detected and notified."""
+    marked_count = len(attendance_engine.daily_marked)
+    notified_count = len(attendance_engine._notification_sent)
+    attendance_engine.daily_marked.clear()
+    attendance_engine._notification_sent.clear()
+    return {
+        "status": "ok",
+        "cleared_marked": marked_count,
+        "cleared_notified": notified_count,
+        "message": "Dedup caches cleared — students will be re-detected and notified",
+    }
+
+
+@app.post("/api/attendance/retry-notifications")
+async def retry_notifications():
+    """Resend WhatsApp notifications for students marked today but not notified."""
+    import database as db_mod
+    from datetime import date, datetime, timedelta
+    records = db_mod.get_attendance_log(limit=500)
+    today = date.today().isoformat()
+    today_records = [r for r in records if today in str(r.get("logged_at", ""))]
+
+    # Filter to only those not yet notified
+    not_notified = [r for r in today_records if not r.get("whatsapp_sent")]
+    if not not_notified:
+        return {"status": "ok", "message": "All students already notified", "total_today": len(today_records)}
+
+    # IST offset (UTC+5:30)
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+
+    sent_count = 0
+    failed_count = 0
+    for r in not_notified:
+        pid = r.get("person_id", "")
+        name = r.get("name", "")
+        # Look up phone from face DB
+        face_data = attendance_engine.known_faces.get(pid)
+        if not face_data:
+            continue
+        phone = face_data.get("phone", "")
+        if not phone:
+            continue
+
+        time_str = ""
+        try:
+            logged = str(r.get("logged_at", ""))
+            dt = datetime.fromisoformat(logged)
+            # DB stores UTC (datetime('now')), convert to IST
+            dt_ist = dt + IST_OFFSET
+            time_str = dt_ist.strftime("%I:%M %p")
+        except Exception:
+            time_str = "today"
+
+        phone_list = [p.strip() for p in phone.split(",") if p.strip()]
+        for parent_phone in phone_list:
+            try:
+                await attendance_engine._send_whatsapp_notification(
+                    attendance_id=r.get("id", 0),
+                    person_id=pid,
+                    name=name,
+                    time_str=time_str,
+                    phone=parent_phone,
+                )
+                sent_count += 1
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Retry notification failed for {name}: {e}")
+
+    return {
+        "status": "ok",
+        "not_notified": len(not_notified),
+        "attempted": sent_count + failed_count,
+        "sent": sent_count,
+        "failed": failed_count,
+    }
+
+
+@app.post("/api/attendance/resend-all")
+async def resend_all_notifications():
+    """Re-send attendance notifications to ALL parents with corrected IST times."""
+    import database as db_mod
+    from datetime import date, datetime, timedelta
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+
+    records = db_mod.get_attendance_log(limit=500)
+    today = date.today().isoformat()
+    today_records = [r for r in records if today in str(r.get("logged_at", ""))]
+
+    if not today_records:
+        return {"status": "ok", "message": "No attendance records today"}
+
+    # Skip staff/test faces
+    skip_ids = {"arpit003", "Alisha002", "HARPREET001", "ALISHA001"}
+
+    sent_count = 0
+    failed_count = 0
+    skipped_count = 0
+    for r in today_records:
+        pid = r.get("person_id", "")
+        name = r.get("name", "")
+        if pid in skip_ids:
+            skipped_count += 1
+            continue
+
+        face_data = attendance_engine.known_faces.get(pid)
+        if not face_data:
+            skipped_count += 1
+            continue
+        phone = face_data.get("phone", "")
+        if not phone:
+            skipped_count += 1
+            continue
+
+        time_str = ""
+        try:
+            logged = str(r.get("logged_at", ""))
+            dt = datetime.fromisoformat(logged)
+            # Convert UTC to IST if hour < 4 (old UTC records)
+            if dt.hour < 4:
+                dt = dt + IST_OFFSET
+            time_str = dt.strftime("%I:%M %p")
+        except Exception:
+            time_str = "today"
+
+        phone_list = [p.strip() for p in phone.split(",") if p.strip()]
+        for parent_phone in phone_list:
+            try:
+                await attendance_engine._send_whatsapp_notification(
+                    attendance_id=r.get("id", 0),
+                    person_id=pid,
+                    name=name,
+                    time_str=time_str,
+                    phone=parent_phone,
+                )
+                sent_count += 1
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Resend failed for {name}: {e}")
+
+    return {
+        "status": "ok",
+        "total_today": len(today_records),
+        "sent": sent_count,
+        "failed": failed_count,
+        "skipped": skipped_count,
+    }
+
+
 @app.post("/api/attendance/recognize")
 async def recognize_single_image(image: UploadFile = File(...)):
     """Run face recognition on a single uploaded image (manual test)."""
@@ -1355,6 +1901,113 @@ async def get_unrecognized_faces(limit: int = 50, all: bool = False):
     """Get unrecognized faces flagged for manual review."""
     import database as db_mod
     return db_mod.get_unrecognized_faces(limit=limit, unreviewed_only=not all)
+
+
+# ---------------------------------------------------------------------------
+# A4 Sheet Capture — Controlled face registration
+# ---------------------------------------------------------------------------
+
+import a4_capture
+
+
+@app.post("/api/a4-capture/single")
+async def a4_capture_single(
+    camera_label: str = Form(...),
+    grade: str = Form(""),
+):
+    """Trigger A4 sheet capture for a single student on a specific camera.
+
+    The student should be standing in front of the camera holding an A4 sheet
+    with their name written in bold black text.
+    """
+    # Find the camera
+    mapping = config.get("camera_mapping", {})
+    cam_config = mapping.get(camera_label)
+    if not cam_config:
+        return JSONResponse({"success": False, "error": f"Camera '{camera_label}' not found"},
+                           status_code=404)
+
+    dvr_index = cam_config["dvr_index"]
+    channel = cam_config["channel"]
+    dvrs = config.get("dvrs", [])
+    if dvr_index >= len(dvrs):
+        return JSONResponse({"success": False, "error": "DVR not configured"},
+                           status_code=400)
+
+    dvr = dvrs[dvr_index]
+    result = await a4_capture.capture_and_register(
+        capture_func=capture_snapshot,
+        dvr=dvr,
+        channel=channel,
+        camera_label=camera_label,
+        grade=grade,
+    )
+    return result
+
+
+@app.post("/api/a4-capture/batch")
+async def a4_capture_batch(
+    camera_label: str = Form(...),
+    grade: str = Form(""),
+    student_count: int = Form(1),
+):
+    """Trigger batch A4 sheet capture for multiple students in a class.
+
+    Students line up and step in front of the camera one at a time.
+    The system waits 5 seconds between each student.
+    """
+    mapping = config.get("camera_mapping", {})
+    cam_config = mapping.get(camera_label)
+    if not cam_config:
+        return JSONResponse({"success": False, "error": f"Camera '{camera_label}' not found"},
+                           status_code=404)
+
+    dvr_index = cam_config["dvr_index"]
+    channel = cam_config["channel"]
+    dvrs = config.get("dvrs", [])
+    if dvr_index >= len(dvrs):
+        return JSONResponse({"success": False, "error": "DVR not configured"},
+                           status_code=400)
+
+    dvr = dvrs[dvr_index]
+    results = await a4_capture.batch_capture_class(
+        capture_func=capture_snapshot,
+        dvr=dvr,
+        channel=channel,
+        camera_label=camera_label,
+        grade=grade,
+        student_count=student_count,
+    )
+
+    success_count = sum(1 for r in results if r.get("success"))
+    return {
+        "total": student_count,
+        "success": success_count,
+        "failed": student_count - success_count,
+        "results": results,
+    }
+
+
+@app.get("/api/a4-capture/logs")
+async def get_a4_capture_logs(date: str = ""):
+    """Get A4 capture logs for a given date (default: today IST)."""
+    logs = a4_capture.get_capture_logs(date)
+    return {"date": date, "entries": logs}
+
+
+@app.get("/api/a4-capture/cameras")
+async def get_capture_cameras():
+    """Get list of cameras available for A4 sheet capture."""
+    mapping = config.get("camera_mapping", {})
+    cameras = []
+    for label, cam_config in mapping.items():
+        cameras.append({
+            "label": label,
+            "dvr_index": cam_config.get("dvr_index"),
+            "channel": cam_config.get("channel"),
+            "description": cam_config.get("description", ""),
+        })
+    return {"cameras": cameras}
 
 
 # ---------------------------------------------------------------------------

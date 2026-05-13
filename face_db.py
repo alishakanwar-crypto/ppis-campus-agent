@@ -60,7 +60,7 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
     try:
         if Image is not None:
             pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            max_dim = 800
+            max_dim = 480
             if max(pil_img.size) > max_dim:
                 pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
             img_array = np.asarray(pil_img, dtype=np.uint8)
@@ -150,7 +150,10 @@ def encode_face_insightface(image_bytes: bytes) -> tuple[np.ndarray, bytes] | No
 
     try:
         pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_array = np.array(pil_img)
+        img_array = np.asarray(pil_img, dtype=np.uint8)
+        if img_array.ndim != 3 or img_array.shape[2] != 3:
+            logger.error(f"Bad image shape for InsightFace: {img_array.shape}")
+            return None
         img_bgr = img_array[:, :, ::-1].copy()
     except Exception as e:
         logger.error(f"Failed to load image for InsightFace: {e}")
@@ -293,6 +296,13 @@ def load_known_faces(encoding_type: str = "face_recognition_128d") -> dict:
                 "phone": row["phone"],
                 "encodings": [],
             }
+        else:
+            # Keep the phone field with the most numbers (later registrations
+            # may include both parents while the first only had one)
+            existing = persons[pid]["phone"] or ""
+            incoming = row["phone"] or ""
+            if incoming.count(",") > existing.count(","):
+                persons[pid]["phone"] = incoming
         persons[pid]["encodings"].append(encoding)
 
     logger.info(f"Loaded {len(persons)} person(s) with "
