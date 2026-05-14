@@ -66,26 +66,26 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (overall: 7:00 AM to 9:30 AM IST)
+# Attendance time window (overall: 7:00 AM to 9:00 AM IST)
 ATTENDANCE_START_HOUR = 7
 ATTENDANCE_START_MINUTE = 0
 ATTENDANCE_END_HOUR = 9
-ATTENDANCE_END_MINUTE = 30
+ATTENDANCE_END_MINUTE = 0
 
 # Two-phase attendance windows (production mode)
-# Phase 1: Teacher recognition (7:00 AM - 9:30 AM)
-# Cameras: Reception C1-C4, Principal Room, Entry Gate, Staff rooms
+# Phase 1: Teacher recognition (7:00 AM - 7:45 AM)
+# Cameras: Entry Gate, Reception, Admission Room, Administration
 TEACHER_PHASE_START_HOUR = 7
 TEACHER_PHASE_START_MIN = 0
-TEACHER_PHASE_END_HOUR = 9
-TEACHER_PHASE_END_MIN = 30
+TEACHER_PHASE_END_HOUR = 7
+TEACHER_PHASE_END_MIN = 45
 
-# Phase 2: Student recognition (7:00 AM - 9:30 AM)
+# Phase 2: Student recognition (7:15 AM - 9:00 AM)
 # Cameras: Entry Gate, Reception, Classroom cameras (grade-specific)
 STUDENT_PHASE_START_HOUR = 7
-STUDENT_PHASE_START_MIN = 0
+STUDENT_PHASE_START_MIN = 15
 STUDENT_PHASE_END_HOUR = 9
-STUDENT_PHASE_END_MIN = 30
+STUDENT_PHASE_END_MIN = 0
 
 # ---------------------------------------------------------------------------
 # HIGH-ACCURACY CONFIGURATION
@@ -1990,7 +1990,8 @@ class AttendanceEngine:
             return "entry_gate"
         if any(kw in loc_upper for kw in {"TEACHER STAFF", "STAFF ROOM",
                                            "ACADEMIC COORDINATOR", "ADMIN ROOM",
-                                           "ACCOUNTS ROOM", "ADMISSION"}):
+                                           "ACCOUNTS ROOM", "ADMISSION",
+                                           "ADMINISTRATION"}):
             return "staff"
         grade = _extract_grade_from_location(location)
         if grade is not None:
@@ -2083,10 +2084,14 @@ class AttendanceEngine:
             all_classroom_cams = [c for c in cameras if c["cam_type"] == "classroom"]
             all_other_cams = [c for c in cameras if c["cam_type"] == "other"]
 
-            # Phase 1 teacher cameras: Entry Gate + Reception FIRST (quick detection),
-            # then fallback to Principal + Staff rooms + Admin/other cameras
+            # Separate admission/administration cameras from other staff cams
+            admission_cams = [c for c in all_staff_cams
+                              if any(kw in c["location"].upper()
+                                     for kw in ("ADMISSION", "ADMINISTRATION"))]
+
+            # Phase 1 teacher cameras: Entry Gate + Reception + Admission + Administration ONLY
             teacher_priority_cams = entry_gate_cams + reception_cams  # scanned first
-            teacher_fallback_cams = principal_cams + all_staff_cams  # scanned after
+            teacher_fallback_cams = admission_cams  # scanned after
             teacher_phase_cams = teacher_priority_cams + teacher_fallback_cams
             # Phase 2 student cameras: Entry Gate + Reception + ALL classrooms
             student_phase_cams_gate = entry_gate_cams + reception_cams
@@ -2115,7 +2120,7 @@ class AttendanceEngine:
                 f"Mode: {mode} | "
                 f"Phase1 teacher cams: {len(teacher_phase_cams)} "
                 f"(PRIORITY: gate={len(entry_gate_cams)}, reception={len(reception_cams)} | "
-                f"FALLBACK: principal={len(principal_cams)}, staff={len(all_staff_cams)}) | "
+                f"FALLBACK: admission/admin={len(admission_cams)}) | "
                 f"Phase2 student cams: {len(student_phase_cams_gate)} gate/reception + "
                 f"{len(student_phase_cams_classroom)} classroom | "
                 f"Other (skipped): {len(all_other_cams)} | "
