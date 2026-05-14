@@ -108,6 +108,20 @@ ENTRY_VALIDATION_CAMERAS = {
 # Set to True for testing, False for production
 FORCE_RENOTIFY_TEST = False
 
+# ---------------------------------------------------------------------------
+# MEAL SNAPSHOT NOTIFICATION SCHEDULE (Summer Camp)
+# ---------------------------------------------------------------------------
+# Sends classroom camera snapshots to parents of present children during
+# meal breaks. Uses ppis_meal_update template (force-send via template API).
+# Active: weekdays only, until May 26, 2026.
+MEAL_SNAPSHOT_ENABLED = True
+MEAL_SNAPSHOT_END_DATE = "2026-05-26"  # Last day of summer camp
+MEAL_WINDOWS = [
+    # (start_hour, start_min, end_hour, end_min, label)
+    (8, 45, 9, 0, "Short Break"),
+    (11, 30, 12, 0, "Lunch Break"),
+]
+
 # Summer break schedule: grades on break won't be scanned on classroom cameras.
 # Teachers and entry gate/reception scanning continue normally.
 # Format: list of (start_date, end_date, set_of_normalized_grade_prefixes)
@@ -321,6 +335,10 @@ class AttendanceEngine:
         self.last_attendance: dict[str, float] = {}  # person_id -> timestamp
         self.daily_marked: dict[str, str] = {}  # person_id -> date string
         self._notification_sent: dict[str, str] = {}  # person_id -> date (dedup notifications)
+        # Meal snapshot dedup: "person_id:window_label" -> date
+        self._meal_sent: dict[str, str] = {}
+        # Track which meal windows already ran their full snapshot cycle today
+        self._meal_window_done: dict[str, str] = {}  # window_label -> date
         self.debug_logs: list[dict] = []
         self.max_debug_logs = 500
         self.scan_interval = 3.0  # seconds between scans
@@ -1658,6 +1676,175 @@ class AttendanceEngine:
             if attempt < max_retries:
                 await asyncio.sleep(2 * attempt)
 
+    # ------------------------------------------------------------------
+    # Meal snapshot notifications
+    # ------------------------------------------------------------------
+
+    def _is_meal_window_active(self) -> tuple[bool, str]:
+        """Check if we are inside a meal snapshot window.
+
+        Returns (active, window_label).  Only fires on weekdays and
+        before MEAL_SNAPSHOT_END_DATE.
+        """
+        if not MEAL_SNAPSHOT_ENABLED:
+            return False, ""
+        from datetime import timezone as _tz, timedelta as _td
+        _ist = _tz(_td(hours=5, minutes=30))
+        now = datetime.now(_ist)
+        # Weekdays only (Mon=0 .. Fri=4)
+        if now.weekday() >= 5:
+            return False, ""
+        # Respect end date
+        if now.strftime("%Y-%m-%d") > MEAL_SNAPSHOT_END_DATE:
+            return False, ""
+        cur_mins = now.hour * 60 + now.minute
+        for sh, sm, eh, em, label in MEAL_WINDOWS:
+            if (sh * 60 + sm) <= cur_mins < (eh * 60 + em):
+                return True, label
+        return False, ""
+
+    async def _run_meal_snapshot_cycle(self, classroom_cams: list[dict],
+                                       window_label: str):
+        """Capture one snapshot per classroom camera and send meal
+        notifications to parents of children marked present today.
+
+        Each child gets ONE notification per meal window per day.
+        The snapshot sent is from the child's classroom camera (matched
+        by grade in person_id).
+        """
+        from datetime import timezone as _tz, timedelta as _td
+        import base64
+        _ist = _tz(_td(hours=5, minutes=30))
+        _now = datetime.now(_ist)
+        today = _now.strftime("%Y-%m-%d")
+        date_display = _now.strftime("%d-%m-%Y")
+        time_display = _now.strftime("%I:%M %p")
+
+        # Build map: grade -> list of classroom cameras
+        grade_cams: dict[str, list[dict]] = {}
+        for cam in classroom_cams:
+            g = cam.get("grade")
+            if g:
+                grade_cams.setdefault(g, []).append(cam)
+
+        # Determine which students were marked present AND notified today
+        notified_students: list[dict] = []
+        for pid, sent_date in self._notification_sent.items():
+            if sent_date != today:
+                continue
+            if pid.startswith("TEACHER_"):
+                continue
+            face = self.known_faces.get(pid)
+            if not face:
+                continue
+            phone = face.get("phone", "")
+            if not phone:
+                continue
+            notified_students.append({
+                "person_id": pid,
+                "name": face["name"],
+                "phone": phone,
+            })
+
+        if not notified_students:
+            self.add_debug_log("meal_snapshot",
+                               f"{window_label}: No present+notified students — skipping")
+            return
+
+        self.add_debug_log("meal_snapshot",
+                           f"{window_label}: {len(notified_students)} present students, "
+                           f"{len(grade_cams)} classroom grades with cameras")
+
+        # Capture one snapshot per grade (first working camera)
+        grade_snapshots: dict[str, bytes] = {}
+        for grade, cams in grade_cams.items():
+            for cam in cams:
+                try:
+                    img = await self.capture_frame_from_dvr(
+                        cam["dvr"], cam["channel"])
+                    if img and len(img) > 1000:
+                        grade_snapshots[grade] = img
+                        break
+                except Exception as e:
+                    logger.debug(f"Meal snapshot failed for {cam['label']}: {e}")
+
+        if not grade_snapshots:
+            self.add_debug_log("meal_snapshot",
+                               f"{window_label}: Could not capture any classroom snapshots")
+            return
+
+        self.add_debug_log("meal_snapshot",
+                           f"{window_label}: Captured snapshots for "
+                           f"{len(grade_snapshots)} classrooms: {list(grade_snapshots.keys())}")
+
+        # Extract grade from person_id
+        def _grade_from_pid(pid: str) -> str:
+            for part in pid.split("_"):
+                if part.startswith("GRADE") or part.startswith("NUR") or part.startswith("PREP"):
+                    return part
+            return ""
+
+        api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+        agent_secret = os.environ.get("AGENT_SECRET", "")
+        headers = {"Content-Type": "application/json"}
+        if agent_secret:
+            headers["X-Agent-Secret"] = agent_secret
+
+        sent_count = 0
+        skip_count = 0
+        for student in notified_students:
+            pid = student["person_id"]
+            dedup_key = f"{pid}:{window_label}"
+            if self._meal_sent.get(dedup_key) == today:
+                skip_count += 1
+                continue
+
+            grade = _grade_from_pid(pid)
+            snapshot = grade_snapshots.get(grade)
+            if not snapshot:
+                # No camera for this student's classroom — skip
+                continue
+
+            # Format grade for display (e.g. GRADE9A -> Grade 9A)
+            grade_display = grade
+            if grade.startswith("GRADE"):
+                num = grade[5:]
+                grade_display = f"Grade {num}"
+            elif grade.startswith("PREP"):
+                num = grade[4:]
+                grade_display = f"Prep {num}" if num else "Prep"
+            elif grade.startswith("NUR"):
+                num = grade[3:]
+                grade_display = f"Nursery {num}" if num else "Nursery"
+
+            phone_list = [p.strip() for p in student["phone"].split(",") if p.strip()]
+            for parent_phone in phone_list:
+                payload = {
+                    "phone": parent_phone,
+                    "template_name": "ppis_meal_update",
+                    "template_params": [grade_display, date_display, time_display],
+                    "language_code": "en",
+                    "header_image_base64": base64.b64encode(snapshot).decode(),
+                }
+                try:
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        resp = await client.post(
+                            f"{api_url}/api/send-whatsapp",
+                            json=payload, headers=headers,
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if data.get("status") in ("ok", "partial"):
+                                sent_count += 1
+                except Exception as e:
+                    logger.warning(f"Meal notification failed for {parent_phone}: {e}")
+
+            self._meal_sent[dedup_key] = today
+
+        self.add_debug_log("meal_snapshot_done",
+                           f"{window_label}: Sent {sent_count} meal notifications, "
+                           f"skipped {skip_count} (already sent)")
+
     async def _sync_attendance_to_cloud(self, record: dict, parent_phones: str):
         """Report attendance record to cloud backend for dashboard display."""
         api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
@@ -2203,13 +2390,15 @@ class AttendanceEngine:
                     today = new_today
                     self.daily_marked.clear()
                     self._notification_sent.clear()
+                    self._meal_sent.clear()
+                    self._meal_window_done.clear()
                     self._sightings.clear()
                     self._camera_errors.clear()
                     self._admin_alerted.clear()
                     self.entry_validated.clear()
                     self.add_debug_log("daily_reset",
                                        f"New day {today}: cleared attendance marks, "
-                                       f"notifications, sightings, and entry validations")
+                                       f"notifications, meal caches, sightings, and entry validations")
 
                 # Periodically reload faces (picks up new registrations)
                 if cycle % 20 == 0:
@@ -2236,6 +2425,22 @@ class AttendanceEngine:
                     in_student_phase = True
 
                 if not in_teacher_phase and not in_student_phase:
+                    # Check if a meal window is active — run meal snapshot
+                    # even outside attendance phases
+                    _meal_active_idle, _meal_label_idle = self._is_meal_window_active()
+                    if _meal_active_idle:
+                        _meal_today_idle = date.today().isoformat()
+                        if self._meal_window_done.get(_meal_label_idle) != _meal_today_idle:
+                            self._meal_window_done[_meal_label_idle] = _meal_today_idle
+                            self.add_debug_log("meal_snapshot_trigger",
+                                               f"Meal window active (idle): {_meal_label_idle} — "
+                                               "capturing classroom snapshots")
+                            try:
+                                await self._run_meal_snapshot_cycle(
+                                    all_classroom_cams, _meal_label_idle)
+                            except Exception as _meal_err2:
+                                logger.error(f"Meal snapshot cycle failed: {_meal_err2}")
+
                     # Outside all attendance windows — sleep and retry
                     if cycle <= 1 or cycle % 60 == 0:
                         self.add_debug_log("outside_window",
@@ -2415,6 +2620,24 @@ class AttendanceEngine:
                         # Free memory between batches
                         gc.collect()
                         await asyncio.sleep(0.3)
+
+                # === MEAL SNAPSHOT CHECK ===
+                # Run once per meal window per day (not every scan cycle)
+                meal_active, meal_label = self._is_meal_window_active()
+                if meal_active:
+                    _meal_today = date.today().isoformat()
+                    if self._meal_window_done.get(meal_label) != _meal_today:
+                        self._meal_window_done[meal_label] = _meal_today
+                        self.add_debug_log("meal_snapshot_trigger",
+                                           f"Meal window active: {meal_label} — "
+                                           "capturing classroom snapshots")
+                        try:
+                            await self._run_meal_snapshot_cycle(
+                                all_classroom_cams, meal_label)
+                        except Exception as _meal_err:
+                            logger.error(f"Meal snapshot cycle failed: {_meal_err}")
+                            self.add_debug_log("meal_snapshot_error",
+                                               f"{meal_label} error: {_meal_err}")
 
                 cycle_duration = time.time() - cycle_start
                 self._classwise_stats["cameras_scanned"] = scanned
