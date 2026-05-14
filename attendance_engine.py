@@ -1440,29 +1440,10 @@ class AttendanceEngine:
                                confidence=confidence)
             return None
 
-        # --- CHECK 5b: Verify entry validation for non-entry cameras ---
-        # Teachers: skip entry gate validation — mark wherever detected
-        # Students: require entry gate/reception sighting first
-        if not is_teacher:
-            entry_ok = self.entry_validated.get(person_id) == date.today().isoformat()
-            if not entry_ok:
-                # Check sightings for any entry camera detection
-                sightings = self._sightings.get(person_id, [])
-                for s in sightings:
-                    if _is_entry_camera(s.get("camera", "")):
-                        entry_ok = True
-                        self.entry_validated[person_id] = date.today().isoformat()
-                        break
-            if not entry_ok and not _is_entry_camera(camera_source):
-                # No entry validation — hold attendance, don't mark yet
-                self.add_debug_log("no_entry_validation",
-                                   f"{name} detected on {camera_source} but NOT seen at "
-                                   f"entry gate/reception today — attendance held",
-                                   person_id=person_id, confidence=confidence)
-                return None
-        else:
-            # Teachers auto-validated
-            self.entry_validated[person_id] = date.today().isoformat()
+        # --- CHECK 5b: Entry validation skipped ---
+        # Both teachers and students: mark wherever detected (no gate requirement)
+        # Summer camp students are spread across classrooms, not at assigned grades
+        self.entry_validated[person_id] = date.today().isoformat()
 
         # --- CHECK 6: Anti-spoofing ---
         if not self._check_anti_spoof(person_id, name):
@@ -2366,17 +2347,8 @@ class AttendanceEngine:
                                 self._classwise_stats["errors"] += r[2]
                     gc.collect()
 
-                    # 2b. Scan classroom cameras (grade-specific students ONLY)
-                    # Skip grades on summer break
-                    active_classroom_cams = [
-                        c for c in student_phase_cams_classroom
-                        if not _is_grade_on_break(c.get("grade", ""))
-                    ]
-                    skipped_break = len(student_phase_cams_classroom) - len(active_classroom_cams)
-                    if skipped_break > 0 and (cycle <= 1 or cycle % 60 == 0):
-                        self.add_debug_log("summer_break_skip",
-                                           f"Skipping {skipped_break} classroom cameras "
-                                           f"(grades on summer break)")
+                    # 2b. Scan ALL classroom cameras (summer camp mode — students in any room)
+                    active_classroom_cams = student_phase_cams_classroom
 
                     BATCH_SIZE = 10
                     for batch_start in range(0, len(active_classroom_cams), BATCH_SIZE):
@@ -2385,20 +2357,21 @@ class AttendanceEngine:
                             if not self.classwise_running:
                                 break
                             try:
-                                grade = cam["grade"]
-                                # Students only — no teachers on classroom cameras
-                                grade_faces = self._grade_face_cache.get(grade, {})
-                                grade_faces_if = self._grade_face_cache_insightface.get(grade, {})
+                                # Summer camp: scan against ALL student faces (not grade-specific)
+                                all_student_faces = {k: v for k, v in self.known_faces.items()
+                                                     if not k.startswith("TEACHER_")}
+                                all_student_faces_if = {k: v for k, v in self.known_faces_insightface.items()
+                                                        if not k.startswith("TEACHER_")}
 
-                                if not grade_faces and not grade_faces_if:
+                                if not all_student_faces and not all_student_faces_if:
                                     scanned += 1
                                     continue
 
                                 self._classwise_stats["current_camera"] = cam["label"]
                                 results = await self.scan_camera(
                                     cam["dvr"], cam["channel"], cam["label"],
-                                    faces_subset=grade_faces,
-                                    insightface_subset=grade_faces_if,
+                                    faces_subset=all_student_faces,
+                                    insightface_subset=all_student_faces_if,
                                 )
                                 scanned += 1
                                 faces_in_cycle += len(results)
