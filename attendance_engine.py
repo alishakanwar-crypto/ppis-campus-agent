@@ -1580,8 +1580,8 @@ class AttendanceEngine:
         display_name = name.title() if name == name.upper() else name
         if is_teacher:
             notif_name = display_name  # Template has "Dear {{1}}, you have been"
-            tpl_name = "teacher_attendance_ppis"
-            tpl_lang = "en_GB"
+            tpl_name = "ppis_teacher_present"
+            tpl_lang = "en"
         else:
             notif_name = f"{display_name} has been"
             tpl_name = "ppis_attendance_alert"
