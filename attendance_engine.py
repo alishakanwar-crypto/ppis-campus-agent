@@ -2084,15 +2084,17 @@ class AttendanceEngine:
             all_classroom_cams = [c for c in cameras if c["cam_type"] == "classroom"]
             all_other_cams = [c for c in cameras if c["cam_type"] == "other"]
 
-            # Separate admission/administration cameras from other staff cams
+            # Separate admission and administration cameras from other staff cams
+            administration_cams = [c for c in all_staff_cams
+                                   if "ADMINISTRATION" in c["location"].upper()]
             admission_cams = [c for c in all_staff_cams
-                              if any(kw in c["location"].upper()
-                                     for kw in ("ADMISSION", "ADMINISTRATION"))]
+                              if "ADMISSION" in c["location"].upper()]
 
-            # Phase 1 teacher cameras: Entry Gate + Reception FIRST,
-            # then Principal Room + Admission Room + Administration
-            teacher_priority_cams = entry_gate_cams + reception_cams  # scanned first
-            teacher_fallback_cams = principal_cams + admission_cams  # scanned after
+            # Phase 1 teacher cameras:
+            # PRIORITY: Entry Gate + Reception + Administration (scanned first)
+            # FALLBACK: Principal Room + Admission Room (scanned after)
+            teacher_priority_cams = entry_gate_cams + reception_cams + administration_cams
+            teacher_fallback_cams = principal_cams + admission_cams
             teacher_phase_cams = teacher_priority_cams + teacher_fallback_cams
             # Phase 2 student cameras: Entry Gate + Reception + ALL classrooms
             student_phase_cams_gate = entry_gate_cams + reception_cams
