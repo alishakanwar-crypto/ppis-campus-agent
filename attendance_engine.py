@@ -309,8 +309,8 @@ class AttendanceEngine:
         self.classwise_running = False
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
-        self.confidence_threshold = 0.35  # Match confidence > 35% for students
-        self.review_threshold = 0.30  # 30-35% goes to manual review queue
+        self.confidence_threshold = 0.40  # Match confidence > 40% for students
+        self.review_threshold = 0.35  # 35-40% goes to manual review queue
         self.min_sightings = 2  # Must be seen 2+ times before marking present (students)
         self.sighting_window = 600  # 10-minute window for sightings to accumulate
         self.teacher_confidence_threshold = 0.30  # Lower threshold — reception cameras are far
