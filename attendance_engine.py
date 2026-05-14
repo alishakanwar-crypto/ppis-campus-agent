@@ -1576,9 +1576,13 @@ class AttendanceEngine:
         is_teacher = person_id.startswith("TEACHER_")
         display_name = name.title() if name == name.upper() else name
         if is_teacher:
-            notif_name = f"Dear {display_name}, you have been"
+            notif_name = display_name  # Template has "Dear {{1}}, you have been"
+            tpl_name = "ppis_teachers_attendance"
+            tpl_lang = "en_GB"
         else:
             notif_name = f"{display_name} has been"
+            tpl_name = "ppis_attendance_alert"
+            tpl_lang = "en"
 
         # Log confidence level for monitoring
         logger.info(f"[NOTIFICATION] Sending to {phone} for {display_name} "
@@ -1593,8 +1597,9 @@ class AttendanceEngine:
                         f"{api_url}/api/send-whatsapp",
                         json={
                             "phone": phone,
-                            "template_name": "ppis_attendance_alert",
+                            "template_name": tpl_name,
                             "template_params": [notif_name, time_str],
+                            "language_code": tpl_lang,
                         },
                         headers=headers,
                     )
