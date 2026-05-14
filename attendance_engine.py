@@ -1578,7 +1578,7 @@ class AttendanceEngine:
         if is_teacher:
             notif_name = f"Dear {display_name}, you have been"
         else:
-            notif_name = f"Dear Parent, {display_name} has been"
+            notif_name = f"{display_name} has been"
 
         # Log confidence level for monitoring
         logger.info(f"[NOTIFICATION] Sending to {phone} for {display_name} "
