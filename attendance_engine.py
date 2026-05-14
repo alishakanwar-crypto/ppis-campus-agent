@@ -1599,9 +1599,25 @@ class AttendanceEngine:
             "language_code": tpl_lang,
         }
         # Attach snapshot for teacher template (image header)
-        if is_teacher and snapshot_bytes:
+        if is_teacher:
             import base64
-            payload["header_image_base64"] = base64.b64encode(snapshot_bytes).decode()
+            _img = snapshot_bytes
+            # Fallback: use registration photo if live snapshot unavailable
+            if not _img:
+                try:
+                    reg_faces = db.get_all_faces()
+                    for face in reg_faces:
+                        if face.get("person_id") == person_id:
+                            img_path = face.get("image_path", "")
+                            if img_path and Path(img_path).exists():
+                                with open(img_path, "rb") as _f:
+                                    _img = _f.read()
+                                logger.info(f"[NOTIFICATION] Using registration photo fallback for {person_id}")
+                                break
+                except Exception as _fb_err:
+                    logger.warning(f"Failed to load fallback photo: {_fb_err}")
+            if _img:
+                payload["header_image_base64"] = base64.b64encode(_img).decode()
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):
