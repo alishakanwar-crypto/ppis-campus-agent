@@ -1552,6 +1552,7 @@ class AttendanceEngine:
                         name=name,
                         time_str=time_str,
                         phone=parent_phone,
+                        snapshot_bytes=image_bytes,
                     )
                 )
 
@@ -1560,12 +1561,14 @@ class AttendanceEngine:
     async def _send_whatsapp_notification(self, attendance_id: int,
                                            person_id: str,
                                            name: str, time_str: str,
-                                           phone: str):
+                                           phone: str,
+                                           snapshot_bytes: bytes | None = None):
         """Send WhatsApp attendance notification via cloud bot API.
 
         Uses ppis_attendance_alert template for guaranteed delivery.
         For teachers (person_id starts with TEACHER_), the notification
-        goes directly to the teacher's own WhatsApp number.
+        goes directly to the teacher's own WhatsApp number with a
+        face snapshot image header.
         """
         api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
         agent_secret = os.environ.get("AGENT_SECRET", "")
@@ -1588,19 +1591,26 @@ class AttendanceEngine:
         logger.info(f"[NOTIFICATION] Sending to {phone} for {display_name} "
                      f"(confidence verified, entry validated)")
 
+        # Build request payload
+        payload = {
+            "phone": phone,
+            "template_name": tpl_name,
+            "template_params": [notif_name, time_str],
+            "language_code": tpl_lang,
+        }
+        # Attach snapshot for teacher template (image header)
+        if is_teacher and snapshot_bytes:
+            import base64
+            payload["header_image_base64"] = base64.b64encode(snapshot_bytes).decode()
+
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             sent = False
             try:
-                async with httpx.AsyncClient(timeout=15) as client:
+                async with httpx.AsyncClient(timeout=30) as client:
                     resp = await client.post(
                         f"{api_url}/api/send-whatsapp",
-                        json={
-                            "phone": phone,
-                            "template_name": tpl_name,
-                            "template_params": [notif_name, time_str],
-                            "language_code": tpl_lang,
-                        },
+                        json=payload,
                         headers=headers,
                     )
                     if resp.status_code == 200:
