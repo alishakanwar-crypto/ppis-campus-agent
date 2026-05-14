@@ -106,7 +106,7 @@ ENTRY_VALIDATION_CAMERAS = {
 
 # TEMPORARY TEST FLAG: Force re-send notifications even if already sent today
 # Set to True for testing, False for production
-FORCE_RENOTIFY_TEST = False
+FORCE_RENOTIFY_TEST = True  # TEMP: enabled for live snapshot test
 
 # Summer break schedule: grades on break won't be scanned on classroom cameras.
 # Teachers and entry gate/reception scanning continue normally.
