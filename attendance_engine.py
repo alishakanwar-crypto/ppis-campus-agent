@@ -77,15 +77,15 @@ ATTENDANCE_END_MINUTE = 0
 # Cameras: Entry Gate, Reception, Admission Room, Administration
 TEACHER_PHASE_START_HOUR = 7
 TEACHER_PHASE_START_MIN = 0
-TEACHER_PHASE_END_HOUR = 7
-TEACHER_PHASE_END_MIN = 45
+TEACHER_PHASE_END_HOUR = 10
+TEACHER_PHASE_END_MIN = 15
 
 # Phase 2: Student recognition (7:15 AM - 9:00 AM)
 # Cameras: Entry Gate, Reception, Classroom cameras (grade-specific)
 STUDENT_PHASE_START_HOUR = 7
 STUDENT_PHASE_START_MIN = 15
-STUDENT_PHASE_END_HOUR = 9
-STUDENT_PHASE_END_MIN = 0
+STUDENT_PHASE_END_HOUR = 10
+STUDENT_PHASE_END_MIN = 15
 
 # ---------------------------------------------------------------------------
 # HIGH-ACCURACY CONFIGURATION
