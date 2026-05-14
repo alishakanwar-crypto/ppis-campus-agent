@@ -121,6 +121,11 @@ MEAL_WINDOWS = [
     (8, 45, 9, 0, "Short Break"),
     (11, 30, 12, 0, "Lunch Break"),
 ]
+# Summer camp meal room mapping: younger students eat in Grade 1A/1B,
+# while Grades 9-12 eat in their own classrooms.
+MEAL_OWN_CLASSROOM_GRADES = {"GRADE9A", "GRADE9B", "GRADE10A", "GRADE10B",
+                              "GRADE11A", "GRADE11B", "GRADE12A", "GRADE12B"}
+MEAL_COMMON_ROOM_GRADES = {"GRADE1A", "GRADE1B"}  # where younger students eat
 
 # Summer break schedule: grades on break won't be scanned on classroom cameras.
 # Teachers and entry gate/reception scanning continue normally.
@@ -1755,9 +1760,18 @@ class AttendanceEngine:
                            f"{window_label}: {len(notified_students)} present students, "
                            f"{len(grade_cams)} classroom grades with cameras")
 
-        # Capture one snapshot per grade (first working camera)
+        # Determine which camera grades we actually need snapshots from.
+        # Summer camp: Grades 9-12 eat in own class; younger students
+        # eat in Grade 1A / 1B (common rooms).
+        needed_grades: set[str] = set()
+        for grade in grade_cams:
+            if grade in MEAL_OWN_CLASSROOM_GRADES or grade in MEAL_COMMON_ROOM_GRADES:
+                needed_grades.add(grade)
+
+        # Capture one snapshot per needed grade (first working camera)
         grade_snapshots: dict[str, bytes] = {}
-        for grade, cams in grade_cams.items():
+        for grade in needed_grades:
+            cams = grade_cams.get(grade, [])
             for cam in cams:
                 try:
                     img = await self.capture_frame_from_dvr(
@@ -1767,6 +1781,13 @@ class AttendanceEngine:
                         break
                 except Exception as e:
                     logger.debug(f"Meal snapshot failed for {cam['label']}: {e}")
+
+        # Also prepare a common-room snapshot for younger students
+        common_room_snapshot: bytes | None = None
+        for cr_grade in MEAL_COMMON_ROOM_GRADES:
+            if cr_grade in grade_snapshots:
+                common_room_snapshot = grade_snapshots[cr_grade]
+                break
 
         if not grade_snapshots:
             self.add_debug_log("meal_snapshot",
@@ -1800,9 +1821,15 @@ class AttendanceEngine:
                 continue
 
             grade = _grade_from_pid(pid)
-            snapshot = grade_snapshots.get(grade)
+
+            # Pick the right snapshot based on summer camp room mapping
+            if grade in MEAL_OWN_CLASSROOM_GRADES:
+                snapshot = grade_snapshots.get(grade)
+            else:
+                # Younger students eat in Grade 1A/1B common rooms
+                snapshot = common_room_snapshot
+
             if not snapshot:
-                # No camera for this student's classroom — skip
                 continue
 
             # Format grade for display (e.g. GRADE9A -> Grade 9A)
