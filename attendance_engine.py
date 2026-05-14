@@ -125,7 +125,9 @@ MEAL_WINDOWS = [
 # while Grades 9-12 eat in their own classrooms.
 MEAL_OWN_CLASSROOM_GRADES = {"GRADE9A", "GRADE9B", "GRADE10A", "GRADE10B",
                               "GRADE11A", "GRADE11B", "GRADE12A", "GRADE12B"}
-MEAL_COMMON_ROOM_GRADES = {"GRADE1A", "GRADE1B"}  # where younger students eat
+# Summer camp students eat in these rooms (snapshot any of them)
+MEAL_CAMP_ROOM_GRADES = {"GRADE1A", "GRADE1B", "GRADE2A", "GRADE2B",
+                          "NURSERY", "PREP", "PREP1", "PREP2", "PREP3"}
 
 # Summer break schedule: grades on break won't be scanned on classroom cameras.
 # Teachers and entry gate/reception scanning continue normally.
@@ -1765,7 +1767,7 @@ class AttendanceEngine:
         # eat in Grade 1A / 1B (common rooms).
         needed_grades: set[str] = set()
         for grade in grade_cams:
-            if grade in MEAL_OWN_CLASSROOM_GRADES or grade in MEAL_COMMON_ROOM_GRADES:
+            if grade in MEAL_OWN_CLASSROOM_GRADES or grade in MEAL_CAMP_ROOM_GRADES:
                 needed_grades.add(grade)
 
         # Capture one snapshot per needed grade (first working camera)
@@ -1782,11 +1784,11 @@ class AttendanceEngine:
                 except Exception as e:
                     logger.debug(f"Meal snapshot failed for {cam['label']}: {e}")
 
-        # Also prepare a common-room snapshot for younger students
-        common_room_snapshot: bytes | None = None
-        for cr_grade in MEAL_COMMON_ROOM_GRADES:
+        # Pick any camp-room snapshot for younger students
+        camp_room_snapshot: bytes | None = None
+        for cr_grade in MEAL_CAMP_ROOM_GRADES:
             if cr_grade in grade_snapshots:
-                common_room_snapshot = grade_snapshots[cr_grade]
+                camp_room_snapshot = grade_snapshots[cr_grade]
                 break
 
         if not grade_snapshots:
@@ -1826,8 +1828,8 @@ class AttendanceEngine:
             if grade in MEAL_OWN_CLASSROOM_GRADES:
                 snapshot = grade_snapshots.get(grade)
             else:
-                # Younger students eat in Grade 1A/1B common rooms
-                snapshot = common_room_snapshot
+                # Summer camp students eat in camp rooms (1A/1B/2A/2B/Nursery/Prep)
+                snapshot = camp_room_snapshot
 
             if not snapshot:
                 continue
