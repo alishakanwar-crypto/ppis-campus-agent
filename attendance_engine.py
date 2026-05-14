@@ -77,15 +77,15 @@ ATTENDANCE_END_MINUTE = 0
 # Cameras: Entry Gate, Reception, Admission Room, Administration
 TEACHER_PHASE_START_HOUR = 7
 TEACHER_PHASE_START_MIN = 0
-TEACHER_PHASE_END_HOUR = 10
-TEACHER_PHASE_END_MIN = 15
+TEACHER_PHASE_END_HOUR = 7
+TEACHER_PHASE_END_MIN = 45
 
 # Phase 2: Student recognition (7:15 AM - 9:00 AM)
 # Cameras: Entry Gate, Reception, Classroom cameras (grade-specific)
 STUDENT_PHASE_START_HOUR = 7
 STUDENT_PHASE_START_MIN = 15
-STUDENT_PHASE_END_HOUR = 10
-STUDENT_PHASE_END_MIN = 15
+STUDENT_PHASE_END_HOUR = 9
+STUDENT_PHASE_END_MIN = 0
 
 # ---------------------------------------------------------------------------
 # HIGH-ACCURACY CONFIGURATION
@@ -106,7 +106,7 @@ ENTRY_VALIDATION_CAMERAS = {
 
 # TEMPORARY TEST FLAG: Force re-send notifications even if already sent today
 # Set to True for testing, False for production
-FORCE_RENOTIFY_TEST = True  # TEMP: enabled for live snapshot test
+FORCE_RENOTIFY_TEST = False
 
 # Summer break schedule: grades on break won't be scanned on classroom cameras.
 # Teachers and entry gate/reception scanning continue normally.
