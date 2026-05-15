@@ -495,7 +495,7 @@ class AttendanceEngine:
         self._grade_face_cache.clear()
         self._teacher_faces_cache: dict = {}
         for person_id, person_data in self.known_faces.items():
-            if person_id.startswith("TEACHER_"):
+            if person_id.startswith(("TEACHER_", "PRINCIPAL_")):
                 self._teacher_faces_cache[person_id] = person_data
                 continue
             grade = _grade_from_person_id(person_id)
@@ -507,7 +507,7 @@ class AttendanceEngine:
         self._grade_face_cache_insightface.clear()
         self._teacher_faces_cache_insightface: dict = {}
         for person_id, person_data in self.known_faces_insightface.items():
-            if person_id.startswith("TEACHER_"):
+            if person_id.startswith(("TEACHER_", "PRINCIPAL_")):
                 self._teacher_faces_cache_insightface[person_id] = person_data
                 continue
             grade = _grade_from_person_id(person_id)
@@ -775,7 +775,7 @@ class AttendanceEngine:
         try:
             grade = ""
             parts = person_id.rsplit("_", 1)
-            if len(parts) > 1 and not person_id.startswith("TEACHER_"):
+            if len(parts) > 1 and not person_id.startswith(("TEACHER_", "PRINCIPAL_")):
                 grade = parts[-1]
 
             review_data = {
@@ -1405,7 +1405,7 @@ class AttendanceEngine:
         CHECK 6: Anti-spoofing / liveness checks
         """
         now = time.time()
-        is_teacher = person_id.startswith("TEACHER_")
+        is_teacher = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
 
         # --- CHECK 1: Confidence range check ---
         effective_threshold = (self.teacher_confidence_threshold
@@ -1617,7 +1617,7 @@ class AttendanceEngine:
         if agent_secret:
             headers["X-Agent-Secret"] = agent_secret
 
-        is_teacher = person_id.startswith("TEACHER_")
+        is_teacher = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
         display_name = name.title() if name == name.upper() else name
         if is_teacher:
             notif_name = display_name  # Template has "Dear {{1}}, you have been"
@@ -1735,7 +1735,7 @@ class AttendanceEngine:
         for pid, sent_date in self._notification_sent.items():
             if sent_date != today:
                 continue
-            if pid.startswith("TEACHER_"):
+            if pid.startswith(("TEACHER_", "PRINCIPAL_")):
                 continue
             face = self.known_faces.get(pid)
             if not face:
@@ -2525,9 +2525,9 @@ class AttendanceEngine:
                     if teacher_principal_cams:
                         # Filter face subset to only Deepi Bector
                         _deepi_faces = {k: v for k, v in teacher_faces.items()
-                                        if k == "TEACHER_DEEPI_BECTOR"}
+                                        if k == "PRINCIPAL_DEEPI_BECTOR"}
                         _deepi_faces_if = {k: v for k, v in teacher_faces_if.items()
-                                           if k == "TEACHER_DEEPI_BECTOR"} if teacher_faces_if else {}
+                                           if k == "PRINCIPAL_DEEPI_BECTOR"} if teacher_faces_if else {}
                         if _deepi_faces or _deepi_faces_if:
                             ppr = await _scan_cam_list(
                                 teacher_principal_cams,
@@ -2649,9 +2649,9 @@ class AttendanceEngine:
                             try:
                                 # Summer camp: scan against ALL student faces (not grade-specific)
                                 all_student_faces = {k: v for k, v in self.known_faces.items()
-                                                     if not k.startswith("TEACHER_")}
+                                                     if not k.startswith(("TEACHER_", "PRINCIPAL_"))}
                                 all_student_faces_if = {k: v for k, v in self.known_faces_insightface.items()
-                                                        if not k.startswith("TEACHER_")}
+                                                        if not k.startswith(("TEACHER_", "PRINCIPAL_"))}
 
                                 if not all_student_faces and not all_student_faces_if:
                                     scanned += 1
