@@ -1831,12 +1831,11 @@ class AttendanceEngine:
 
             grade = _grade_from_pid(pid)
 
-            # Pick the right snapshot based on summer camp room mapping
-            if grade in MEAL_OWN_CLASSROOM_GRADES:
-                snapshot = grade_snapshots.get(grade)
-            else:
-                # Summer camp students eat in camp rooms (1A/1B/2A/2B/Nursery/Prep)
-                snapshot = camp_room_snapshot
+            # Only send meal snapshots for Grades 9-12 (own classroom)
+            # Younger students (camp rooms) are excluded
+            if grade not in MEAL_OWN_CLASSROOM_GRADES:
+                continue
+            snapshot = grade_snapshots.get(grade)
 
             if not snapshot:
                 continue
