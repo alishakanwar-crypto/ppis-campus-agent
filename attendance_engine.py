@@ -66,24 +66,33 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (overall: 7:00 AM to 12:00 PM IST — varies by date)
-ATTENDANCE_START_HOUR = 7
-ATTENDANCE_START_MINUTE = 0
+# Attendance time window (overall: 6:30 AM to 12:00 PM IST — varies by date)
+ATTENDANCE_START_HOUR = 6
+ATTENDANCE_START_MINUTE = 30
 ATTENDANCE_END_HOUR = 12
 ATTENDANCE_END_MINUTE = 0
 
 # Two-phase attendance windows (production mode)
-# Phase 1: Teacher recognition (7:00 AM - 7:45 AM) — same every day
-# Cameras: Administration ONLY
+# Phase 1: Teacher recognition — date-dependent
+#   Open House (16 May 2026): 6:30 AM - 8:00 AM (Admin Camera ONLY)
+#   Regular days (18 May onwards): 7:00 AM - 7:45 AM
+# Phase 2: Student recognition — date-dependent
+#   Open House (16 May 2026): 8:15 AM - 12:00 PM (classroom cameras)
+#   Regular days (18 May onwards): 8:00 AM - 9:00 AM
+
+OPEN_HOUSE_DATE = "2026-05-16"  # Saturday Open House
+
+# Default teacher window (regular days from Monday 18 May onwards)
 TEACHER_PHASE_START_HOUR = 7
 TEACHER_PHASE_START_MIN = 0
 TEACHER_PHASE_END_HOUR = 7
 TEACHER_PHASE_END_MIN = 45
 
-# Phase 2: Student recognition — date-dependent
-# Open House (16 May 2026): 7:30 AM - 12:00 PM (students move between classrooms)
-# Regular days (18 May 2026 onwards): 8:00 AM - 9:00 AM
-OPEN_HOUSE_DATE = "2026-05-16"  # Saturday Open House
+# Open House teacher window (wider)
+OPEN_HOUSE_TEACHER_START_HOUR = 6
+OPEN_HOUSE_TEACHER_START_MIN = 30
+OPEN_HOUSE_TEACHER_END_HOUR = 8
+OPEN_HOUSE_TEACHER_END_MIN = 0
 
 # Default student window (regular days from Monday 18 May onwards)
 STUDENT_PHASE_START_HOUR = 8
@@ -91,9 +100,9 @@ STUDENT_PHASE_START_MIN = 0
 STUDENT_PHASE_END_HOUR = 9
 STUDENT_PHASE_END_MIN = 0
 
-# Open House student window (wider — students move between classrooms)
-OPEN_HOUSE_STUDENT_START_HOUR = 7
-OPEN_HOUSE_STUDENT_START_MIN = 30
+# Open House student window
+OPEN_HOUSE_STUDENT_START_HOUR = 8
+OPEN_HOUSE_STUDENT_START_MIN = 15
 OPEN_HOUSE_STUDENT_END_HOUR = 12
 OPEN_HOUSE_STUDENT_END_MIN = 0
 
@@ -101,6 +110,15 @@ OPEN_HOUSE_STUDENT_END_MIN = 0
 def _is_open_house_today() -> bool:
     """Check if today is Open House day."""
     return date.today().isoformat() == OPEN_HOUSE_DATE
+
+
+def _get_teacher_phase_window() -> tuple[int, int, int, int]:
+    """Return (start_hour, start_min, end_hour, end_min) for teacher phase."""
+    if _is_open_house_today():
+        return (OPEN_HOUSE_TEACHER_START_HOUR, OPEN_HOUSE_TEACHER_START_MIN,
+                OPEN_HOUSE_TEACHER_END_HOUR, OPEN_HOUSE_TEACHER_END_MIN)
+    return (TEACHER_PHASE_START_HOUR, TEACHER_PHASE_START_MIN,
+            TEACHER_PHASE_END_HOUR, TEACHER_PHASE_END_MIN)
 
 
 def _get_student_phase_window() -> tuple[int, int, int, int]:
@@ -2378,11 +2396,13 @@ class AttendanceEngine:
                               if "ADMISSION" in c["location"].upper()]
 
             # Phase 1 teacher cameras:
-            # OPEN HOUSE PROTOCOL:
-            #   - Administration Camera for ALL teachers
-            #   - Principal Room Camera ONLY for Ms. Deepi Bector
+            #   Open House: Administration Camera ONLY (no Principal Room)
+            #   Regular: Administration Camera + Principal Room for Deepi Bector
             teacher_priority_cams = administration_cams
-            teacher_principal_cams = principal_cams  # Scanned separately for Deepi Bector only
+            if _is_open_house_today():
+                teacher_principal_cams = []  # Open House: Admin Camera ONLY
+            else:
+                teacher_principal_cams = principal_cams  # Regular: Principal Room for Deepi Bector
             teacher_fallback_cams = []  # No fallback
             teacher_phase_cams = teacher_priority_cams + teacher_principal_cams
             # Phase 2 student cameras: Classroom cameras ONLY (no gate/reception)
@@ -2406,6 +2426,7 @@ class AttendanceEngine:
                 "errors": 0,
             }
             # Log camera breakdown
+            _tw_log = _get_teacher_phase_window()
             _sw_log = _get_student_phase_window()
             _is_oh = _is_open_house_today()
             mode = "TEST (all cameras, all faces)" if FORCE_RENOTIFY_TEST else (
@@ -2414,13 +2435,13 @@ class AttendanceEngine:
                 "classwise_started",
                 f"Mode: {mode} | "
                 f"Phase1 teacher cams: {len(teacher_phase_cams)} "
-                f"(Admin={len(administration_cams)}, Principal={len(teacher_principal_cams)} [Deepi Bector only]) | "
+                f"(Admin={len(administration_cams)}, Principal={len(teacher_principal_cams)}) | "
                 f"Phase2 student cams: {len(student_phase_cams_classroom)} classroom ONLY | "
                 f"Other (skipped): {len(all_other_cams)} | "
                 f"{len(self.known_faces)} total faces loaded, "
                 f"{len(self._grade_face_cache)} grades with faces | "
-                f"Teacher window: {TEACHER_PHASE_START_HOUR}:{TEACHER_PHASE_START_MIN:02d}-"
-                f"{TEACHER_PHASE_END_HOUR}:{TEACHER_PHASE_END_MIN:02d} | "
+                f"Teacher window: {_tw_log[0]}:{_tw_log[1]:02d}-"
+                f"{_tw_log[2]}:{_tw_log[3]:02d} | "
                 f"Student window: {_sw_log[0]}:{_sw_log[1]:02d}-"
                 f"{_sw_log[2]}:{_sw_log[3]:02d}"
             )
@@ -2502,9 +2523,10 @@ class AttendanceEngine:
                 _h, _m = _now_phase.hour, _now_phase.minute
                 _now_mins = _h * 60 + _m
 
-                teacher_start = TEACHER_PHASE_START_HOUR * 60 + TEACHER_PHASE_START_MIN
-                teacher_end = TEACHER_PHASE_END_HOUR * 60 + TEACHER_PHASE_END_MIN
-                # Use dynamic student window (Open House vs regular)
+                # Use dynamic windows (Open House vs regular)
+                _tw = _get_teacher_phase_window()
+                teacher_start = _tw[0] * 60 + _tw[1]
+                teacher_end = _tw[2] * 60 + _tw[3]
                 _sw = _get_student_phase_window()
                 student_start = _sw[0] * 60 + _sw[1]
                 student_end = _sw[2] * 60 + _sw[3]
@@ -2538,8 +2560,8 @@ class AttendanceEngine:
                     if cycle <= 1 or cycle % 60 == 0:
                         self.add_debug_log("outside_window",
                                            f"Current time {_now_phase.strftime('%H:%M')} IST — "
-                                           f"outside both teacher ({TEACHER_PHASE_START_HOUR}:{TEACHER_PHASE_START_MIN:02d}-"
-                                           f"{TEACHER_PHASE_END_HOUR}:{TEACHER_PHASE_END_MIN:02d}) and "
+                                           f"outside both teacher ({_tw[0]}:{_tw[1]:02d}-"
+                                           f"{_tw[2]}:{_tw[3]:02d}) and "
                                            f"student ({_sw[0]}:{_sw[1]:02d}-"
                                            f"{_sw[2]}:{_sw[3]:02d}) windows")
                     # Memory cleanup during idle — every 5 minutes (10 idle cycles)
