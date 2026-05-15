@@ -9,6 +9,11 @@ Features:
 - On-demand child photo capture and delivery
 """
 
+from __future__ import annotations
+
+import faulthandler
+faulthandler.enable()  # Print C-level crash tracebacks
+
 import asyncio
 import base64
 import io
@@ -443,62 +448,91 @@ def find_all_cameras_for_classroom(classroom: str) -> list[tuple[dict, int, str]
                 results.append((dvrs[dvr_idx], channel, desc))
         return results or None
 
-    def _find_val(target: str) -> dict | None:
-        """Find the mapping value using fuzzy matching."""
+    def _strip_dvr_suffix(key: str) -> str:
+        """Strip '(DVR X Ch Y)' suffix from key for comparison.
+        E.g. 'NUR-3 (DVR 2 Ch 22)' -> 'NUR-3'"""
+        return re.sub(r'\s*\(DVR\s*\d+\s*Ch\s*\d+\)\s*$', '', key, flags=re.IGNORECASE).strip().upper()
+
+    def _find_all_vals(target: str) -> list[dict]:
+        """Find ALL mapping entries matching the classroom, using fuzzy matching.
+        Returns list of mapping dicts for all matching cameras."""
+        results = []
+
+        # 0. Match by stripping DVR suffix from keys: "NUR-3 (DVR 2 Ch 22)" -> "NUR-3"
+        for key, val in mapping.items():
+            key_base = _strip_dvr_suffix(key)
+            if key_base == target:
+                results.append(val)
+        if results:
+            return results
+
         # 1. Direct match (case-insensitive)
         for key, val in mapping.items():
             if key.strip().upper() == target:
-                return val
-        # 2. Whitespace-normalized match
+                return [val]
+        # 2. Whitespace-normalized match (also strip DVR suffix)
         clean = re.sub(r'\s+', '', target)
         for key, val in mapping.items():
-            key_clean = re.sub(r'\s+', '', key.strip().upper())
+            key_base = _strip_dvr_suffix(key)
+            key_clean = re.sub(r'\s+', '', key_base)
             if key_clean == clean:
-                return val
+                results.append(val)
+        if results:
+            return results
         # 3. Strip section letter: "GRADE 6A" → "GRADE 6"
         m = re.match(r'^(GRADE\s*\d{1,2})\s*[A-D]$', target)
         if m:
             grade_no_section_clean = re.sub(r'\s+', '', m.group(1).strip())
             for key, val in mapping.items():
-                key_clean = re.sub(r'\s+', '', key.strip().upper())
+                key_base = _strip_dvr_suffix(key)
+                key_clean = re.sub(r'\s+', '', key_base)
                 if key_clean == grade_no_section_clean:
                     logger.info(f"Fuzzy camera match: {target} -> {key} (section stripped)")
-                    return val
+                    results.append(val)
+            if results:
+                return results
         # 4. Grade without section: "GRADE 9" → find "GRADE 9A" if it's the only match
         m3 = re.match(r'^GRADE\s*(\d{1,2})$', target)
         if m3:
             grade_num = m3.group(1)
             candidates = []
             for key, val in mapping.items():
-                km = re.match(r'^GRADE\s*' + grade_num + r'\s*[A-D]$', key.strip().upper())
+                key_base = _strip_dvr_suffix(key)
+                km = re.match(r'^GRADE\s*' + grade_num + r'\s*[A-D]$', key_base)
                 if km:
                     candidates.append((key, val))
             if len(candidates) == 1:
                 logger.info(f"Fuzzy camera match: {target} -> {candidates[0][0]} (section inferred)")
-                return candidates[0][1]
+                return [candidates[0][1]]
             elif candidates:
                 # Multiple sections exist — pick section A as default
                 for key, val in candidates:
-                    if key.strip().upper().endswith('A'):
+                    key_base = _strip_dvr_suffix(key)
+                    if key_base.endswith('A'):
                         logger.info(f"Fuzzy camera match: {target} -> {key} (default section A)")
-                        return val
+                        return [val]
                 logger.info(f"Fuzzy camera match: {target} -> {candidates[0][0]} (first of {len(candidates)})")
-                return candidates[0][1]
+                return [candidates[0][1]]
         # 5. Strip number from Nursery/Prep: "NURSERY 4" → "NURSERY"
         m2 = re.match(r'^(NURSERY|NUR|PREP)\s*[-]?\s*\d+$', target)
         if m2:
             base_name = m2.group(1)
             for key, val in mapping.items():
-                if key.strip().upper() == base_name:
+                key_base = _strip_dvr_suffix(key)
+                if key_base == base_name:
                     logger.info(f"Fuzzy camera match: {target} -> {key} (number stripped)")
-                    return val
-        return None
+                    return [val]
+        return []
 
-    val = _find_val(classroom_upper)
-    if val:
-        resolved = _resolve_entry(val)
-        if resolved:
-            return resolved
+    all_vals = _find_all_vals(classroom_upper)
+    if all_vals:
+        all_results = []
+        for val in all_vals:
+            resolved = _resolve_entry(val)
+            if resolved:
+                all_results.extend(resolved)
+        if all_results:
+            return all_results
 
     logger.warning(f"No camera mapping found for: {classroom!r}")
     return None
@@ -636,6 +670,8 @@ async def websocket_client():
 
                     except json.JSONDecodeError:
                         logger.error(f"Invalid JSON from cloud bot: {message[:200]}")
+                    except Exception as e:
+                        logger.error(f"Error handling WS message: {e}", exc_info=True)
 
         except websockets.exceptions.ConnectionClosed as e:
             logger.warning(f"WebSocket closed: {e}. Reconnecting in 5s...")
@@ -738,32 +774,34 @@ async def _auto_start_classwise():
 
     This ensures the system is always-on without manual intervention.
     """
-    await asyncio.sleep(5)  # Let other startup tasks finish
-    if attendance_engine.classwise_running or attendance_engine.running:
-        logger.info("Monitoring already active — skipping auto-start")
-        return
+    try:
+        await asyncio.sleep(10)  # Let other startup tasks finish
+        if attendance_engine.classwise_running or attendance_engine.running:
+            logger.info("Monitoring already active — skipping auto-start")
+            return
 
-    dvrs = config.get("dvrs", [])
-    camera_mapping = config.get("camera_mapping", {})
-    if not dvrs or not camera_mapping:
-        logger.warning("Auto-start skipped: no DVRs or camera mapping configured")
-        return
+        dvrs = config.get("dvrs", [])
+        camera_mapping = config.get("camera_mapping", {})
+        if not dvrs or not camera_mapping:
+            logger.warning("Auto-start skipped: no DVRs or camera mapping configured")
+            return
 
-    attendance_engine.test_mode = False
-    attendance_engine.reload_faces()
+        attendance_engine.test_mode = False
 
-    # Configure camera alert phones from agent settings
-    import database as db_mod
-    alert_phones_str = db_mod.get_attendance_setting("camera_alert_phones", "")
-    if alert_phones_str:
-        attendance_engine._admin_phones = [p.strip() for p in alert_phones_str.split(",") if p.strip()]
-        logger.info(f"Camera alerts configured for: {attendance_engine._admin_phones}")
+        # Configure camera alert phones from agent settings
+        import database as db_mod
+        alert_phones_str = db_mod.get_attendance_setting("camera_alert_phones", "")
+        if alert_phones_str:
+            attendance_engine._admin_phones = [p.strip() for p in alert_phones_str.split(",") if p.strip()]
+            logger.info(f"Camera alerts configured for: {attendance_engine._admin_phones}")
 
-    attendance_engine.classwise_running = True
-    attendance_engine._classwise_task = asyncio.create_task(
-        attendance_engine.classwise_monitoring_loop(dvrs, camera_mapping)
-    )
-    logger.info("AUTO-START: Classwise attendance monitoring started automatically")
+        attendance_engine.classwise_running = True
+        attendance_engine._classwise_task = asyncio.create_task(
+            attendance_engine.classwise_monitoring_loop(dvrs, camera_mapping)
+        )
+        logger.info("AUTO-START: Classwise attendance monitoring started automatically")
+    except Exception as e:
+        logger.error(f"AUTO-START FAILED: {e}", exc_info=True)
 
 
 async def _health_watchdog():
@@ -819,25 +857,45 @@ async def _health_watchdog():
                     attendance_engine.reload_faces()
                     logger.info(f"WATCHDOG: Synced {synced} new face(s) from cloud")
 
-            # --- Check 4: Memory monitoring (every 5 min) ---
+            # --- Check 4: Tiered memory management (every 2 min) ---
             cleanup_counter += 1
-            if cleanup_counter >= 5:
+            if cleanup_counter >= 2:
                 cleanup_counter = 0
                 try:
                     import psutil
                     proc = psutil.Process()
                     mem_mb = proc.memory_info().rss / (1024 * 1024)
                     attendance_engine._health["memory_mb"] = round(mem_mb, 1)
-                    if mem_mb > 800:
-                        logger.warning(f"WATCHDOG: High memory usage: {mem_mb:.0f}MB — forcing cleanup")
-                        # Trim debug logs
-                        attendance_engine.debug_logs = attendance_engine.debug_logs[-100:]
-                        # Force garbage collection
-                        gc.collect()
-                        # Clean old snapshot files
+
+                    # Tier 1: Normal cleanup (>400MB)
+                    if mem_mb > 400:
+                        stats = attendance_engine.cleanup_memory(aggressive=False)
+                        logger.info(f"WATCHDOG: Memory {mem_mb:.0f}MB — routine cleanup: {stats}")
                         _cleanup_old_snapshots()
+
+                    # Tier 2: Aggressive cleanup (>700MB)
+                    if mem_mb > 700:
+                        stats = attendance_engine.cleanup_memory(aggressive=True)
+                        logger.warning(f"WATCHDOG: High memory {mem_mb:.0f}MB — aggressive cleanup: {stats}")
+
+                    # Tier 3: Critical — force restart (>1200MB)
+                    if mem_mb > 1200:
+                        logger.critical(
+                            f"WATCHDOG: CRITICAL memory {mem_mb:.0f}MB — "
+                            f"forcing process restart to prevent OOM"
+                        )
+                        attendance_engine.add_debug_log(
+                            "memory_restart",
+                            f"Process restarting due to critical memory: {mem_mb:.0f}MB"
+                        )
+                        # Exit with code 1 — run_forever.bat will auto-restart
+                        import sys
+                        sys.exit(1)
+
                 except ImportError:
                     pass
+                except SystemExit:
+                    raise
                 except Exception as e:
                     logger.debug(f"WATCHDOG: Memory check error: {e}")
 
@@ -869,6 +927,14 @@ def _cleanup_old_snapshots():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ws_task, config
+
+    # Set up asyncio exception handler to log unhandled task errors
+    def _handle_task_exception(loop, context):
+        exc = context.get("exception")
+        msg = context.get("message", "")
+        logger.critical(f"ASYNCIO UNHANDLED: {msg} — {exc}", exc_info=exc)
+    asyncio.get_event_loop().set_exception_handler(_handle_task_exception)
+
     # Initialize database (creates tables including attendance tables)
     import database as db_mod
     db_mod.init_db()
@@ -887,18 +953,30 @@ async def lifespan(app: FastAPI):
         logger.error(f"Face sync crashed during startup (non-fatal): {e}")
     # Pre-load registered faces into attendance engine
     attendance_engine.reload_faces()
+
     # Start WebSocket client in background
     ws_task = asyncio.create_task(websocket_client())
-    # Auto-start classwise monitoring (24/7 always-on)
+    # Auto-start classwise monitoring after brief delay (24/7 always-on)
     asyncio.create_task(_auto_start_classwise())
-    # Start health watchdog (auto-recovery, face sync, system checks)
-    asyncio.create_task(_health_watchdog())
+    # Start health watchdog after 60 seconds (auto-recovery, face sync)
+    async def _delayed_watchdog():
+        try:
+            await asyncio.sleep(60)
+            await _health_watchdog()
+        except Exception as e:
+            logger.error(f"Health watchdog failed: {e}", exc_info=True)
+
+    asyncio.create_task(_delayed_watchdog())
     logger.info("PPIS Campus Agent started (24/7 mode with auto-recovery)")
-    yield
-    # Shutdown
-    attendance_engine.stop()
-    if ws_task:
-        ws_task.cancel()
+    try:
+        yield
+    except Exception as e:
+        logger.critical(f"LIFESPAN CRASH: {e}", exc_info=True)
+    finally:
+        # Shutdown
+        attendance_engine.stop()
+        if ws_task:
+            ws_task.cancel()
     logger.info("PPIS Campus Agent stopped")
 
 
@@ -1590,6 +1668,27 @@ async def health_check():
         if d == __import__("datetime").date.today().isoformat()
     )
     health["cameras_with_errors"] = len(attendance_engine._camera_errors)
+
+    # Memory info
+    try:
+        import psutil
+        proc = psutil.Process()
+        mem = proc.memory_info()
+        health["memory_rss_mb"] = round(mem.rss / (1024 * 1024), 1)
+        health["memory_vms_mb"] = round(mem.vms / (1024 * 1024), 1)
+        health["cpu_percent"] = proc.cpu_percent(interval=0)
+        health["open_files"] = len(proc.open_files())
+        health["threads"] = proc.num_threads()
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Cache sizes
+    health["sighting_cache_entries"] = len(attendance_engine._sightings)
+    health["debug_log_entries"] = len(attendance_engine.debug_logs)
+    health["background_tasks"] = len(attendance_engine._background_tasks)
+    health["daily_marked_entries"] = len(attendance_engine.daily_marked)
 
     # Overall status
     statuses = [health["camera_feed"], health["recognition_engine"],
@@ -2673,8 +2772,58 @@ setInterval(async () => {
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _kill_port_holder(port: int) -> None:
+    """Kill any process currently listening on the given port (Windows only)."""
+    if sys.platform != "win32":
+        return
+    import subprocess
+    try:
+        result = subprocess.run(
+            f'netstat -ano | findstr :{port} | findstr LISTENING',
+            capture_output=True, text=True, shell=True,
+        )
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if parts:
+                pid = parts[-1]
+                subprocess.run(f"taskkill /F /PID {pid}", shell=True,
+                               capture_output=True)
+                logger.info(f"Killed stale process PID {pid} on port {port}")
+        time.sleep(3)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     import uvicorn
+    import traceback
+
+    # Global crash logger
+    def _log_crash(exc_type, exc_value, exc_tb):
+        logger.critical(
+            f"UNHANDLED EXCEPTION: {exc_type.__name__}: {exc_value}\n"
+            + "".join(traceback.format_tb(exc_tb))
+        )
+    sys.excepthook = _log_crash
+
     port = config.get("local_port", 8897)
+
+    # Kill any lingering process on our port before binding
+    _kill_port_holder(port)
+
     logger.info(f"Starting PPIS Campus Agent on http://localhost:{port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
+                    timeout_keep_alive=30, ws_max_size=16777216)
+    except OSError as e:
+        if "10048" in str(e) or "Address already in use" in str(e):
+            logger.warning(f"Port {port} still busy, retrying after kill...")
+            _kill_port_holder(port)
+            time.sleep(5)
+            uvicorn.run(app, host="0.0.0.0", port=port)
+        else:
+            logger.critical(f"FATAL OS ERROR: {e}", exc_info=True)
+            raise
+    except Exception as e:
+        logger.critical(f"FATAL CRASH: {e}", exc_info=True)
+        raise

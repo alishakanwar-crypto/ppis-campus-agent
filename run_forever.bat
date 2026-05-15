@@ -22,11 +22,23 @@ set PYTHONDONTWRITEBYTECODE=1
 :loop
 echo.
 echo ============================================
+echo [%DATE% %TIME%] Killing any existing agent on port 8897...
+echo ============================================
+REM Kill ALL python.exe first to avoid duplicate instances
+taskkill /F /IM python.exe >nul 2>&1
+REM Also kill any process holding port 8897
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8897 ^| findstr LISTENING') do (
+    echo Killing PID %%a on port 8897...
+    taskkill /F /PID %%a >nul 2>&1
+)
+timeout /t 3 /nobreak >nul
+
+echo ============================================
 echo [%DATE% %TIME%] Pulling latest code...
 echo ============================================
-REM Stash any local changes first (prevents git pull from failing)
-git stash 2>nul
-git pull 2>nul
+REM Force-sync to latest remote code (nuclear but reliable)
+git fetch origin 2>nul
+git reset --hard origin/devin/1778414374-enterprise-hardening 2>nul
 
 REM Clean up old snapshot files (older than 1 day) to prevent disk fill
 echo [%DATE% %TIME%] Cleaning old snapshots...

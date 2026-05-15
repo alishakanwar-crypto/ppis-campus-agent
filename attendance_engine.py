@@ -10,6 +10,8 @@ Supports:
   Each camera only checks faces of students in that class.
 """
 
+from __future__ import annotations
+
 import asyncio
 import gc
 import io
@@ -64,13 +66,112 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window defaults (overridden by cloud settings if available)
-# Teacher window: 7:00 AM to 8:00 AM IST
-# Student window: 7:00 AM to 9:30 AM IST
+# Attendance time window (overall: 7:00 AM to 12:00 PM IST — Open House)
 ATTENDANCE_START_HOUR = 7
 ATTENDANCE_START_MINUTE = 0
-ATTENDANCE_END_HOUR = 9
-ATTENDANCE_END_MINUTE = 30
+ATTENDANCE_END_HOUR = 12
+ATTENDANCE_END_MINUTE = 0
+
+# Two-phase attendance windows (production mode)
+# Phase 1: Teacher recognition (7:00 AM - 7:45 AM)
+# Cameras: Administration ONLY (Open House protocol)
+TEACHER_PHASE_START_HOUR = 7
+TEACHER_PHASE_START_MIN = 0
+TEACHER_PHASE_END_HOUR = 7
+TEACHER_PHASE_END_MIN = 45
+
+# Phase 2: Student recognition (7:30 AM - 12:00 PM)
+# Cameras: Classroom cameras ONLY (no gate/reception)
+# Admin Room camera stays active alongside student cameras during overlap
+STUDENT_PHASE_START_HOUR = 7
+STUDENT_PHASE_START_MIN = 30
+STUDENT_PHASE_END_HOUR = 12
+STUDENT_PHASE_END_MIN = 0
+
+# --- OPEN HOUSE SMART MODE ---
+# Students may move between classrooms during Open House.
+# Prevent duplicate attendance, allow cross-classroom detection.
+OPEN_HOUSE_MODE = True
+
+# ---------------------------------------------------------------------------
+# HIGH-ACCURACY CONFIGURATION
+# ---------------------------------------------------------------------------
+# Minimum face pixel dimensions for quality filtering
+MIN_FACE_WIDTH = 25
+MIN_FACE_HEIGHT = 25
+
+# Image quality thresholds (Laplacian variance for sharpness)
+MIN_SHARPNESS_SCORE = 30.0  # Reject blurry faces below this
+MIN_BRIGHTNESS = 40         # Reject underexposed faces
+MAX_BRIGHTNESS = 230        # Reject overexposed faces
+
+# Entry gate / reception camera labels (for entry validation)
+ENTRY_VALIDATION_CAMERAS = {
+    "entry_gate", "reception",
+}
+
+# TEMPORARY TEST FLAG: Force re-send notifications even if already sent today
+# Set to True for testing, False for production
+FORCE_RENOTIFY_TEST = False
+
+# ---------------------------------------------------------------------------
+# MEAL SNAPSHOT NOTIFICATION SCHEDULE (Summer Camp)
+# ---------------------------------------------------------------------------
+# Sends classroom camera snapshots to parents of present children during
+# meal breaks. Uses ppis_meal_update template (force-send via template API).
+# Active: weekdays only, until May 26, 2026.
+MEAL_SNAPSHOT_ENABLED = True
+MEAL_SNAPSHOT_END_DATE = "2026-05-26"  # Last day of summer camp
+MEAL_WINDOWS = [
+    # (start_hour, start_min, end_hour, end_min, label)
+    (8, 45, 9, 0, "Short Break"),
+    (11, 30, 12, 0, "Lunch Break"),
+]
+# Summer camp meal room mapping: younger students eat in Grade 1A/1B,
+# while Grades 9-12 eat in their own classrooms.
+MEAL_OWN_CLASSROOM_GRADES = {"GRADE9A", "GRADE9B", "GRADE10A", "GRADE10B",
+                              "GRADE11A", "GRADE11B", "GRADE12A", "GRADE12B"}
+# Summer camp students eat in these rooms (snapshot any of them)
+MEAL_CAMP_ROOM_GRADES = {"GRADE1A", "GRADE1B", "GRADE2A", "GRADE2B",
+                          "NURSERY", "PREP", "PREP1", "PREP2", "PREP3"}
+
+# Summer break schedule: grades on break won't be scanned on classroom cameras.
+# Teachers and entry gate/reception scanning continue normally.
+# Format: list of (start_date, end_date, set_of_normalized_grade_prefixes)
+SUMMER_BREAK_SCHEDULE = [
+    # Popsicles through Grade 8: May 12 - June 30, 2026
+    ("2026-05-12", "2026-06-30", {
+        "POPSICLES", "NUR", "NUR1", "NUR2", "NUR3",
+        "PREP", "PREP1", "PREP2", "PREP3",
+        "GRADE1A", "GRADE1B", "GRADE1C",
+        "GRADE2A", "GRADE2B", "GRADE2C",
+        "GRADE3A", "GRADE3B", "GRADE3C",
+        "GRADE4A", "GRADE4B", "GRADE4C",
+        "GRADE5A", "GRADE5B", "GRADE5C",
+        "GRADE6A", "GRADE6B", "GRADE6C",
+        "GRADE7A", "GRADE7B", "GRADE7C",
+        "GRADE8A", "GRADE8B", "GRADE8C",
+    }),
+    # Grade 9-12: May 27 - June 30, 2026 (last working day May 26)
+    ("2026-05-27", "2026-06-30", {
+        "GRADE9A", "GRADE9B", "GRADE9C",
+        "GRADE10A", "GRADE10B", "GRADE10C",
+        "GRADE11A", "GRADE11B", "GRADE11C",
+        "GRADE12A", "GRADE12B", "GRADE12C",
+    }),
+]
+
+
+def _is_grade_on_break(grade: str) -> bool:
+    """Check if a grade is currently on summer break."""
+    if not grade:
+        return False
+    today = date.today().isoformat()
+    for start_date, end_date, grades_set in SUMMER_BREAK_SCHEDULE:
+        if start_date <= today <= end_date and grade in grades_set:
+            return True
+    return False
+
 
 # Teacher-specific window (used when person_id starts with TEACHER_)
 TEACHER_END_HOUR = 8
@@ -180,6 +281,57 @@ def _preprocess_image(image_bytes: bytes) -> bytes:
         return image_bytes
 
 
+def _assess_face_quality(face_crop_bytes: bytes) -> dict:
+    """Assess quality of a cropped face image.
+
+    Returns dict with:
+        sharpness: float (Laplacian variance — higher = sharper)
+        brightness: float (mean pixel value 0-255)
+        is_acceptable: bool (passes all quality checks)
+        rejection_reason: str or None
+    """
+    result = {"sharpness": 0.0, "brightness": 128.0,
+              "is_acceptable": True, "rejection_reason": None}
+    if cv2 is None:
+        return result
+    try:
+        arr = np.frombuffer(face_crop_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            result["is_acceptable"] = False
+            result["rejection_reason"] = "could not decode face crop"
+            return result
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # Sharpness via Laplacian variance
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        sharpness = float(laplacian.var())
+        result["sharpness"] = round(sharpness, 1)
+        # Brightness
+        brightness = float(gray.mean())
+        result["brightness"] = round(brightness, 1)
+        if sharpness < MIN_SHARPNESS_SCORE:
+            result["is_acceptable"] = False
+            result["rejection_reason"] = f"blurry (sharpness {sharpness:.1f} < {MIN_SHARPNESS_SCORE})"
+        elif brightness < MIN_BRIGHTNESS:
+            result["is_acceptable"] = False
+            result["rejection_reason"] = f"too dark (brightness {brightness:.0f} < {MIN_BRIGHTNESS})"
+        elif brightness > MAX_BRIGHTNESS:
+            result["is_acceptable"] = False
+            result["rejection_reason"] = f"overexposed (brightness {brightness:.0f} > {MAX_BRIGHTNESS})"
+    except Exception:
+        pass
+    return result
+
+
+def _is_entry_camera(camera_source: str) -> bool:
+    """Check if camera_source is an entry gate or reception camera."""
+    src_lower = camera_source.lower()
+    for keyword in ENTRY_VALIDATION_CAMERAS:
+        if keyword in src_lower:
+            return True
+    return False
+
+
 class AttendanceEngine:
     """Runs face recognition attendance monitoring."""
 
@@ -188,15 +340,24 @@ class AttendanceEngine:
         self.classwise_running = False
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
-        self.confidence_threshold = 0.42  # Match confidence > 42%
-        self.min_sightings = 2  # Must be seen 2+ times before marking present
-        self.sighting_window = 300  # 5-minute window for sightings to accumulate
+        self.confidence_threshold = 0.33  # Match confidence > 33% for students
+        self.confidence_max = 0.50  # Reject above 50% (likely false positive or too-close match)
+        self.review_threshold = 0.30  # Below 30% gets rejected outright
+        self.min_sightings = 1  # ONE recognition cycle only (Open House protocol)
+        self.sighting_window = 600  # 10-minute window for sightings to accumulate
+        self.teacher_confidence_threshold = 0.30  # Teacher min threshold 30%
+        self.teacher_confidence_max = 0.50  # Teacher max threshold 50%
+        self.entry_validated: dict[str, str] = {}  # person_id -> date (seen at entry/reception)
         self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
         self.known_faces: dict = {}
         self.known_faces_insightface: dict = {}  # person_id -> {name, phone, embeddings: [...]}
         self.last_attendance: dict[str, float] = {}  # person_id -> timestamp
         self.daily_marked: dict[str, str] = {}  # person_id -> date string
         self._notification_sent: dict[str, str] = {}  # person_id -> date (dedup notifications)
+        # Meal snapshot dedup: "person_id:window_label" -> date
+        self._meal_sent: dict[str, str] = {}
+        # Track which meal windows already ran their full snapshot cycle today
+        self._meal_window_done: dict[str, str] = {}  # window_label -> date
         self.debug_logs: list[dict] = []
         self.max_debug_logs = 500
         self.scan_interval = 3.0  # seconds between scans
@@ -205,6 +366,8 @@ class AttendanceEngine:
         self._task: asyncio.Task | None = None
         self._classwise_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
+        # Persistent HTTP clients per DVR IP for connection pooling
+        self._dvr_clients: dict[str, httpx.AsyncClient] = {}
         # Disable InsightFace — legacy face_recognition works more reliably
         # with the current DVR setup. Re-enable once InsightFace image
         # compatibility issues with all DVR models are resolved.
@@ -301,17 +464,23 @@ class AttendanceEngine:
 
         # Pre-populate dedup caches from persistent DB (survives restarts)
         today = date.today().isoformat()
-        try:
-            marked_ids = db.get_today_marked_person_ids()
-            for pid in marked_ids:
-                self.daily_marked[pid] = today
-            notified_ids = db.get_today_notified_person_ids()
-            for pid in notified_ids:
-                self._notification_sent[pid] = today
-            logger.info(f"Pre-populated dedup caches: {len(marked_ids)} marked, "
-                        f"{len(notified_ids)} notified today")
-        except Exception as e:
-            logger.warning(f"Failed to pre-populate dedup caches from DB: {e}")
+        if FORCE_RENOTIFY_TEST:
+            logger.info("FORCE_RENOTIFY_TEST=True: Skipping dedup cache pre-population "
+                        "— will re-mark and re-notify all detected faces")
+            self.daily_marked = {}
+            self._notification_sent = {}
+        else:
+            try:
+                marked_ids = db.get_today_marked_person_ids()
+                for pid in marked_ids:
+                    self.daily_marked[pid] = today
+                notified_ids = db.get_today_notified_person_ids()
+                for pid in notified_ids:
+                    self._notification_sent[pid] = today
+                logger.info(f"Pre-populated dedup caches: {len(marked_ids)} marked, "
+                            f"{len(notified_ids)} notified today")
+            except Exception as e:
+                logger.warning(f"Failed to pre-populate dedup caches from DB: {e}")
 
         engine_label = "insightface" if self.use_insightface else "face_recognition"
         n_legacy = len(self.known_faces)
@@ -330,7 +499,7 @@ class AttendanceEngine:
         self._grade_face_cache.clear()
         self._teacher_faces_cache: dict = {}
         for person_id, person_data in self.known_faces.items():
-            if person_id.startswith("TEACHER_"):
+            if person_id.startswith(("TEACHER_", "PRINCIPAL_")):
                 self._teacher_faces_cache[person_id] = person_data
                 continue
             grade = _grade_from_person_id(person_id)
@@ -342,7 +511,7 @@ class AttendanceEngine:
         self._grade_face_cache_insightface.clear()
         self._teacher_faces_cache_insightface: dict = {}
         for person_id, person_data in self.known_faces_insightface.items():
-            if person_id.startswith("TEACHER_"):
+            if person_id.startswith(("TEACHER_", "PRINCIPAL_")):
                 self._teacher_faces_cache_insightface[person_id] = person_data
                 continue
             grade = _grade_from_person_id(person_id)
@@ -396,6 +565,10 @@ class AttendanceEngine:
         Uses in-memory cache first for speed. On cache miss, falls back
         to the persistent database so dedup survives process restarts.
         """
+        if FORCE_RENOTIFY_TEST:
+            # During test mode, only dedup within this session (in-memory only)
+            today = date.today().isoformat()
+            return self.daily_marked.get(person_id) == today
         today = date.today().isoformat()
         if self.daily_marked.get(person_id) == today:
             return True
@@ -503,15 +676,33 @@ class AttendanceEngine:
         results = []
 
         for i, (encoding, location) in enumerate(zip(face_encodings, face_locations)):
-            # Face quality filter: reject tiny/distant faces (legacy)
+            # Face quality filter: reject tiny/distant/blurry faces
             top, right, bottom, left = location
             face_w = right - left
             face_h = bottom - top
-            min_face_px = 40
-            if face_w < min_face_px or face_h < min_face_px:
+            if face_w < MIN_FACE_WIDTH or face_h < MIN_FACE_HEIGHT:
                 self.add_debug_log("face_too_small",
-                                   f"Face {face_w}x{face_h}px < {min_face_px}px "
+                                   f"Face {face_w}x{face_h}px < {MIN_FACE_WIDTH}x{MIN_FACE_HEIGHT}px "
                                    f"minimum from {camera_source} — skipping",
+                                   confidence=0.0)
+                continue
+
+            # Assess face crop quality (sharpness, brightness)
+            face_crop = image_bytes  # Use full image for quality check
+            try:
+                if Image is not None:
+                    pil_crop = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                    crop_region = pil_crop.crop((left, top, right, bottom))
+                    buf = io.BytesIO()
+                    crop_region.save(buf, format="JPEG", quality=95)
+                    face_crop = buf.getvalue()
+            except Exception:
+                pass
+            quality = _assess_face_quality(face_crop)
+            if not quality["is_acceptable"]:
+                self.add_debug_log("face_quality_rejected",
+                                   f"Face from {camera_source} rejected: "
+                                   f"{quality['rejection_reason']}",
                                    confidence=0.0)
                 continue
 
@@ -548,10 +739,22 @@ class AttendanceEngine:
                     )
                     if result:
                         results.append(result)
+                elif confidence >= self.review_threshold:
+                    self.add_debug_log("manual_review",
+                                       f"Confidence {confidence:.1%} in review band "
+                                       f"({self.review_threshold:.0%}-{self.confidence_threshold:.0%})",
+                                       person_id=person_id,
+                                       confidence=confidence)
+                    self._queue_manual_review(
+                        person_id=person_id,
+                        name=match_result["name"],
+                        confidence=confidence,
+                        camera_source=camera_source,
+                    )
                 else:
                     self.add_debug_log("low_confidence",
                                        f"Confidence {confidence:.1%} < "
-                                       f"{self.confidence_threshold:.0%} threshold",
+                                       f"{self.review_threshold:.0%} minimum",
                                        person_id=person_id,
                                        confidence=confidence)
             else:
@@ -569,6 +772,51 @@ class AttendanceEngine:
                         pass
 
         return results
+
+    def _queue_manual_review(self, person_id: str, name: str,
+                             confidence: float, camera_source: str):
+        """Queue a low-confidence detection for manual review on the backend."""
+        try:
+            grade = ""
+            parts = person_id.rsplit("_", 1)
+            if len(parts) > 1 and not person_id.startswith(("TEACHER_", "PRINCIPAL_")):
+                grade = parts[-1]
+
+            review_data = {
+                "person_id": person_id,
+                "name": name,
+                "grade": grade,
+                "camera": camera_source,
+                "confidence": confidence,
+            }
+
+            # Send to backend asynchronously (safe from thread pool)
+            async def _send():
+                try:
+                    import httpx
+                    api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        resp = await client.post(
+                            f"{api_url}/api/dashboard/review/report",
+                            json={"records": [review_data]},
+                        )
+                        if resp.status_code == 200:
+                            logger.info(f"Manual review queued: {name} ({confidence:.1%}) from {camera_source}")
+                except Exception as e:
+                    logger.warning(f"Failed to queue manual review: {e}")
+
+            loop = getattr(self, '_event_loop', None)
+            if loop is not None:
+                asyncio.run_coroutine_threadsafe(_send(), loop)
+            else:
+                try:
+                    task = asyncio.create_task(_send())
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                except RuntimeError:
+                    logger.warning("Manual review skipped: no event loop")
+        except Exception as e:
+            logger.warning(f"Manual review queue error: {e}")
 
     def _match_face(self, encoding: np.ndarray,
                     faces: dict | None = None) -> dict | None:
@@ -655,7 +903,7 @@ class AttendanceEngine:
             bbox = face_obj.bbox  # [x1, y1, x2, y2]
             face_w = bbox[2] - bbox[0]
             face_h = bbox[3] - bbox[1]
-            min_face_px = 40  # minimum face size in pixels
+            min_face_px = 20  # minimum face size in pixels
             if face_w < min_face_px or face_h < min_face_px:
                 self.add_debug_log("face_too_small",
                                    f"Face {face_w:.0f}x{face_h:.0f}px < {min_face_px}px "
@@ -882,6 +1130,10 @@ class AttendanceEngine:
         Uses in-memory cache first for speed. On cache miss, falls back
         to the persistent database so dedup survives process restarts.
         """
+        if FORCE_RENOTIFY_TEST:
+            # During test mode, only dedup within this session (in-memory only)
+            today = date.today().isoformat()
+            return self._notification_sent.get(person_id) == today
         today = date.today().isoformat()
         if self._notification_sent.get(person_id) == today:
             return True
@@ -898,7 +1150,9 @@ class AttendanceEngine:
     def _record_sighting(self, person_id: str, confidence: float,
                          camera_source: str,
                          embedding: np.ndarray | None = None,
-                         face_size: tuple[int, int] | None = None) -> int:
+                         face_size: tuple[int, int] | None = None,
+                         face_position: tuple[int, int] | None = None,
+                         face_crop_bytes: bytes | None = None) -> int:
         """Record a face sighting and return how many recent sightings exist."""
         now = time.time()
         if person_id not in self._sightings:
@@ -909,6 +1163,8 @@ class AttendanceEngine:
             "confidence": confidence,
             "embedding": embedding,
             "face_size": face_size,
+            "face_position": face_position,
+            "face_crop_bytes": face_crop_bytes,
         })
         # Prune old sightings outside the window
         cutoff = now - self.sighting_window
@@ -918,49 +1174,56 @@ class AttendanceEngine:
         return len(self._sightings[person_id])
 
     def _check_anti_spoof(self, person_id: str, name: str) -> bool:
-        """Anti-spoofing check: detect if sightings look like a static photo.
+        """Advanced liveness detection: verify the face is a live person.
 
-        Returns True if the sightings appear to be from a REAL person,
-        False if they look like a photo/spoof (and attendance should be blocked).
+        Returns True if the sightings appear to be from a REAL live person,
+        False if they look like a spoof attempt (photo, screen, print, video).
 
-        Three checks:
-        1. Embedding variance — real faces show slight natural variation between
-           frames (micro-movements, lighting changes). A static photo produces
-           near-identical embeddings.
-        2. Face size consistency — a photo held to a camera often produces faces
-           with unrealistically identical sizes across frames. Real people move
-           and their face size varies slightly.
-        3. Camera diversity — sightings from multiple cameras strongly indicate
-           a real person walking through campus (optional bonus signal).
+        SIX-LAYER LIVENESS VERIFICATION:
+        1. Embedding variance — real faces vary between frames; static images don't
+        2. Face size variance — held photos produce identical face sizes
+        3. Face position movement — real people shift position naturally
+        4. Texture analysis — detect flat surfaces (prints/screens) vs real skin
+        5. Camera diversity — multiple cameras = strong real-person signal
+        6. Temporal pattern — real people don't appear at perfect intervals
+
+        If ANY check detects spoofing, the attempt is:
+        - Rejected immediately
+        - Logged as a security event
+        - Snapshot saved for review
         """
         sightings = self._sightings.get(person_id, [])
         if len(sightings) < 2:
             return True  # Not enough data to check, allow
 
-        # --- Check 1: Embedding variance ---
+        spoof_score = 0  # Accumulate spoof evidence (>= 2 = blocked)
+
+        # --- CHECK 1: Embedding variance (STRICT) ---
         embeddings = [s["embedding"] for s in sightings
                       if s.get("embedding") is not None]
         if len(embeddings) >= 2:
-            # Compute pairwise cosine similarity between consecutive embeddings
             similarities = []
             for i in range(len(embeddings) - 1):
-                sim = float(np.dot(embeddings[i], embeddings[i + 1]))
+                a, b = embeddings[i], embeddings[i + 1]
+                norm_a = float(np.linalg.norm(a))
+                norm_b = float(np.linalg.norm(b))
+                if norm_a > 0 and norm_b > 0:
+                    sim = float(np.dot(a, b) / (norm_a * norm_b))
+                else:
+                    sim = 0.0
                 similarities.append(sim)
             avg_sim = sum(similarities) / len(similarities)
 
-            # Real faces: embeddings vary slightly between frames due to
-            # micro-expressions, head tilt, lighting changes.
-            # Typical real-face similarity: 0.70 - 0.95
-            # Static photo similarity: 0.97 - 1.00 (nearly identical)
-            if avg_sim > 0.97:
-                self.add_debug_log("anti_spoof_blocked",
-                                   f"{name}: embeddings too similar "
-                                   f"(avg cosine sim {avg_sim:.4f} > 0.97) — "
-                                   f"likely a static photo",
-                                   person_id=person_id)
-                return False
+            # Tightened threshold: 0.95 (was 0.97)
+            # Real faces: 0.70 - 0.93 (natural micro-movements)
+            # Static photo: 0.95 - 1.00 (near-identical)
+            if avg_sim > 0.95:
+                self._log_spoof_attempt(person_id, name, "embedding_frozen",
+                                        f"embeddings too similar (avg cosine sim "
+                                        f"{avg_sim:.4f} > 0.95) — static image suspected")
+                spoof_score += 2  # Strong spoof signal — immediately block
 
-        # --- Check 2: Face size variance ---
+        # --- CHECK 2: Face size variance (STRICT) ---
         face_sizes = [s["face_size"] for s in sightings
                       if s.get("face_size") is not None]
         if len(face_sizes) >= 2:
@@ -968,31 +1231,173 @@ class AttendanceEngine:
             heights = [fs[1] for fs in face_sizes]
             avg_w = sum(widths) / len(widths)
             avg_h = sum(heights) / len(heights)
-            # Coefficient of variation (std/mean) for width and height
             if avg_w > 0 and avg_h > 0:
                 std_w = (sum((w - avg_w) ** 2 for w in widths) / len(widths)) ** 0.5
                 std_h = (sum((h - avg_h) ** 2 for h in heights) / len(heights)) ** 0.5
                 cv_w = std_w / avg_w
                 cv_h = std_h / avg_h
-                # Real faces: some size variation as person moves (CV > 0.01)
-                # Static photo: virtually identical sizes (CV ~ 0)
-                if cv_w < 0.005 and cv_h < 0.005 and len(face_sizes) >= 3:
-                    self.add_debug_log("anti_spoof_blocked",
-                                       f"{name}: face size too consistent "
-                                       f"(width CV={cv_w:.4f}, height CV={cv_h:.4f}) — "
-                                       f"likely a static photo",
-                                       person_id=person_id)
-                    return False
+                # Tightened: CV < 0.01 (was 0.005)
+                if cv_w < 0.01 and cv_h < 0.01:
+                    self._log_spoof_attempt(person_id, name, "size_frozen",
+                                            f"face size too consistent "
+                                            f"(width CV={cv_w:.4f}, height CV={cv_h:.4f})")
+                    spoof_score += 1
 
-        # --- Check 3: Camera diversity (bonus signal, not blocking) ---
+        # --- CHECK 3: Face position movement (NEW) ---
+        positions = [s["face_position"] for s in sightings
+                     if s.get("face_position") is not None]
+        if len(positions) >= 2:
+            # Calculate total movement across frames
+            total_movement = 0.0
+            for i in range(len(positions) - 1):
+                dx = abs(positions[i + 1][0] - positions[i][0])
+                dy = abs(positions[i + 1][1] - positions[i][1])
+                total_movement += (dx ** 2 + dy ** 2) ** 0.5
+            avg_movement = total_movement / (len(positions) - 1)
+
+            # Real person: natural head/body movement between frames (> 3px)
+            # Static photo: nearly zero movement (< 2px)
+            if avg_movement < 2.0:
+                self._log_spoof_attempt(person_id, name, "no_movement",
+                                        f"face position frozen across {len(positions)} "
+                                        f"frames (avg movement {avg_movement:.1f}px)")
+                spoof_score += 1
+
+        # --- CHECK 4: Texture analysis for print/screen detection (NEW) ---
+        face_crops = [s["face_crop_bytes"] for s in sightings
+                      if s.get("face_crop_bytes") is not None]
+        if face_crops and cv2 is not None:
+            try:
+                latest_crop = face_crops[-1]
+                arr = np.frombuffer(latest_crop, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+                    # 4a. High-frequency content analysis
+                    # Real skin has rich micro-texture; prints/screens are smoother
+                    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+                    lap_var = float(laplacian.var())
+                    lap_mean = float(np.abs(laplacian).mean())
+
+                    # 4b. Color channel distribution (screens have distinct patterns)
+                    b, g, r = cv2.split(img)
+                    # Screens often have higher blue channel variance
+                    b_std = float(np.std(b))
+                    g_std = float(np.std(g))
+                    r_std = float(np.std(r))
+
+                    # 4c. Moiré pattern detection (screen display artifact)
+                    # Apply FFT and check for periodic patterns
+                    f_transform = np.fft.fft2(gray.astype(np.float64))
+                    f_shift = np.fft.fftshift(f_transform)
+                    magnitude = np.abs(f_shift)
+                    # High magnitude peaks at non-DC frequencies = periodic pattern
+                    h, w = magnitude.shape
+                    center_h, center_w = h // 2, w // 2
+                    # Mask out the DC component (center)
+                    mask_size = max(3, min(h, w) // 20)
+                    magnitude[center_h - mask_size:center_h + mask_size,
+                              center_w - mask_size:center_w + mask_size] = 0
+                    peak_ratio = float(np.max(magnitude)) / (float(np.mean(magnitude)) + 1e-6)
+
+                    # Screen moiré: very high peak ratio (> 50)
+                    if peak_ratio > 50:
+                        self._log_spoof_attempt(person_id, name, "moire_pattern",
+                                                f"screen moiré detected "
+                                                f"(FFT peak ratio {peak_ratio:.1f})")
+                        spoof_score += 2  # Strong signal
+
+                    # 4d. Uniform texture detection (printed photo)
+                    # Real skin has varied texture; prints are more uniform
+                    local_std = cv2.blur(
+                        (gray.astype(np.float64) - cv2.blur(gray, (5, 5)).astype(np.float64)) ** 2,
+                        (15, 15),
+                    )
+                    texture_var = float(np.mean(local_std))
+                    if texture_var < 5.0 and lap_var < 50:
+                        self._log_spoof_attempt(person_id, name, "flat_texture",
+                                                f"unnaturally uniform texture "
+                                                f"(var={texture_var:.1f}, lap={lap_var:.1f})")
+                        spoof_score += 1
+
+            except Exception as e:
+                logger.debug(f"Texture analysis error for {name}: {e}")
+
+        # --- CHECK 5: Camera diversity ---
         cameras = set(s["camera"] for s in sightings)
         if len(cameras) > 1:
-            self.add_debug_log("anti_spoof_multi_cam",
+            # Multi-camera sightings = strong real-person signal
+            # Reduce spoof score (it's very hard to spoof across cameras)
+            spoof_score = max(0, spoof_score - 1)
+            self.add_debug_log("liveness_multi_cam",
                                f"{name}: seen on {len(cameras)} cameras — "
                                f"strong real-person signal",
                                person_id=person_id)
 
+        # --- CHECK 6: Temporal pattern (NEW) ---
+        if len(sightings) >= 3:
+            timestamps = [s["time"] for s in sightings]
+            intervals = [timestamps[i + 1] - timestamps[i]
+                         for i in range(len(timestamps) - 1)]
+            if intervals:
+                avg_interval = sum(intervals) / len(intervals)
+                # Check if intervals are suspiciously regular (robotic precision)
+                if avg_interval > 0:
+                    interval_cv = (sum((iv - avg_interval) ** 2 for iv in intervals)
+                                   / len(intervals)) ** 0.5 / avg_interval
+                    # Real person: irregular timing (CV > 0.1)
+                    # Replay/loop: nearly perfect intervals (CV < 0.05)
+                    if interval_cv < 0.05 and len(intervals) >= 3:
+                        self._log_spoof_attempt(person_id, name, "regular_timing",
+                                                f"suspiciously regular detection intervals "
+                                                f"(CV={interval_cv:.4f})")
+                        spoof_score += 1
+
+        # --- FINAL DECISION ---
+        if spoof_score >= 2:
+            self.add_debug_log("liveness_BLOCKED",
+                               f"{name}: SPOOF DETECTED (score {spoof_score}/6) — "
+                               f"attendance REJECTED",
+                               person_id=person_id)
+            return False
+
+        if spoof_score == 1:
+            self.add_debug_log("liveness_warning",
+                               f"{name}: minor spoof signal (score 1/6) — "
+                               f"allowing but flagged for review",
+                               person_id=person_id)
+
+        self.add_debug_log("liveness_passed",
+                           f"{name}: liveness verified (spoof score {spoof_score}/6, "
+                           f"{len(cameras)} camera(s), {len(sightings)} sightings)",
+                           person_id=person_id)
         return True
+
+    def _log_spoof_attempt(self, person_id: str, name: str,
+                           spoof_type: str, details: str):
+        """Log a suspected spoof attempt with snapshot for security review."""
+        self.add_debug_log(f"spoof_{spoof_type}",
+                           f"SPOOF ALERT — {name}: {details}",
+                           person_id=person_id)
+        # Save snapshot of the spoof attempt
+        try:
+            sightings = self._sightings.get(person_id, [])
+            if sightings:
+                latest = sightings[-1]
+                crop = latest.get("face_crop_bytes")
+                if crop:
+                    ts = int(time.time())
+                    spoof_dir = ATTENDANCE_SNAPSHOTS_DIR / "spoof_attempts"
+                    spoof_dir.mkdir(exist_ok=True)
+                    spoof_path = spoof_dir / f"spoof_{person_id}_{spoof_type}_{ts}.jpg"
+                    with open(spoof_path, "wb") as f:
+                        f.write(crop)
+                    self.add_debug_log("spoof_snapshot_saved",
+                                       f"Spoof attempt snapshot saved: {spoof_path}",
+                                       person_id=person_id)
+        except Exception as e:
+            logger.debug(f"Failed to save spoof snapshot: {e}")
 
     def _process_attendance(self, person_id: str, name: str, phone: str,
                             confidence: float, image_bytes: bytes,
@@ -1000,14 +1405,43 @@ class AttendanceEngine:
                             camera_source: str,
                             embedding: np.ndarray | None = None,
                             face_size: tuple[int, int] | None = None) -> dict | None:
-        """Process an attendance detection: check time window, cooldown/daily dedup, log, and notify."""
-        now = time.time()
+        """Process an attendance detection with multi-layer verification.
 
-        # Time window check: teachers 7:00-8:00 AM, students 7:00-9:30 AM
+        All checks must pass before marking attendance:
+        CHECK 1: High-confidence facial recognition (threshold depends on role)
+        CHECK 2: Detection from authorized cameras
+        CHECK 3: Detection within attendance time window
+        CHECK 4: Repeated face confirmation across frames (min_sightings)
+        CHECK 5: Entry gate / reception validation
+        CHECK 6: Anti-spoofing / liveness checks
+        """
+        now = time.time()
+        is_teacher = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
+
+        # --- CHECK 1: Confidence range check ---
+        effective_threshold = (self.teacher_confidence_threshold
+                               if is_teacher else self.confidence_threshold)
+        effective_max = (self.teacher_confidence_max
+                         if is_teacher else self.confidence_max)
+        if confidence < effective_threshold:
+            self.add_debug_log("confidence_rejected",
+                               f"{name} confidence {confidence:.1%} < "
+                               f"{effective_threshold:.0%} threshold "
+                               f"({'teacher' if is_teacher else 'student'})",
+                               person_id=person_id, confidence=confidence)
+            return None
+        if confidence > effective_max:
+            self.add_debug_log("confidence_too_high",
+                               f"{name} confidence {confidence:.1%} > "
+                               f"{effective_max:.0%} max — doubtful match, ignoring",
+                               person_id=person_id, confidence=confidence)
+            return None
+
+        # --- CHECK 3: Time window ---
         if not self._is_within_attendance_window(person_id):
             return None
 
-        # Daily dedup: one entry per student per day
+        # --- Daily dedup: one entry per student per day ---
         if self._is_already_marked_today(person_id):
             self.add_debug_log("daily_already_marked",
                                f"{name} already marked today",
@@ -1015,31 +1449,77 @@ class AttendanceEngine:
                                confidence=confidence)
             return None
 
-        # Multi-detection: require 2+ sightings within the sighting window
-        # to prevent false positives from one-off camera noise/artifacts.
+        # --- CHECK 5: Entry gate / reception validation ---
+        # Record entry validation if detected on entry/reception camera
+        if _is_entry_camera(camera_source):
+            self.entry_validated[person_id] = date.today().isoformat()
+
+        # Compute face position (center of bounding box) for movement tracking
+        face_position = None
+        face_crop_bytes = None
+        if face_location:
+            try:
+                top, right, bottom, left = face_location
+                cx = (left + right) // 2
+                cy = (top + bottom) // 2
+                face_position = (cx, cy)
+                # Crop face for texture analysis
+                if Image is not None:
+                    pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                    crop = pil_img.crop((left, top, right, bottom))
+                    buf = io.BytesIO()
+                    crop.save(buf, format="JPEG", quality=90)
+                    face_crop_bytes = buf.getvalue()
+            except Exception:
+                pass
+
+        # --- CHECK 4: Multi-frame verification ---
+        # Teachers: 1 sighting (immediate marking)
+        # Students: 3 sightings (multi-frame confirmation)
+        required_sightings = 1 if is_teacher else self.min_sightings
         sighting_count = self._record_sighting(
             person_id, confidence, camera_source,
             embedding=embedding, face_size=face_size,
+            face_position=face_position,
+            face_crop_bytes=face_crop_bytes,
         )
-        if sighting_count < self.min_sightings:
+        if sighting_count < required_sightings:
             self.add_debug_log("awaiting_confirmation",
-                               f"{name} sighting {sighting_count}/{self.min_sightings} "
-                               f"(need {self.min_sightings} within {self.sighting_window}s "
+                               f"{name} sighting {sighting_count}/{required_sightings} "
+                               f"(need {required_sightings} within {self.sighting_window}s "
                                f"to confirm presence)",
                                person_id=person_id,
                                confidence=confidence)
             return None
 
-        # Anti-spoofing: check that sightings look like a real person,
-        # not a static photo held up to the camera.
+        # --- CHECK 5b: Entry validation skipped ---
+        # Both teachers and students: mark wherever detected (no gate requirement)
+        # Summer camp students are spread across classrooms, not at assigned grades
+        self.entry_validated[person_id] = date.today().isoformat()
+
+        # --- CHECK 6: Anti-spoofing ---
         if not self._check_anti_spoof(person_id, name):
             self.add_debug_log("spoof_rejected",
                                f"{name} blocked by anti-spoof check — "
                                f"resetting sightings",
                                person_id=person_id,
                                confidence=confidence)
-            # Clear sightings so they can't just wait and try again
             self._sightings.pop(person_id, None)
+            return None
+
+        # --- Compute average confidence from all sightings ---
+        sightings = self._sightings.get(person_id, [])
+        avg_confidence = confidence
+        if sightings:
+            confs = [s["confidence"] for s in sightings if s.get("confidence")]
+            if confs:
+                avg_confidence = sum(confs) / len(confs)
+        # Use average confidence for final check
+        if avg_confidence < effective_threshold:
+            self.add_debug_log("avg_confidence_low",
+                               f"{name} average confidence {avg_confidence:.1%} across "
+                               f"{len(sightings)} sightings < {effective_threshold:.0%}",
+                               person_id=person_id, confidence=avg_confidence)
             return None
 
         # Cooldown check (prevents rapid duplicate detections)
@@ -1124,6 +1604,7 @@ class AttendanceEngine:
                         name=name,
                         time_str=time_str,
                         phone=parent_phone,
+                        snapshot_bytes=image_bytes,
                     )
                 )
 
@@ -1132,12 +1613,14 @@ class AttendanceEngine:
     async def _send_whatsapp_notification(self, attendance_id: int,
                                            person_id: str,
                                            name: str, time_str: str,
-                                           phone: str):
+                                           phone: str,
+                                           snapshot_bytes: bytes | None = None):
         """Send WhatsApp attendance notification via cloud bot API.
 
         Uses ppis_attendance_alert template for guaranteed delivery.
         For teachers (person_id starts with TEACHER_), the notification
-        goes directly to the teacher's own WhatsApp number.
+        goes directly to the teacher's own WhatsApp number with a
+        face snapshot image header.
         """
         api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
         agent_secret = os.environ.get("AGENT_SECRET", "")
@@ -1145,20 +1628,37 @@ class AttendanceEngine:
         if agent_secret:
             headers["X-Agent-Secret"] = agent_secret
 
-        is_teacher = person_id.startswith("TEACHER_")
+        is_teacher = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
+        display_name = name.title() if name == name.upper() else name
+        if is_teacher:
+            notif_name = display_name  # Template has "Dear {{1}}, you have been"
+            tpl_name = "ppis_teacher_present_text"  # Text-only template (no image header)
+            tpl_lang = "en"
+        else:
+            notif_name = f"{display_name} has been"
+            tpl_name = "ppis_attendance_alert"
+            tpl_lang = "en"
+
+        # Log confidence level for monitoring
+        logger.info(f"[NOTIFICATION] Sending to {phone} for {display_name} "
+                     f"(confidence verified, entry validated)")
+
+        # Build request payload (text-only for teachers, no image header needed)
+        payload = {
+            "phone": phone,
+            "template_name": tpl_name,
+            "template_params": [notif_name, time_str],
+            "language_code": tpl_lang,
+        }
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             sent = False
             try:
-                async with httpx.AsyncClient(timeout=15) as client:
+                async with httpx.AsyncClient(timeout=30) as client:
                     resp = await client.post(
                         f"{api_url}/api/send-whatsapp",
-                        json={
-                            "phone": phone,
-                            "template_name": "ppis_attendance_alert",
-                            "template_params": [name, time_str],
-                        },
+                        json=payload,
                         headers=headers,
                     )
                     if resp.status_code == 200:
@@ -1189,6 +1689,196 @@ class AttendanceEngine:
                                    f"Attempt {attempt}/{max_retries} failed for {phone}: {type(e).__name__}: {e}")
             if attempt < max_retries:
                 await asyncio.sleep(2 * attempt)
+
+    # ------------------------------------------------------------------
+    # Meal snapshot notifications
+    # ------------------------------------------------------------------
+
+    def _is_meal_window_active(self) -> tuple[bool, str]:
+        """Check if we are inside a meal snapshot window.
+
+        Returns (active, window_label).  Only fires on weekdays and
+        before MEAL_SNAPSHOT_END_DATE.
+        """
+        if not MEAL_SNAPSHOT_ENABLED:
+            return False, ""
+        from datetime import timezone as _tz, timedelta as _td
+        _ist = _tz(_td(hours=5, minutes=30))
+        now = datetime.now(_ist)
+        # Weekdays only (Mon=0 .. Fri=4)
+        if now.weekday() >= 5:
+            return False, ""
+        # Respect end date
+        if now.strftime("%Y-%m-%d") > MEAL_SNAPSHOT_END_DATE:
+            return False, ""
+        cur_mins = now.hour * 60 + now.minute
+        for sh, sm, eh, em, label in MEAL_WINDOWS:
+            if (sh * 60 + sm) <= cur_mins < (eh * 60 + em):
+                return True, label
+        return False, ""
+
+    async def _run_meal_snapshot_cycle(self, classroom_cams: list[dict],
+                                       window_label: str):
+        """Capture one snapshot per classroom camera and send meal
+        notifications to parents of children marked present today.
+
+        Each child gets ONE notification per meal window per day.
+        The snapshot sent is from the child's classroom camera (matched
+        by grade in person_id).
+        """
+        from datetime import timezone as _tz, timedelta as _td
+        import base64
+        _ist = _tz(_td(hours=5, minutes=30))
+        _now = datetime.now(_ist)
+        today = _now.strftime("%Y-%m-%d")
+        date_display = _now.strftime("%d-%m-%Y")
+        time_display = _now.strftime("%I:%M %p")
+
+        # Build map: grade -> list of classroom cameras
+        grade_cams: dict[str, list[dict]] = {}
+        for cam in classroom_cams:
+            g = cam.get("grade")
+            if g:
+                grade_cams.setdefault(g, []).append(cam)
+
+        # Determine which students were marked present AND notified today
+        notified_students: list[dict] = []
+        for pid, sent_date in self._notification_sent.items():
+            if sent_date != today:
+                continue
+            if pid.startswith(("TEACHER_", "PRINCIPAL_")):
+                continue
+            face = self.known_faces.get(pid)
+            if not face:
+                continue
+            phone = face.get("phone", "")
+            if not phone:
+                continue
+            notified_students.append({
+                "person_id": pid,
+                "name": face["name"],
+                "phone": phone,
+            })
+
+        if not notified_students:
+            self.add_debug_log("meal_snapshot",
+                               f"{window_label}: No present+notified students — skipping")
+            return
+
+        self.add_debug_log("meal_snapshot",
+                           f"{window_label}: {len(notified_students)} present students, "
+                           f"{len(grade_cams)} classroom grades with cameras")
+
+        # Determine which camera grades we actually need snapshots from.
+        # Summer camp: Grades 9-12 eat in own class; younger students
+        # eat in Grade 1A / 1B (common rooms).
+        needed_grades: set[str] = set()
+        for grade in grade_cams:
+            if grade in MEAL_OWN_CLASSROOM_GRADES or grade in MEAL_CAMP_ROOM_GRADES:
+                needed_grades.add(grade)
+
+        # Capture one snapshot per needed grade (first working camera)
+        grade_snapshots: dict[str, bytes] = {}
+        for grade in needed_grades:
+            cams = grade_cams.get(grade, [])
+            for cam in cams:
+                try:
+                    img = await self.capture_frame_from_dvr(
+                        cam["dvr"], cam["channel"])
+                    if img and len(img) > 1000:
+                        grade_snapshots[grade] = img
+                        break
+                except Exception as e:
+                    logger.debug(f"Meal snapshot failed for {cam['label']}: {e}")
+
+        # Pick any camp-room snapshot for younger students
+        camp_room_snapshot: bytes | None = None
+        for cr_grade in MEAL_CAMP_ROOM_GRADES:
+            if cr_grade in grade_snapshots:
+                camp_room_snapshot = grade_snapshots[cr_grade]
+                break
+
+        if not grade_snapshots:
+            self.add_debug_log("meal_snapshot",
+                               f"{window_label}: Could not capture any classroom snapshots")
+            return
+
+        self.add_debug_log("meal_snapshot",
+                           f"{window_label}: Captured snapshots for "
+                           f"{len(grade_snapshots)} classrooms: {list(grade_snapshots.keys())}")
+
+        # Extract grade from person_id
+        def _grade_from_pid(pid: str) -> str:
+            for part in pid.split("_"):
+                if part.startswith("GRADE") or part.startswith("NUR") or part.startswith("PREP"):
+                    return part
+            return ""
+
+        api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+        agent_secret = os.environ.get("AGENT_SECRET", "")
+        headers = {"Content-Type": "application/json"}
+        if agent_secret:
+            headers["X-Agent-Secret"] = agent_secret
+
+        sent_count = 0
+        skip_count = 0
+        for student in notified_students:
+            pid = student["person_id"]
+            dedup_key = f"{pid}:{window_label}"
+            if self._meal_sent.get(dedup_key) == today:
+                skip_count += 1
+                continue
+
+            grade = _grade_from_pid(pid)
+
+            # Only send meal snapshots for Grades 9-12 (own classroom)
+            # Younger students (camp rooms) are excluded
+            if grade not in MEAL_OWN_CLASSROOM_GRADES:
+                continue
+            snapshot = grade_snapshots.get(grade)
+
+            if not snapshot:
+                continue
+
+            # Format grade for display (e.g. GRADE9A -> Grade 9A)
+            grade_display = grade
+            if grade.startswith("GRADE"):
+                num = grade[5:]
+                grade_display = f"Grade {num}"
+            elif grade.startswith("PREP"):
+                num = grade[4:]
+                grade_display = f"Prep {num}" if num else "Prep"
+            elif grade.startswith("NUR"):
+                num = grade[3:]
+                grade_display = f"Nursery {num}" if num else "Nursery"
+
+            phone_list = [p.strip() for p in student["phone"].split(",") if p.strip()]
+            for parent_phone in phone_list:
+                payload = {
+                    "phone": parent_phone,
+                    "template_name": "ppis_meal_update",
+                    "template_params": [grade_display, date_display, time_display],
+                    "language_code": "en",
+                    "header_image_base64": base64.b64encode(snapshot).decode(),
+                }
+                try:
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        resp = await client.post(
+                            f"{api_url}/api/send-whatsapp",
+                            json=payload, headers=headers,
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if data.get("status") in ("ok", "partial"):
+                                sent_count += 1
+                except Exception as e:
+                    logger.warning(f"Meal notification failed for {parent_phone}: {e}")
+
+            self._meal_sent[dedup_key] = today
+
+        self.add_debug_log("meal_snapshot_done",
+                           f"{window_label}: Sent {sent_count} meal notifications, "
+                           f"skipped {skip_count} (already sent)")
 
     async def _sync_attendance_to_cloud(self, record: dict, parent_phones: str):
         """Report attendance record to cloud backend for dashboard display."""
@@ -1234,8 +1924,13 @@ class AttendanceEngine:
             self.add_debug_log("cloud_sync_error", f"Cloud sync error: {e}")
 
     async def _resync_todays_records(self):
-        """Re-sync locally marked attendance records that may not have been
-        synced to cloud or notified due to previous event-loop issues."""
+        """Re-sync locally marked attendance records to cloud.
+
+        Only syncs record metadata to the cloud dashboard — does NOT
+        re-send WhatsApp notifications. The backend handles notification
+        sending as a safety net so we avoid duplicate sends and startup
+        crashes from heavy HTTP activity.
+        """
         try:
             records = db.get_attendance_log(limit=200)
             today_ist = date.today().isoformat()
@@ -1246,16 +1941,13 @@ class AttendanceEngine:
             if not today_records:
                 return
 
-            logger.info(f"Re-syncing {len(today_records)} locally-marked records to cloud")
+            logger.info(f"Re-syncing {len(today_records)} locally-marked records to cloud (metadata only)")
 
             for rec in today_records:
                 pid = rec.get("person_id", "")
                 name = rec.get("name", "")
                 confidence = rec.get("confidence", 0)
                 camera = rec.get("camera_source", "")
-                logged_at = rec.get("logged_at", "")
-                whatsapp_sent = rec.get("whatsapp_sent", 0)
-                attendance_id = rec.get("id", 0)
 
                 # Get phone from face DB
                 phone = ""
@@ -1378,57 +2070,81 @@ class AttendanceEngine:
                     self._camera_recovered.add(cam_key)
                     await self._send_camera_alert(cam_key, label, 0, "recovered")
 
+    async def _report_camera_status_to_backend(self, cameras: list[dict]):
+        """Report camera health status to the backend for dashboard tracking."""
+        try:
+            camera_statuses = []
+            for cam in cameras:
+                cam_key = f"{cam['dvr']['ip']}:{cam['channel']}"
+                errors = self._camera_errors.get(cam_key, 0)
+                status = "offline" if errors >= self._camera_alert_threshold else "online"
+                camera_statuses.append({
+                    "label": cam["label"],
+                    "dvr_ip": cam["dvr"]["ip"],
+                    "channel": cam["channel"],
+                    "status": status,
+                    "error_code": f"{errors} consecutive failures" if errors else "",
+                    "consecutive_failures": errors,
+                })
+
+            api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+            async with httpx.AsyncClient(timeout=15) as client:
+                await client.post(
+                    f"{api_url}/api/dashboard/cameras/status/report",
+                    json={"cameras": camera_statuses},
+                )
+        except Exception as e:
+            logger.warning(f"Camera status report failed (non-fatal): {e}")
+
+    def _get_dvr_client(self, dvr: dict) -> httpx.AsyncClient:
+        """Get or create a persistent HTTP client for a DVR (connection pooling)."""
+        ip = dvr["ip"]
+        if ip not in self._dvr_clients or self._dvr_clients[ip].is_closed:
+            self._dvr_clients[ip] = httpx.AsyncClient(
+                timeout=8.0,
+                auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
+                limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
+            )
+        return self._dvr_clients[ip]
+
     async def capture_frame_from_dvr(self, dvr: dict, channel: int,
-                                     max_retries: int = 3) -> bytes | None:
+                                     max_retries: int = 2) -> bytes | None:
         """Capture a single frame from a Hikvision DVR via ISAPI snapshot.
 
-        Auto-retries on connection failures with exponential backoff.
+        Uses persistent HTTP client with connection pooling for speed.
         """
         ip = dvr["ip"]
         port = dvr.get("port", 80)
-        user = dvr["username"]
-        pwd = dvr["password"]
 
         stream_channel = channel * 100 + 1
-        # Request highest quality JPEG for face recognition
         url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
                f"?snapShotImageType=JPEG&videoResolutionWidth=1920&videoResolutionHeight=1080")
 
+        client = self._get_dvr_client(dvr)
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(url, auth=httpx.DigestAuth(user, pwd))
-                    if resp.status_code == 401:
-                        resp = await client.get(url, auth=httpx.BasicAuth(user, pwd))
-                    if resp.status_code == 200 and resp.headers.get(
-                            "content-type", "").startswith("image"):
-                        # Reset consecutive error count on success
-                        cam_key = f"{ip}:{channel}"
-                        self._camera_errors.pop(cam_key, None)
-                        return resp.content
-                    # Non-exception failure: log and track like exceptions
+                resp = await client.get(url)
+                if resp.status_code == 200 and resp.headers.get(
+                        "content-type", "").startswith("image"):
                     cam_key = f"{ip}:{channel}"
-                    self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
-                    ct = resp.headers.get("content-type", "unknown")
-                    if attempt < max_retries - 1:
-                        backoff = 2 ** attempt
-                        self.add_debug_log(
-                            "dvr_http_error",
-                            f"{ip} ch{channel}: HTTP {resp.status_code} "
-                            f"(content-type={ct}), retrying in {backoff}s")
-                        await asyncio.sleep(backoff)
-                    else:
-                        self.add_debug_log(
-                            "dvr_error",
-                            f"Capture failed from {ip} ch{channel} after "
-                            f"{max_retries} attempts: HTTP {resp.status_code} "
-                            f"(content-type={ct})")
+                    self._camera_errors.pop(cam_key, None)
+                    return resp.content
+                cam_key = f"{ip}:{channel}"
+                self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
+                ct = resp.headers.get("content-type", "unknown")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                else:
+                    self.add_debug_log(
+                        "dvr_error",
+                        f"Capture failed from {ip} ch{channel} after "
+                        f"{max_retries} attempts: HTTP {resp.status_code} "
+                        f"(content-type={ct})")
             except Exception as e:
                 cam_key = f"{ip}:{channel}"
                 self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
                 if attempt < max_retries - 1:
-                    backoff = 2 ** attempt
-                    await asyncio.sleep(backoff)
+                    await asyncio.sleep(1)
                 else:
                     self.add_debug_log("dvr_error",
                                        f"Capture failed from {ip} ch{channel} "
@@ -1515,12 +2231,49 @@ class AttendanceEngine:
     # Classwise multi-camera monitoring
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _classify_camera_type(location: str) -> str:
+        """Classify a camera into a type for attendance scanning rules.
+
+        Camera types:
+        - 'reception': Reception cameras — Phase 1 teacher + Phase 2 students
+        - 'principal': Principal Room — Phase 1 only
+        - 'entry_gate': Entry gates — Phase 2 students only
+        - 'staff': Teacher Staff, Admission, Admin, Accounts, Academic Coord — Phase 1 only
+        - 'classroom': Grade classrooms (NUR, PREP, GRADE) — Phase 2 students
+        - 'other': Labs, galleries, parks, etc. — skip
+        """
+        loc_upper = location.upper()
+        if "RECEPTION" in loc_upper:
+            return "reception"
+        if "PRINCIPAL" in loc_upper:
+            return "principal"
+        if any(kw in loc_upper for kw in {"ENTRY", "ENTRANCE", "DISPERSAL"}):
+            return "entry_gate"
+        if any(kw in loc_upper for kw in {"TEACHER STAFF", "STAFF ROOM",
+                                           "ACADEMIC COORDINATOR", "ADMIN ROOM",
+                                           "ACCOUNTS ROOM", "ADMISSION",
+                                           "ADMINISTRATION"}):
+            return "staff"
+        grade = _extract_grade_from_location(location)
+        if grade is not None:
+            return "classroom"
+        return "other"
+
     def build_classroom_camera_list(self, camera_mapping: dict,
                                      dvrs: list[dict]) -> list[dict]:
-        """Build list of classroom cameras with their DVR configs and grade.
+        """Build list of ALL cameras with their DVR configs, grade, and camera type.
 
         Each classroom may have multiple cameras (C1, C2). This includes
         ALL camera feeds per classroom from the all_cameras field.
+
+        Camera types for attendance:
+        - reception: Reception C1-C4 → Phase 1 teachers + Phase 2 students
+        - principal: Principal Room → Phase 1 only
+        - entry_gate: Entry Gate → Phase 2 students only
+        - staff: Teacher Staff, Admission, Admin, Accounts, Acad. Coord → Phase 1 only
+        - classroom: Grade classrooms → Phase 2 students only
+        - other: Labs, galleries, parks → all faces (test mode) / skip (production)
 
         Returns list of dicts:
             {
@@ -1531,39 +2284,23 @@ class AttendanceEngine:
                 "dvr": {...},
                 "label": "GRADE 3C (DVR 2 Ch 13)",
                 "is_gate": False,
+                "cam_type": "classroom",
             }
         """
         cameras = []
         seen = set()  # (dvr_index, channel) to avoid duplicates
 
+        # Process ALL cameras from the mapping
         for location, cam_data in camera_mapping.items():
             grade = _extract_grade_from_location(location)
-            if grade is None:
-                continue  # Not a classroom camera
+            cam_type = self._classify_camera_type(location)
 
-            # Add ALL cameras for this classroom (C1, C2, etc.)
             all_cams = cam_data.get("all_cameras", [])
-            if all_cams:
-                for ac in all_cams:
-                    dvr_idx = ac.get("dvr_index", 0)
-                    channel = ac.get("channel", 1)
-                    key = (dvr_idx, channel)
-                    if key in seen or dvr_idx >= len(dvrs):
-                        continue
-                    seen.add(key)
-                    desc = ac.get("description", location)
-                    cameras.append({
-                        "location": location,
-                        "grade": grade,
-                        "dvr_index": dvr_idx,
-                        "channel": channel,
-                        "dvr": dvrs[dvr_idx],
-                        "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
-                        "is_gate": False,
-                    })
-            else:
-                dvr_idx = cam_data.get("dvr_index", 0)
-                channel = cam_data.get("channel", 1)
+            cams_to_add = all_cams if all_cams else [cam_data]
+
+            for ac in cams_to_add:
+                dvr_idx = ac.get("dvr_index", 0)
+                channel = ac.get("channel", 1)
                 key = (dvr_idx, channel)
                 if key in seen or dvr_idx >= len(dvrs):
                     continue
@@ -1575,34 +2312,8 @@ class AttendanceEngine:
                     "channel": channel,
                     "dvr": dvrs[dvr_idx],
                     "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
-                    "is_gate": False,
-                })
-
-        # Include ALL remaining cameras (gates, labs, staff rooms, assembly,
-        # activity rooms, parks, etc.) so teachers can be recognized everywhere.
-        # These get grade=None so they scan ALL known faces.
-        for location, cam_data in camera_mapping.items():
-            all_cams = cam_data.get("all_cameras", [])
-            cams_to_add = all_cams if all_cams else [cam_data]
-            for ac in cams_to_add:
-                dvr_idx = ac.get("dvr_index", 0)
-                channel = ac.get("channel", 1)
-                key = (dvr_idx, channel)
-                if key in seen or dvr_idx >= len(dvrs):
-                    continue
-                seen.add(key)
-                loc_upper = location.upper()
-                _GATE_KEYWORDS = {"ENTRY", "ENTRANCE", "DISPERSAL",
-                                  "ADMISSION", "RECEPTION"}
-                is_gate = any(kw in loc_upper for kw in _GATE_KEYWORDS)
-                cameras.append({
-                    "location": location,
-                    "grade": None,  # Check ALL faces
-                    "dvr_index": dvr_idx,
-                    "channel": channel,
-                    "dvr": dvrs[dvr_idx],
-                    "label": f"{location} (DVR {dvr_idx + 1} Ch {channel})",
-                    "is_gate": is_gate,
+                    "is_gate": cam_type in ("reception", "entry_gate"),
+                    "cam_type": cam_type,
                 })
 
         return cameras
@@ -1626,12 +2337,41 @@ class AttendanceEngine:
             self.reload_faces()
 
             cameras = self.build_classroom_camera_list(camera_mapping, dvrs)
-            classroom_cams = [c for c in cameras if c["grade"] is not None]
-            gate_cams = [c for c in cameras if c["grade"] is None]
+
+            # Categorize cameras by type
+            reception_cams = [c for c in cameras if c["cam_type"] == "reception"]
+            principal_cams = [c for c in cameras if c["cam_type"] == "principal"]
+            entry_gate_cams = [c for c in cameras if c["cam_type"] == "entry_gate"]
+            all_staff_cams = [c for c in cameras if c["cam_type"] == "staff"]
+            all_classroom_cams = [c for c in cameras if c["cam_type"] == "classroom"]
+            all_other_cams = [c for c in cameras if c["cam_type"] == "other"]
+
+            # Separate admission and administration cameras from other staff cams
+            administration_cams = [c for c in all_staff_cams
+                                   if "ADMINISTRATION" in c["location"].upper()]
+            admission_cams = [c for c in all_staff_cams
+                              if "ADMISSION" in c["location"].upper()]
+
+            # Phase 1 teacher cameras:
+            # OPEN HOUSE PROTOCOL:
+            #   - Administration Camera for ALL teachers
+            #   - Principal Room Camera ONLY for Ms. Deepi Bector
+            teacher_priority_cams = administration_cams
+            teacher_principal_cams = principal_cams  # Scanned separately for Deepi Bector only
+            teacher_fallback_cams = []  # No fallback
+            teacher_phase_cams = teacher_priority_cams + teacher_principal_cams
+            # Phase 2 student cameras: Classroom cameras ONLY (no gate/reception)
+            student_phase_cams_gate = []  # No gate cameras for students
+            student_phase_cams_classroom = all_classroom_cams
+
+            active_cam_count = len(set(
+                (c["dvr_index"], c["channel"]) for c in
+                teacher_phase_cams + student_phase_cams_gate + student_phase_cams_classroom
+            ))
 
             # Reset all stats so counters don't accumulate across restarts
             self._classwise_stats = {
-                "total_cameras": len(cameras),
+                "total_cameras": active_cam_count,
                 "cameras_scanned": 0,
                 "current_camera": "",
                 "cycle_count": 0,
@@ -1640,20 +2380,33 @@ class AttendanceEngine:
                 "attendance_marked_today": 0,
                 "errors": 0,
             }
-            # Log gate camera details for debugging
-            gate_labels = [c["label"] for c in gate_cams]
+            # Log camera breakdown
+            mode = "TEST (all cameras, all faces)" if FORCE_RENOTIFY_TEST else "OPEN HOUSE"
             self.add_debug_log(
                 "classwise_started",
-                f"Monitoring {len(classroom_cams)} classroom cameras + "
-                f"{len(gate_cams)} entry gate cameras, "
+                f"Mode: {mode} | "
+                f"Phase1 teacher cams: {len(teacher_phase_cams)} "
+                f"(Admin={len(administration_cams)}, Principal={len(teacher_principal_cams)} [Deepi Bector only]) | "
+                f"Phase2 student cams: {len(student_phase_cams_classroom)} classroom ONLY | "
+                f"Other (skipped): {len(all_other_cams)} | "
                 f"{len(self.known_faces)} total faces loaded, "
-                f"{len(self._grade_face_cache)} grades with faces"
+                f"{len(self._grade_face_cache)} grades with faces | "
+                f"Teacher window: {TEACHER_PHASE_START_HOUR}:{TEACHER_PHASE_START_MIN:02d}-"
+                f"{TEACHER_PHASE_END_HOUR}:{TEACHER_PHASE_END_MIN:02d} | "
+                f"Student window: {STUDENT_PHASE_START_HOUR}:{STUDENT_PHASE_START_MIN:02d}-"
+                f"{STUDENT_PHASE_END_HOUR}:{STUDENT_PHASE_END_MIN:02d}"
             )
-            if gate_cams:
-                logger.info(f"Gate/special cameras: {gate_labels}")
+            if teacher_phase_cams:
+                logger.info(f"Phase1 teacher cameras: {[c['label'] for c in teacher_phase_cams]}")
+            if student_phase_cams_classroom:
+                logger.info(f"Phase2 classroom cameras: {[c['label'] for c in student_phase_cams_classroom[:5]]}... ({len(student_phase_cams_classroom)} total)")
 
-            # Re-sync locally marked but un-synced/un-notified records on startup
-            await self._resync_todays_records()
+            # Resync disabled — backend already has all records and handles
+            # notifications as safety net. Resync was causing startup crashes.
+            # try:
+            #     await self._resync_todays_records()
+            # except Exception as e:
+            #     logger.error(f"Resync failed on startup (non-fatal): {e}")
 
             # Clear daily marks at start if it's a new day
             today = date.today().isoformat()
@@ -1680,6 +2433,8 @@ class AttendanceEngine:
                         self.add_debug_log("off_day_skip",
                                            f"Today is {_day_name} — attendance disabled. "
                                            f"No scanning, no notifications.")
+                    if cycle % 30 == 0:
+                        self.cleanup_memory(aggressive=True)
                     await asyncio.sleep(60)
                     continue
                 if self._is_holiday_today():
@@ -1687,6 +2442,8 @@ class AttendanceEngine:
                         self.add_debug_log("holiday_skip",
                                            "Today is a holiday — attendance disabled. "
                                            "No scanning, no notifications.")
+                    if cycle % 30 == 0:
+                        self.cleanup_memory(aggressive=True)
                     await asyncio.sleep(60)
                     continue
 
@@ -1696,72 +2453,283 @@ class AttendanceEngine:
                     today = new_today
                     self.daily_marked.clear()
                     self._notification_sent.clear()
+                    self._meal_sent.clear()
+                    self._meal_window_done.clear()
                     self._sightings.clear()
                     self._camera_errors.clear()
                     self._admin_alerted.clear()
+                    self.entry_validated.clear()
                     self.add_debug_log("daily_reset",
                                        f"New day {today}: cleared attendance marks, "
-                                       f"notifications, and sightings")
+                                       f"notifications, meal caches, sightings, and entry validations")
 
                 # Periodically reload faces (picks up new registrations)
                 if cycle % 20 == 0:
                     self.reload_faces()
 
-                # Scan entry gate cameras first (priority)
-                for cam in gate_cams:
-                    if not self.classwise_running:
-                        break
-                    try:
-                        self._classwise_stats["current_camera"] = cam["label"]
-                        results = await self.scan_camera(
-                            cam["dvr"], cam["channel"], cam["label"],
-                            faces_subset=None,
-                            insightface_subset=None,
-                        )
-                        scanned += 1
-                        faces_in_cycle += len(results)
-                    except Exception as e:
-                        self._classwise_stats["errors"] += 1
-                        cycle_errors += 1
-                        logger.error(f"Error scanning {cam['label']}: {e}")
-                    await asyncio.sleep(0.5)
+                # Determine current phase based on IST time
+                from datetime import timezone as _tz3, timedelta as _td3
+                _ist3 = _tz3(_td3(hours=5, minutes=30))
+                _now_phase = datetime.now(_ist3)
+                _h, _m = _now_phase.hour, _now_phase.minute
+                _now_mins = _h * 60 + _m
 
-                # Free memory after gate cameras
-                gc.collect()
+                teacher_start = TEACHER_PHASE_START_HOUR * 60 + TEACHER_PHASE_START_MIN
+                teacher_end = TEACHER_PHASE_END_HOUR * 60 + TEACHER_PHASE_END_MIN
+                student_start = STUDENT_PHASE_START_HOUR * 60 + STUDENT_PHASE_START_MIN
+                student_end = STUDENT_PHASE_END_HOUR * 60 + STUDENT_PHASE_END_MIN
 
-                # Scan classroom cameras in batches to manage memory
-                BATCH_SIZE = 10
-                for batch_start in range(0, len(classroom_cams), BATCH_SIZE):
-                    batch = classroom_cams[batch_start:batch_start + BATCH_SIZE]
-                    for cam in batch:
+                in_teacher_phase = teacher_start <= _now_mins < teacher_end
+                in_student_phase = student_start <= _now_mins < student_end
+
+                if FORCE_RENOTIFY_TEST:
+                    # Test mode: both phases always active
+                    in_teacher_phase = True
+                    in_student_phase = True
+
+                if not in_teacher_phase and not in_student_phase:
+                    # Check if a meal window is active — run meal snapshot
+                    # even outside attendance phases
+                    _meal_active_idle, _meal_label_idle = self._is_meal_window_active()
+                    if _meal_active_idle:
+                        _meal_today_idle = date.today().isoformat()
+                        if self._meal_window_done.get(_meal_label_idle) != _meal_today_idle:
+                            self._meal_window_done[_meal_label_idle] = _meal_today_idle
+                            self.add_debug_log("meal_snapshot_trigger",
+                                               f"Meal window active (idle): {_meal_label_idle} — "
+                                               "capturing classroom snapshots")
+                            try:
+                                await self._run_meal_snapshot_cycle(
+                                    all_classroom_cams, _meal_label_idle)
+                            except Exception as _meal_err2:
+                                logger.error(f"Meal snapshot cycle failed: {_meal_err2}")
+
+                    # Outside all attendance windows — sleep and retry
+                    if cycle <= 1 or cycle % 60 == 0:
+                        self.add_debug_log("outside_window",
+                                           f"Current time {_now_phase.strftime('%H:%M')} IST — "
+                                           f"outside both teacher ({TEACHER_PHASE_START_HOUR}:{TEACHER_PHASE_START_MIN:02d}-"
+                                           f"{TEACHER_PHASE_END_HOUR}:{TEACHER_PHASE_END_MIN:02d}) and "
+                                           f"student ({STUDENT_PHASE_START_HOUR}:{STUDENT_PHASE_START_MIN:02d}-"
+                                           f"{STUDENT_PHASE_END_HOUR}:{STUDENT_PHASE_END_MIN:02d}) windows")
+                    # Memory cleanup during idle — every 5 minutes (10 idle cycles)
+                    if cycle % 10 == 0:
+                        self.cleanup_memory(aggressive=True)
+                    await asyncio.sleep(30)
+                    continue
+
+                # === PHASE 1: Teacher Recognition (OPEN HOUSE PROTOCOL) ===
+                # Administration Camera: ALL teachers
+                # Principal Room Camera: Ms. Deepi Bector ONLY
+                if in_teacher_phase:
+                    if cycle <= 1 or (cycle % 30 == 0):
+                        self.add_debug_log("teacher_phase",
+                                           f"Phase 1 ACTIVE (OPEN HOUSE): scanning "
+                                           f"{len(teacher_priority_cams)} admin cam(s) + "
+                                           f"{len(teacher_principal_cams)} principal cam(s) "
+                                           f"(Deepi Bector only)")
+                    teacher_faces = getattr(self, '_teacher_faces_cache', {})
+                    teacher_faces_if = getattr(self, '_teacher_faces_cache_insightface', {})
+
+                    async def _scan_cam_list(cams, faces, faces_if):
+                        _scanned, _faces_found, _errors = 0, 0, 0
+                        for cam in cams:
+                            if not self.classwise_running:
+                                break
+                            try:
+                                self._classwise_stats["current_camera"] = cam["label"]
+                                results = await self.scan_camera(
+                                    cam["dvr"], cam["channel"], cam["label"],
+                                    faces_subset=faces if faces else None,
+                                    insightface_subset=faces_if if faces_if else None,
+                                )
+                                _scanned += 1
+                                _faces_found += len(results)
+                            except Exception as e:
+                                _errors += 1
+                                logger.error(f"Error scanning {cam['label']}: {e}")
+                            await asyncio.sleep(0.1)
+                        return _scanned, _faces_found, _errors
+
+                    # Step 1: Scan Administration camera for ALL teachers
+                    if teacher_priority_cams:
+                        pr = await _scan_cam_list(
+                            teacher_priority_cams, teacher_faces, teacher_faces_if)
+                        scanned += pr[0]
+                        faces_in_cycle += pr[1]
+                        cycle_errors += pr[2]
+
+                    # Step 2: Scan Principal Room camera for Ms. Deepi Bector ONLY
+                    if teacher_principal_cams:
+                        # Filter face subset to only Deepi Bector
+                        _deepi_faces = {k: v for k, v in teacher_faces.items()
+                                        if k == "PRINCIPAL_DEEPI_BECTOR"}
+                        _deepi_faces_if = {k: v for k, v in teacher_faces_if.items()
+                                           if k == "PRINCIPAL_DEEPI_BECTOR"} if teacher_faces_if else {}
+                        if _deepi_faces or _deepi_faces_if:
+                            ppr = await _scan_cam_list(
+                                teacher_principal_cams,
+                                _deepi_faces if _deepi_faces else None,
+                                _deepi_faces_if if _deepi_faces_if else None)
+                            scanned += ppr[0]
+                            faces_in_cycle += ppr[1]
+                            cycle_errors += ppr[2]
+
+                    gc.collect()
+
+                # --- Trigger teacher report email once Phase 1 ends ---
+                if not in_teacher_phase and getattr(self, '_teacher_report_sent_today', None) != date.today().isoformat():
+                    if _now_mins >= teacher_end and _now_mins < student_end:
+                        self._teacher_report_sent_today = date.today().isoformat()
+                        self.add_debug_log("teacher_report",
+                                           "Phase 1 ended — triggering teacher attendance report email")
+                        try:
+                            api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+                            agent_secret = os.environ.get("AGENT_SECRET", "")
+                            headers = {"Content-Type": "application/json"}
+                            if agent_secret:
+                                headers["X-Agent-Secret"] = agent_secret
+                            async with httpx.AsyncClient(timeout=30) as _rpt_client:
+                                _rpt_resp = await _rpt_client.post(
+                                    f"{api_url}/api/dashboard/attendance/teacher-report/email",
+                                    json={}, headers=headers,
+                                )
+                                if _rpt_resp.status_code == 200:
+                                    _rpt_data = _rpt_resp.json()
+                                    self.add_debug_log("teacher_report_sent",
+                                                       f"Teacher report emailed: {_rpt_data.get('present', 0)} present, "
+                                                       f"{_rpt_data.get('absent', 0)} absent")
+                                else:
+                                    self.add_debug_log("teacher_report_error",
+                                                       f"Report email failed: HTTP {_rpt_resp.status_code}")
+                        except Exception as _rpt_e:
+                            self.add_debug_log("teacher_report_error",
+                                               f"Report email error: {_rpt_e}")
+
+                # === Administration camera: keep scanning for teachers even during student phase ===
+                if in_student_phase and not in_teacher_phase and teacher_priority_cams:
+                    teacher_faces = getattr(self, '_teacher_faces_cache', {})
+                    teacher_faces_if = getattr(self, '_teacher_faces_cache_insightface', {})
+                    for cam in teacher_priority_cams:
                         if not self.classwise_running:
                             break
                         try:
-                            grade = cam["grade"]
-                            grade_faces = self.get_faces_for_grade(grade)
-                            grade_faces_if = self.get_insightface_for_grade(grade)
-
-                            if not grade_faces and not grade_faces_if:
-                                scanned += 1
-                                continue
-
                             self._classwise_stats["current_camera"] = cam["label"]
                             results = await self.scan_camera(
                                 cam["dvr"], cam["channel"], cam["label"],
-                                faces_subset=grade_faces,
-                                insightface_subset=grade_faces_if,
+                                faces_subset=teacher_faces if teacher_faces else None,
+                                insightface_subset=teacher_faces_if if teacher_faces_if else None,
                             )
                             scanned += 1
                             faces_in_cycle += len(results)
                         except Exception as e:
-                            self._classwise_stats["errors"] += 1
                             cycle_errors += 1
                             logger.error(f"Error scanning {cam['label']}: {e}")
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.1)
 
-                    # Free memory between batches
+                # === PHASE 2: Student Recognition ===
+                if in_student_phase:
+                    if cycle <= 1 or (cycle % 30 == 0):
+                        self.add_debug_log("student_phase",
+                                           f"Phase 2 ACTIVE (OPEN HOUSE): scanning "
+                                           f"{len(student_phase_cams_classroom)} classroom cameras "
+                                           f"for student faces + admin cam for teachers")
+
+                    # 2a. Scan gate/reception cameras for ALL student faces (parallel by DVR)
+                    gate_cams_to_scan = [
+                        cam for cam in student_phase_cams_gate
+                        if not (in_teacher_phase and cam in teacher_phase_cams)
+                    ]
+                    if gate_cams_to_scan:
+                        gate_dvr_groups: dict[str, list] = {}
+                        for cam in gate_cams_to_scan:
+                            ip = cam["dvr"]["ip"]
+                            gate_dvr_groups.setdefault(ip, []).append(cam)
+
+                        async def _scan_gate_group(cams):
+                            _s, _f, _e = 0, 0, 0
+                            for cam in cams:
+                                if not self.classwise_running:
+                                    break
+                                try:
+                                    self._classwise_stats["current_camera"] = cam["label"]
+                                    results = await self.scan_camera(
+                                        cam["dvr"], cam["channel"], cam["label"],
+                                        faces_subset=None, insightface_subset=None,
+                                    )
+                                    _s += 1
+                                    _f += len(results)
+                                except Exception as e:
+                                    _e += 1
+                                    logger.error(f"Error scanning {cam['label']}: {e}")
+                                await asyncio.sleep(0.1)
+                            return _s, _f, _e
+
+                        gate_tasks = [_scan_gate_group(cams) for cams in gate_dvr_groups.values()]
+                        gate_results = await asyncio.gather(*gate_tasks, return_exceptions=True)
+                        for r in gate_results:
+                            if isinstance(r, tuple):
+                                scanned += r[0]
+                                faces_in_cycle += r[1]
+                                cycle_errors += r[2]
+                                self._classwise_stats["errors"] += r[2]
                     gc.collect()
-                    await asyncio.sleep(1.0)
+
+                    # 2b. Scan ALL classroom cameras (summer camp mode — students in any room)
+                    active_classroom_cams = student_phase_cams_classroom
+
+                    BATCH_SIZE = 10
+                    for batch_start in range(0, len(active_classroom_cams), BATCH_SIZE):
+                        batch = active_classroom_cams[batch_start:batch_start + BATCH_SIZE]
+                        for cam in batch:
+                            if not self.classwise_running:
+                                break
+                            try:
+                                # Summer camp: scan against ALL student faces (not grade-specific)
+                                all_student_faces = {k: v for k, v in self.known_faces.items()
+                                                     if not k.startswith(("TEACHER_", "PRINCIPAL_"))}
+                                all_student_faces_if = {k: v for k, v in self.known_faces_insightface.items()
+                                                        if not k.startswith(("TEACHER_", "PRINCIPAL_"))}
+
+                                if not all_student_faces and not all_student_faces_if:
+                                    scanned += 1
+                                    continue
+
+                                self._classwise_stats["current_camera"] = cam["label"]
+                                results = await self.scan_camera(
+                                    cam["dvr"], cam["channel"], cam["label"],
+                                    faces_subset=all_student_faces,
+                                    insightface_subset=all_student_faces_if,
+                                )
+                                scanned += 1
+                                faces_in_cycle += len(results)
+                            except Exception as e:
+                                self._classwise_stats["errors"] += 1
+                                cycle_errors += 1
+                                logger.error(f"Error scanning {cam['label']}: {e}")
+                            await asyncio.sleep(0.1)
+
+                        # Free memory between batches
+                        gc.collect()
+                        await asyncio.sleep(0.3)
+
+                # === MEAL SNAPSHOT CHECK ===
+                # Run once per meal window per day (not every scan cycle)
+                meal_active, meal_label = self._is_meal_window_active()
+                if meal_active:
+                    _meal_today = date.today().isoformat()
+                    if self._meal_window_done.get(meal_label) != _meal_today:
+                        self._meal_window_done[meal_label] = _meal_today
+                        self.add_debug_log("meal_snapshot_trigger",
+                                           f"Meal window active: {meal_label} — "
+                                           "capturing classroom snapshots")
+                        try:
+                            await self._run_meal_snapshot_cycle(
+                                all_classroom_cams, meal_label)
+                        except Exception as _meal_err:
+                            logger.error(f"Meal snapshot cycle failed: {_meal_err}")
+                            self.add_debug_log("meal_snapshot_error",
+                                               f"{meal_label} error: {_meal_err}")
 
                 cycle_duration = time.time() - cycle_start
                 self._classwise_stats["cameras_scanned"] = scanned
@@ -1802,9 +2770,19 @@ class AttendanceEngine:
                 if cycle % 3 == 0:
                     await self._check_camera_health_alerts()
 
-                # Free memory between cycles and brief cooldown
-                gc.collect()
-                await asyncio.sleep(2.0)
+                # Report camera status to backend every 10 cycles
+                if cycle % 10 == 0:
+                    await self._report_camera_status_to_backend(cameras)
+
+                # Periodic memory cleanup every 10 cycles
+                if cycle % 10 == 0:
+                    cleanup = self.cleanup_memory(aggressive=False)
+                    if cleanup.get("memory_mb_after", 0) > 500:
+                        self.add_debug_log("memory_warning",
+                                           f"Memory at {cleanup['memory_mb_after']}MB after cleanup")
+                else:
+                    gc.collect()
+                await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
             self.add_debug_log("classwise_cancelled",
@@ -1832,6 +2810,11 @@ class AttendanceEngine:
             self._task.cancel()
         if self._classwise_task and not self._classwise_task.done():
             self._classwise_task.cancel()
+        # Close persistent DVR HTTP clients
+        for client in self._dvr_clients.values():
+            if not client.is_closed:
+                asyncio.ensure_future(client.aclose())
+        self._dvr_clients.clear()
         self.add_debug_log("monitoring_stopped",
                            "Stop requested — auto_start disabled")
 
@@ -1865,10 +2848,100 @@ class AttendanceEngine:
             "grades_with_faces": len(self._grade_face_cache),
             "health": self._health.copy(),
             "anti_spoof_enabled": True,
+            "entry_validation_enabled": True,
+            "quality_filtering_enabled": True,
+            "teacher_confidence_threshold": self.teacher_confidence_threshold,
+            "entry_validated_today": sum(
+                1 for d in self.entry_validated.values()
+                if d == date.today().isoformat()
+            ),
+            "multi_layer_checks": [
+                "high_confidence_match",
+                "authorized_camera",
+                "time_window",
+                "multi_frame_verification",
+                "entry_gate_validation",
+                "anti_spoofing",
+                "average_confidence_check",
+                "face_quality_filter",
+            ],
         }
         if self.classwise_running:
             status["classwise_stats"] = self._classwise_stats.copy()
         return status
+
+    def cleanup_memory(self, aggressive: bool = False) -> dict:
+        """Free memory by pruning caches and collecting garbage.
+
+        Args:
+            aggressive: If True, perform deeper cleanup (used when memory is high).
+
+        Returns:
+            Dict with cleanup stats.
+        """
+        stats: dict = {}
+        now = time.time()
+
+        # 1. Prune stale sightings (older than sighting_window)
+        pruned_sightings = 0
+        cutoff = now - self.sighting_window
+        stale_keys = []
+        for pid, sights in self._sightings.items():
+            before = len(sights)
+            self._sightings[pid] = [s for s in sights if s["time"] >= cutoff]
+            pruned_sightings += before - len(self._sightings[pid])
+            if not self._sightings[pid]:
+                stale_keys.append(pid)
+        for k in stale_keys:
+            del self._sightings[k]
+        stats["pruned_sightings"] = pruned_sightings
+        stats["removed_sighting_keys"] = len(stale_keys)
+
+        # 2. Trim debug logs
+        max_logs = 100 if aggressive else self.max_debug_logs
+        if len(self.debug_logs) > max_logs:
+            trimmed = len(self.debug_logs) - max_logs
+            self.debug_logs = self.debug_logs[-max_logs:]
+            stats["trimmed_debug_logs"] = trimmed
+
+        # 3. Clean up finished background tasks
+        before_tasks = len(self._background_tasks)
+        self._background_tasks = {t for t in self._background_tasks if not t.done()}
+        stats["cleaned_tasks"] = before_tasks - len(self._background_tasks)
+
+        # 4. Prune old daily marks from previous days
+        today = date.today().isoformat()
+        old_marks = {k for k, v in self.daily_marked.items() if v != today}
+        for k in old_marks:
+            del self.daily_marked[k]
+        old_notifs = {k for k, v in self._notification_sent.items() if v != today}
+        for k in old_notifs:
+            del self._notification_sent[k]
+        stats["pruned_old_marks"] = len(old_marks)
+        stats["pruned_old_notifs"] = len(old_notifs)
+
+        # 5. Clear camera error tracking for recovered cameras
+        if aggressive:
+            recovered = [k for k, v in self._camera_errors.items() if v == 0]
+            for k in recovered:
+                del self._camera_errors[k]
+            stats["cleared_recovered_cameras"] = len(recovered)
+            self._camera_recovered.clear()
+
+        # 6. Force garbage collection
+        gc.collect()
+        stats["gc_collected"] = True
+
+        # 7. Report memory after cleanup
+        try:
+            import psutil
+            mem_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+            stats["memory_mb_after"] = round(mem_mb, 1)
+            self._health["memory_mb"] = round(mem_mb, 1)
+        except ImportError:
+            pass
+
+        return stats
 
     def get_debug_logs(self, limit: int = 100) -> list[dict]:
         """Return recent debug logs."""

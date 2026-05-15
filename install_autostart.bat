@@ -54,43 +54,33 @@ if %ERRORLEVEL% NEQ 0 (
     schtasks /create /tn "PPIS Campus Agent" /tr "wscript.exe \"%~dp0run_hidden.vbs\"" /sc onlogon /rl highest /f
 )
 
-REM Also add to Windows Startup folder as backup
-echo Adding to Startup folder as backup...
+REM Remove any old startup folder entry to prevent duplicate instances
+REM (ONLY the scheduled task should auto-start the agent)
 set STARTUP_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
-echo Set WshShell = CreateObject("WScript.Shell") > "%STARTUP_DIR%\PPIS Agent.vbs"
-echo scriptDir = "%~dp0" >> "%STARTUP_DIR%\PPIS Agent.vbs"
-echo WshShell.CurrentDirectory = scriptDir >> "%STARTUP_DIR%\PPIS Agent.vbs"
-echo WshShell.Run """" ^& scriptDir ^& "run_forever.bat""", 0, False >> "%STARTUP_DIR%\PPIS Agent.vbs"
+del "%STARTUP_DIR%\PPIS Agent.vbs" >nul 2>&1
+echo Removed startup folder entry (using scheduled task only).
 
 if %ERRORLEVEL% EQU 0 (
     echo.
     echo ============================================================
-    echo   SUCCESS! PPIS Campus Agent installed.
+    echo   SUCCESS! PPIS Campus Agent auto-start installed.
     echo ============================================================
     echo.
-    echo   The agent will now:
-    echo     - Start automatically on PC boot (no manual action needed)
-    echo     - Run in the background (no window)
-    echo     - Auto-restart if it crashes
-    echo     - Pull latest code on each restart
-    echo     - Clean up old files automatically
+    echo   The agent will auto-start on next PC reboot.
     echo.
-    echo   Starting the agent now...
-    echo.
-
-    REM Start immediately
-    wscript.exe "%~dp0run_hidden.vbs"
-
-    echo   Agent is running in background!
-    echo.
+    echo   To START NOW:    run_forever.bat
     echo   To CHECK status: Open browser to http://localhost:8897
     echo   To STOP:         taskkill /F /IM python.exe
     echo   To UNINSTALL:    schtasks /delete /tn "PPIS Campus Agent" /f
+    echo.
+    echo   NOTE: This does NOT start the agent immediately.
+    echo   Run 'run_forever.bat' manually if you want it running now.
     echo.
 ) else (
     echo.
     echo ERROR: Failed to create scheduled task.
     echo Please run this script as Administrator.
+    echo Right-click Command Prompt and select "Run as administrator"
     echo.
 )
 
