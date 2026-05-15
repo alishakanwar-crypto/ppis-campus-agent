@@ -66,10 +66,10 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (overall: 7:00 AM to 9:00 AM IST)
+# Attendance time window (overall: 7:00 AM to 12:00 PM IST — Open House)
 ATTENDANCE_START_HOUR = 7
 ATTENDANCE_START_MINUTE = 0
-ATTENDANCE_END_HOUR = 9
+ATTENDANCE_END_HOUR = 12
 ATTENDANCE_END_MINUTE = 0
 
 # Two-phase attendance windows (production mode)
@@ -80,11 +80,12 @@ TEACHER_PHASE_START_MIN = 0
 TEACHER_PHASE_END_HOUR = 7
 TEACHER_PHASE_END_MIN = 45
 
-# Phase 2: Student recognition (7:15 AM - 9:00 AM)
+# Phase 2: Student recognition (7:30 AM - 12:00 PM)
 # Cameras: Classroom cameras ONLY (no gate/reception)
+# Admin Room camera stays active alongside student cameras during overlap
 STUDENT_PHASE_START_HOUR = 7
-STUDENT_PHASE_START_MIN = 15
-STUDENT_PHASE_END_HOUR = 9
+STUDENT_PHASE_START_MIN = 30
+STUDENT_PHASE_END_HOUR = 12
 STUDENT_PHASE_END_MIN = 0
 
 # --- OPEN HOUSE SMART MODE ---
@@ -2567,13 +2568,34 @@ class AttendanceEngine:
                             self.add_debug_log("teacher_report_error",
                                                f"Report email error: {_rpt_e}")
 
+                # === Administration camera: keep scanning for teachers even during student phase ===
+                if in_student_phase and not in_teacher_phase and teacher_priority_cams:
+                    teacher_faces = getattr(self, '_teacher_faces_cache', {})
+                    teacher_faces_if = getattr(self, '_teacher_faces_cache_insightface', {})
+                    for cam in teacher_priority_cams:
+                        if not self.classwise_running:
+                            break
+                        try:
+                            self._classwise_stats["current_camera"] = cam["label"]
+                            results = await self.scan_camera(
+                                cam["dvr"], cam["channel"], cam["label"],
+                                faces_subset=teacher_faces if teacher_faces else None,
+                                insightface_subset=teacher_faces_if if teacher_faces_if else None,
+                            )
+                            scanned += 1
+                            faces_in_cycle += len(results)
+                        except Exception as e:
+                            cycle_errors += 1
+                            logger.error(f"Error scanning {cam['label']}: {e}")
+                        await asyncio.sleep(0.1)
+
                 # === PHASE 2: Student Recognition ===
                 if in_student_phase:
                     if cycle <= 1 or (cycle % 30 == 0):
                         self.add_debug_log("student_phase",
-                                           f"Phase 2 ACTIVE: scanning {len(student_phase_cams_gate)} gate + "
+                                           f"Phase 2 ACTIVE (OPEN HOUSE): scanning "
                                            f"{len(student_phase_cams_classroom)} classroom cameras "
-                                           f"for student faces")
+                                           f"for student faces + admin cam for teachers")
 
                     # 2a. Scan gate/reception cameras for ALL student faces (parallel by DVR)
                     gate_cams_to_scan = [
