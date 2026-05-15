@@ -330,11 +330,11 @@ class AttendanceEngine:
         self.classwise_running = False
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
-        self.confidence_threshold = 0.50  # Match confidence > 50% for students (raised from 40% to reduce false positives)
-        self.review_threshold = 0.35  # 35-40% goes to manual review queue
+        self.confidence_threshold = 0.33  # Match confidence > 33% for students
+        self.review_threshold = 0.30  # Below 30% gets rejected outright
         self.min_sightings = 2  # Must be seen 2+ times before marking present (students)
         self.sighting_window = 600  # 10-minute window for sightings to accumulate
-        self.teacher_confidence_threshold = 0.30  # Lower threshold — reception cameras are far
+        self.teacher_confidence_threshold = 0.33  # Same threshold for teachers
         self.entry_validated: dict[str, str] = {}  # person_id -> date (seen at entry/reception)
         self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
         self.known_faces: dict = {}
