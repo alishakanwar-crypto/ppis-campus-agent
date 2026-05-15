@@ -20,7 +20,7 @@ import os
 import re
 import tempfile
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -172,6 +172,10 @@ def _is_grade_on_break(grade: str) -> bool:
             return True
     return False
 
+
+# Teacher-specific window (used when person_id starts with TEACHER_)
+TEACHER_END_HOUR = 8
+TEACHER_END_MINUTE = 0
 
 # Grade pattern to extract grade from camera location names
 _GRADE_RE = re.compile(
@@ -1060,9 +1064,10 @@ class AttendanceEngine:
             return saturday_number == 2  # Only 2nd Saturday is off
         return False
 
-    def _is_within_attendance_window(self) -> bool:
+    def _is_within_attendance_window(self, person_id: str = "") -> bool:
         """Check if the current IST time is within the attendance window.
 
+        Uses a shorter window (7:00-8:00) for teachers vs students (7:00-9:30).
         Returns False on off-days (Sundays, 2nd Saturday) and holidays.
         """
         from datetime import timezone, timedelta as _td
@@ -1079,8 +1084,14 @@ class AttendanceEngine:
 
         start = now.replace(hour=ATTENDANCE_START_HOUR, minute=ATTENDANCE_START_MINUTE,
                             second=0, microsecond=0)
-        end = now.replace(hour=ATTENDANCE_END_HOUR, minute=ATTENDANCE_END_MINUTE,
-                          second=0, microsecond=0)
+
+        # Teachers have a shorter attendance window (7:00-8:00 AM)
+        if person_id.startswith("TEACHER_"):
+            end = now.replace(hour=TEACHER_END_HOUR, minute=TEACHER_END_MINUTE,
+                              second=0, microsecond=0)
+        else:
+            end = now.replace(hour=ATTENDANCE_END_HOUR, minute=ATTENDANCE_END_MINUTE,
+                              second=0, microsecond=0)
         return start <= now <= end
 
     def _is_holiday_today(self) -> bool:
@@ -1427,7 +1438,7 @@ class AttendanceEngine:
             return None
 
         # --- CHECK 3: Time window ---
-        if not self._is_within_attendance_window():
+        if not self._is_within_attendance_window(person_id):
             return None
 
         # --- Daily dedup: one entry per student per day ---
@@ -1895,7 +1906,7 @@ class AttendanceEngine:
                 "confidence": record.get("confidence", 0),
                 "notification_sent": bool(parent_phones),
                 "parent_phones": parent_phones,
-                "logged_at": datetime.now().isoformat(),
+                "logged_at": datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat(),
             }]
         }
         try:
@@ -1946,15 +1957,43 @@ class AttendanceEngine:
                         phone = face_data.get("phone", "")
                         break
 
-                try:
-                    await self._sync_attendance_to_cloud({
-                        "person_id": pid,
-                        "name": name,
-                        "confidence": confidence,
-                        "camera_source": camera,
-                    }, phone)
-                except Exception as e:
-                    logger.error(f"Resync cloud sync error for {pid}: {e}")
+                # Sync to cloud dashboard
+                grade = ""
+                for part in pid.split("_"):
+                    if part.startswith("GRADE") or part.startswith("NUR") or part.startswith("PREP"):
+                        grade = part
+                        break
+
+                await self._sync_attendance_to_cloud({
+                    "person_id": pid,
+                    "name": name,
+                    "confidence": confidence,
+                    "camera_source": camera,
+                }, phone)
+
+                # Re-send notifications only for records that weren't notified
+                if phone and not whatsapp_sent:
+                    # Convert logged_at (UTC in DB) to IST for notification
+                    try:
+                        from datetime import timezone, timedelta as _td
+                        _ist = timezone(_td(hours=5, minutes=30))
+                        t = datetime.strptime(logged_at[:19], "%Y-%m-%d %H:%M:%S")
+                        t_ist = t + _td(hours=5, minutes=30)
+                        time_str = t_ist.strftime("%I:%M %p")
+                    except Exception:
+                        from datetime import timezone, timedelta as _td
+                        _ist = timezone(_td(hours=5, minutes=30))
+                        time_str = datetime.now(_ist).strftime("%I:%M %p")
+
+                    phone_list = [p.strip() for p in phone.split(",") if p.strip()]
+                    for parent_phone in phone_list:
+                        await self._send_whatsapp_notification(
+                            attendance_id=attendance_id,
+                            person_id=pid,
+                            name=name,
+                            time_str=time_str,
+                            phone=parent_phone,
+                        )
 
             logger.info(f"Re-sync complete for {len(today_records)} records")
         except Exception as e:
