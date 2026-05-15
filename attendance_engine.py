@@ -74,18 +74,23 @@ ATTENDANCE_END_MINUTE = 0
 
 # Two-phase attendance windows (production mode)
 # Phase 1: Teacher recognition (7:00 AM - 7:45 AM)
-# Cameras: Entry Gate, Reception, Admission Room, Administration
+# Cameras: Administration ONLY (Open House protocol)
 TEACHER_PHASE_START_HOUR = 7
 TEACHER_PHASE_START_MIN = 0
 TEACHER_PHASE_END_HOUR = 7
 TEACHER_PHASE_END_MIN = 45
 
 # Phase 2: Student recognition (7:15 AM - 9:00 AM)
-# Cameras: Entry Gate, Reception, Classroom cameras (grade-specific)
+# Cameras: Classroom cameras ONLY (no gate/reception)
 STUDENT_PHASE_START_HOUR = 7
 STUDENT_PHASE_START_MIN = 15
 STUDENT_PHASE_END_HOUR = 9
 STUDENT_PHASE_END_MIN = 0
+
+# --- OPEN HOUSE SMART MODE ---
+# Students may move between classrooms during Open House.
+# Prevent duplicate attendance, allow cross-classroom detection.
+OPEN_HOUSE_MODE = True
 
 # ---------------------------------------------------------------------------
 # HIGH-ACCURACY CONFIGURATION
@@ -331,10 +336,12 @@ class AttendanceEngine:
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
         self.confidence_threshold = 0.33  # Match confidence > 33% for students
+        self.confidence_max = 0.50  # Reject above 50% (likely false positive or too-close match)
         self.review_threshold = 0.30  # Below 30% gets rejected outright
-        self.min_sightings = 2  # Must be seen 2+ times before marking present (students)
+        self.min_sightings = 1  # ONE recognition cycle only (Open House protocol)
         self.sighting_window = 600  # 10-minute window for sightings to accumulate
-        self.teacher_confidence_threshold = 0.33  # Same threshold for teachers
+        self.teacher_confidence_threshold = 0.30  # Teacher min threshold 30%
+        self.teacher_confidence_max = 0.50  # Teacher max threshold 50%
         self.entry_validated: dict[str, str] = {}  # person_id -> date (seen at entry/reception)
         self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
         self.known_faces: dict = {}
@@ -1399,14 +1406,22 @@ class AttendanceEngine:
         now = time.time()
         is_teacher = person_id.startswith("TEACHER_")
 
-        # --- CHECK 1: High-confidence match ---
+        # --- CHECK 1: Confidence range check ---
         effective_threshold = (self.teacher_confidence_threshold
                                if is_teacher else self.confidence_threshold)
+        effective_max = (self.teacher_confidence_max
+                         if is_teacher else self.confidence_max)
         if confidence < effective_threshold:
             self.add_debug_log("confidence_rejected",
                                f"{name} confidence {confidence:.1%} < "
                                f"{effective_threshold:.0%} threshold "
                                f"({'teacher' if is_teacher else 'student'})",
+                               person_id=person_id, confidence=confidence)
+            return None
+        if confidence > effective_max:
+            self.add_debug_log("confidence_too_high",
+                               f"{name} confidence {confidence:.1%} > "
+                               f"{effective_max:.0%} max — doubtful match, ignoring",
                                person_id=person_id, confidence=confidence)
             return None
 
@@ -1605,7 +1620,7 @@ class AttendanceEngine:
         display_name = name.title() if name == name.upper() else name
         if is_teacher:
             notif_name = display_name  # Template has "Dear {{1}}, you have been"
-            tpl_name = "ppis_teacher_present"
+            tpl_name = "ppis_teacher_present_text"  # Text-only template (no image header)
             tpl_lang = "en"
         else:
             notif_name = f"{display_name} has been"
@@ -1616,33 +1631,13 @@ class AttendanceEngine:
         logger.info(f"[NOTIFICATION] Sending to {phone} for {display_name} "
                      f"(confidence verified, entry validated)")
 
-        # Build request payload
+        # Build request payload (text-only for teachers, no image header needed)
         payload = {
             "phone": phone,
             "template_name": tpl_name,
             "template_params": [notif_name, time_str],
             "language_code": tpl_lang,
         }
-        # Attach snapshot for teacher template (image header)
-        if is_teacher:
-            import base64
-            _img = snapshot_bytes
-            # Fallback: use registration photo if live snapshot unavailable
-            if not _img:
-                try:
-                    reg_faces = db.get_all_faces()
-                    for face in reg_faces:
-                        if face.get("person_id") == person_id:
-                            img_path = face.get("image_path", "")
-                            if img_path and Path(img_path).exists():
-                                with open(img_path, "rb") as _f:
-                                    _img = _f.read()
-                                logger.info(f"[NOTIFICATION] Using registration photo fallback for {person_id}")
-                                break
-                except Exception as _fb_err:
-                    logger.warning(f"Failed to load fallback photo: {_fb_err}")
-            if _img:
-                payload["header_image_base64"] = base64.b64encode(_img).decode()
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):
@@ -2319,13 +2314,15 @@ class AttendanceEngine:
                               if "ADMISSION" in c["location"].upper()]
 
             # Phase 1 teacher cameras:
-            # PRIORITY: Entry Gate + Reception + Administration (scanned first)
-            # FALLBACK: Principal Room + Admission Room (scanned after)
-            teacher_priority_cams = entry_gate_cams + reception_cams + administration_cams
-            teacher_fallback_cams = principal_cams + admission_cams
-            teacher_phase_cams = teacher_priority_cams + teacher_fallback_cams
-            # Phase 2 student cameras: Entry Gate + Reception + ALL classrooms
-            student_phase_cams_gate = entry_gate_cams + reception_cams
+            # OPEN HOUSE PROTOCOL:
+            #   - Administration Camera for ALL teachers
+            #   - Principal Room Camera ONLY for Ms. Deepi Bector
+            teacher_priority_cams = administration_cams
+            teacher_principal_cams = principal_cams  # Scanned separately for Deepi Bector only
+            teacher_fallback_cams = []  # No fallback
+            teacher_phase_cams = teacher_priority_cams + teacher_principal_cams
+            # Phase 2 student cameras: Classroom cameras ONLY (no gate/reception)
+            student_phase_cams_gate = []  # No gate cameras for students
             student_phase_cams_classroom = all_classroom_cams
 
             active_cam_count = len(set(
@@ -2345,15 +2342,13 @@ class AttendanceEngine:
                 "errors": 0,
             }
             # Log camera breakdown
-            mode = "TEST (all cameras, all faces)" if FORCE_RENOTIFY_TEST else "TWO-PHASE"
+            mode = "TEST (all cameras, all faces)" if FORCE_RENOTIFY_TEST else "OPEN HOUSE"
             self.add_debug_log(
                 "classwise_started",
                 f"Mode: {mode} | "
                 f"Phase1 teacher cams: {len(teacher_phase_cams)} "
-                f"(PRIORITY: gate={len(entry_gate_cams)}, reception={len(reception_cams)} | "
-                f"FALLBACK: admission/admin={len(admission_cams)}) | "
-                f"Phase2 student cams: {len(student_phase_cams_gate)} gate/reception + "
-                f"{len(student_phase_cams_classroom)} classroom | "
+                f"(Admin={len(administration_cams)}, Principal={len(teacher_principal_cams)} [Deepi Bector only]) | "
+                f"Phase2 student cams: {len(student_phase_cams_classroom)} classroom ONLY | "
                 f"Other (skipped): {len(all_other_cams)} | "
                 f"{len(self.known_faces)} total faces loaded, "
                 f"{len(self._grade_face_cache)} grades with faces | "
@@ -2484,15 +2479,16 @@ class AttendanceEngine:
                     await asyncio.sleep(30)
                     continue
 
-                # === PHASE 1: Teacher Recognition ===
-                # Priority: Entry Gate + Reception cameras FIRST (fastest detection)
-                # Fallback: Principal + Staff rooms + Admin (for teachers missed at gate)
+                # === PHASE 1: Teacher Recognition (OPEN HOUSE PROTOCOL) ===
+                # Administration Camera: ALL teachers
+                # Principal Room Camera: Ms. Deepi Bector ONLY
                 if in_teacher_phase:
                     if cycle <= 1 or (cycle % 30 == 0):
                         self.add_debug_log("teacher_phase",
-                                           f"Phase 1 ACTIVE: scanning "
-                                           f"{len(teacher_priority_cams)} priority (gate/reception) + "
-                                           f"{len(teacher_fallback_cams)} fallback cameras")
+                                           f"Phase 1 ACTIVE (OPEN HOUSE): scanning "
+                                           f"{len(teacher_priority_cams)} admin cam(s) + "
+                                           f"{len(teacher_principal_cams)} principal cam(s) "
+                                           f"(Deepi Bector only)")
                     teacher_faces = getattr(self, '_teacher_faces_cache', {})
                     teacher_faces_if = getattr(self, '_teacher_faces_cache_insightface', {})
 
@@ -2516,7 +2512,7 @@ class AttendanceEngine:
                             await asyncio.sleep(0.1)
                         return _scanned, _faces_found, _errors
 
-                    # Step 1: Scan priority cameras FIRST (entry gate + reception)
+                    # Step 1: Scan Administration camera for ALL teachers
                     if teacher_priority_cams:
                         pr = await _scan_cam_list(
                             teacher_priority_cams, teacher_faces, teacher_faces_if)
@@ -2524,14 +2520,21 @@ class AttendanceEngine:
                         faces_in_cycle += pr[1]
                         cycle_errors += pr[2]
 
-                    # Step 2: Scan fallback cameras (principal, staff, admin)
-                    if teacher_fallback_cams:
-                        fr = await _scan_cam_list(
-                            teacher_fallback_cams, teacher_faces, teacher_faces_if)
-                        scanned += fr[0]
-                        faces_in_cycle += fr[1]
-                        cycle_errors += fr[2]
-                        self._classwise_stats["errors"] += fr[2]
+                    # Step 2: Scan Principal Room camera for Ms. Deepi Bector ONLY
+                    if teacher_principal_cams:
+                        # Filter face subset to only Deepi Bector
+                        _deepi_faces = {k: v for k, v in teacher_faces.items()
+                                        if k == "TEACHER_DEEPI_BECTOR"}
+                        _deepi_faces_if = {k: v for k, v in teacher_faces_if.items()
+                                           if k == "TEACHER_DEEPI_BECTOR"} if teacher_faces_if else {}
+                        if _deepi_faces or _deepi_faces_if:
+                            ppr = await _scan_cam_list(
+                                teacher_principal_cams,
+                                _deepi_faces if _deepi_faces else None,
+                                _deepi_faces_if if _deepi_faces_if else None)
+                            scanned += ppr[0]
+                            faces_in_cycle += ppr[1]
+                            cycle_errors += ppr[2]
 
                     gc.collect()
 
