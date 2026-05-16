@@ -144,6 +144,18 @@ OPEN_HOUSE_MODE = False  # Computed dynamically via _is_open_house_today()
 MIN_FACE_WIDTH = 25
 MIN_FACE_HEIGHT = 25
 
+# ---------------------------------------------------------------------------
+# HD FACE RECOGNITION — DVR OPTIMIZATION
+# ---------------------------------------------------------------------------
+# Cache of each camera channel's max supported resolution.
+# Populated on first capture via ISAPI capabilities probe.
+# Key: "ip:channel", Value: (width, height) or None if unknown.
+_channel_resolution_cache: dict[str, tuple[int, int] | None] = {}
+
+# Face crop padding: expand the detected face bounding box by this fraction
+# to include forehead, chin, and ears for better encoding accuracy.
+FACE_CROP_PADDING = 0.35  # 35% padding around the detected face box
+
 # Image quality thresholds (Laplacian variance for sharpness)
 MIN_SHARPNESS_SCORE = 30.0  # Reject blurry faces below this
 MIN_BRIGHTNESS = 40         # Reject underexposed faces
@@ -303,6 +315,105 @@ def _grade_from_person_id(person_id: str) -> str | None:
     if grade.startswith("POPSICLE"):
         return "POPSICLES"
     return grade
+
+
+async def _probe_channel_resolution(client: httpx.AsyncClient,
+                                     ip: str, port: int,
+                                     channel: int) -> tuple[int, int] | None:
+    """Query Hikvision ISAPI for a channel's native (max) resolution.
+
+    Probes /ISAPI/Streaming/channels/{stream}/capabilities to discover
+    the camera's actual resolution. Caches the result so we only probe once
+    per channel per session.
+
+    Returns (width, height) or None if the probe fails.
+    """
+    cam_key = f"{ip}:{channel}"
+    if cam_key in _channel_resolution_cache:
+        return _channel_resolution_cache[cam_key]
+
+    stream_channel = channel * 100 + 1
+    url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/"
+           f"{stream_channel}/capabilities")
+    try:
+        resp = await client.get(url)
+        if resp.status_code == 200:
+            body = resp.text
+            # Parse max resolution from XML: look for videoResolutionWidth/Height
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(body)
+            ns = ""
+            # Hikvision uses a namespace; detect it from the root tag
+            if root.tag.startswith("{"):
+                ns = root.tag.split("}")[0] + "}"
+            w_el = root.find(f".//{ns}videoResolutionWidth")
+            h_el = root.find(f".//{ns}videoResolutionHeight")
+            if w_el is not None and h_el is not None:
+                # The capabilities may have max attribute or text value
+                w_text = w_el.get("max") or w_el.text
+                h_text = h_el.get("max") or h_el.text
+                if w_text and h_text:
+                    w, h = int(w_text), int(h_text)
+                    _channel_resolution_cache[cam_key] = (w, h)
+                    logger.info(f"Camera {cam_key} native resolution: {w}x{h}")
+                    return (w, h)
+    except Exception as e:
+        logger.debug(f"Resolution probe failed for {cam_key}: {e}")
+
+    # Fallback: try /ISAPI/System/Video/inputs/channels/{channel}
+    try:
+        alt_url = f"http://{ip}:{port}/ISAPI/System/Video/inputs/channels/{channel}"
+        resp2 = await client.get(alt_url)
+        if resp2.status_code == 200:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(resp2.text)
+            ns = ""
+            if root.tag.startswith("{"):
+                ns = root.tag.split("}")[0] + "}"
+            res_w = root.find(f".//{ns}resolutionWidth")
+            res_h = root.find(f".//{ns}resolutionHeight")
+            if res_w is not None and res_h is not None:
+                w = int(res_w.text)
+                h = int(res_h.text)
+                _channel_resolution_cache[cam_key] = (w, h)
+                logger.info(f"Camera {cam_key} native resolution (alt): {w}x{h}")
+                return (w, h)
+    except Exception:
+        pass
+
+    _channel_resolution_cache[cam_key] = None
+    return None
+
+
+def _extract_padded_face_crop(image_bytes: bytes,
+                              top: int, right: int,
+                              bottom: int, left: int,
+                              padding: float = FACE_CROP_PADDING) -> bytes:
+    """Extract a face crop with extra padding for better recognition.
+
+    Expands the detected face bounding box by the padding fraction
+    to include forehead, chin, and ears. This gives the face encoder
+    more context and produces better embeddings.
+    """
+    if Image is None:
+        return image_bytes
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        w, h = img.size
+        face_w = right - left
+        face_h = bottom - top
+        pad_x = int(face_w * padding)
+        pad_y = int(face_h * padding)
+        crop_left = max(0, left - pad_x)
+        crop_top = max(0, top - pad_y)
+        crop_right = min(w, right + pad_x)
+        crop_bottom = min(h, bottom + pad_y)
+        crop = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=95)
+        return buf.getvalue()
+    except Exception:
+        return image_bytes
 
 
 def _preprocess_image(image_bytes: bytes) -> bytes:
@@ -480,6 +591,8 @@ class AttendanceEngine:
         self._failsafe_recovery_count = 0  # consecutive successful cycles during failsafe
         self._last_dvrs: list[dict] = []
         self._last_camera_mapping: dict = {}
+        # HD resolution probe results: camera_label -> {width, height, probed}
+        self._camera_resolutions: dict[str, dict] = {}
 
         # Initialize InsightFace if available
         if self.use_insightface:
@@ -506,6 +619,38 @@ class AttendanceEngine:
             self._insightface_app = None
             self.use_insightface = False
             self._health["face_engine"] = "face_recognition"
+
+    async def probe_all_camera_resolutions(self, dvrs: list[dict],
+                                           camera_mapping: dict) -> dict:
+        """Probe native resolution for every mapped camera.
+
+        Returns a summary dict of camera_label -> {ip, channel, width, height}.
+        Useful for diagnostics: shows which cameras can deliver HD+ stills.
+        """
+        results: dict[str, dict] = {}
+        for label, cam_info in camera_mapping.items():
+            all_cams = cam_info.get("all_cameras", [cam_info])
+            for cam in all_cams:
+                dvr_idx = cam.get("dvr_index", 0)
+                if dvr_idx < 1 or dvr_idx > len(dvrs):
+                    continue
+                dvr = dvrs[dvr_idx - 1]
+                ch = cam.get("channel", 0)
+                desc = cam.get("description", label)
+                ip = dvr["ip"]
+                port = dvr.get("port", 80)
+                client = self._get_dvr_client(dvr)
+                res = await _probe_channel_resolution(client, ip, port, ch)
+                entry = {
+                    "ip": ip,
+                    "channel": ch,
+                    "width": res[0] if res else 1920,
+                    "height": res[1] if res else 1080,
+                    "native_probed": res is not None,
+                }
+                results[desc] = entry
+                self._camera_resolutions[desc] = entry
+        return results
 
     def _check_failsafe(self, cycle_errors: int, scanned: int) -> bool:
         """Check if failsafe mode should be activated.
@@ -831,16 +976,9 @@ class AttendanceEngine:
                 continue
 
             # Assess face crop quality (sharpness, brightness)
-            face_crop = image_bytes  # Use full image for quality check
-            try:
-                if Image is not None:
-                    pil_crop = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                    crop_region = pil_crop.crop((left, top, right, bottom))
-                    buf = io.BytesIO()
-                    crop_region.save(buf, format="JPEG", quality=95)
-                    face_crop = buf.getvalue()
-            except Exception:
-                pass
+            # Use padded crop for better quality assessment and encoding
+            face_crop = _extract_padded_face_crop(
+                image_bytes, top, right, bottom, left)
             quality = _assess_face_quality(face_crop)
             if not quality["is_acceptable"]:
                 self.add_debug_log("face_quality_rejected",
@@ -2271,15 +2409,26 @@ class AttendanceEngine:
         """Capture a single frame from a Hikvision DVR via ISAPI snapshot.
 
         Uses persistent HTTP client with connection pooling for speed.
+        Probes the camera's native resolution on first call and requests
+        the highest available quality (up to 4MP if the camera supports it).
         """
         ip = dvr["ip"]
         port = dvr.get("port", 80)
 
+        client = self._get_dvr_client(dvr)
+
+        # Probe native resolution on first capture (cached per channel)
+        native_res = await _probe_channel_resolution(client, ip, port, channel)
+        if native_res:
+            req_w, req_h = native_res
+        else:
+            req_w, req_h = 1920, 1080  # default fallback
+
         stream_channel = channel * 100 + 1
         url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
-               f"?snapShotImageType=JPEG&videoResolutionWidth=1920&videoResolutionHeight=1080")
+               f"?snapShotImageType=JPEG"
+               f"&videoResolutionWidth={req_w}&videoResolutionHeight={req_h}")
 
-        client = self._get_dvr_client(dvr)
         for attempt in range(max_retries):
             try:
                 resp = await client.get(url)
