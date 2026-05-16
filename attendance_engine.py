@@ -120,7 +120,7 @@ FORCE_RENOTIFY_TEST = False
 # Sends classroom camera snapshots to parents of present children during
 # meal breaks. Uses ppis_meal_update template (force-send via template API).
 # Active: weekdays only, until May 26, 2026.
-MEAL_SNAPSHOT_ENABLED = True
+MEAL_SNAPSHOT_ENABLED = False
 MEAL_SNAPSHOT_END_DATE = "2026-05-26"  # Last day of summer camp
 MEAL_WINDOWS = [
     # (start_hour, start_min, end_hour, end_min, label)
