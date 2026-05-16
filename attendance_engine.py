@@ -768,7 +768,10 @@ class AttendanceEngine:
                                    person_id=person_id,
                                    confidence=confidence)
 
-                if confidence >= self.confidence_threshold:
+                is_teacher_gate = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
+                effective_min = (self.teacher_confidence_threshold
+                                if is_teacher_gate else self.confidence_threshold)
+                if confidence >= effective_min:
                     result = self._process_attendance(
                         person_id=person_id,
                         name=match_result["name"],
@@ -785,7 +788,7 @@ class AttendanceEngine:
                 elif confidence >= self.review_threshold:
                     self.add_debug_log("manual_review",
                                        f"Confidence {confidence:.1%} in review band "
-                                       f"({self.review_threshold:.0%}-{self.confidence_threshold:.0%})",
+                                       f"({self.review_threshold:.0%}-{effective_min:.0%})",
                                        person_id=person_id,
                                        confidence=confidence)
                     self._queue_manual_review(
@@ -991,7 +994,10 @@ class AttendanceEngine:
                                    person_id=person_id,
                                    confidence=confidence)
 
-                if confidence >= self.confidence_threshold:
+                is_teacher_if = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
+                effective_min_if = (self.teacher_confidence_threshold
+                                   if is_teacher_if else self.confidence_threshold)
+                if confidence >= effective_min_if:
                     result = self._process_attendance(
                         person_id=person_id,
                         name=match_result["name"],
@@ -1008,7 +1014,7 @@ class AttendanceEngine:
                 else:
                     self.add_debug_log("low_confidence",
                                        f"Confidence {confidence:.1%} < "
-                                       f"{self.confidence_threshold:.0%} threshold [InsightFace]",
+                                       f"{effective_min_if:.0%} threshold [InsightFace]",
                                        person_id=person_id,
                                        confidence=confidence)
             else:
