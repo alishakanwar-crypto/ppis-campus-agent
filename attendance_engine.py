@@ -383,13 +383,13 @@ class AttendanceEngine:
         self.classwise_running = False
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
-        self.confidence_threshold = 0.33  # Match confidence > 33% for students
-        self.confidence_max = 0.50  # Reject above 50% (likely false positive or too-close match)
-        self.review_threshold = 0.30  # Below 30% gets rejected outright
-        self.min_sightings = 1  # ONE recognition cycle only (Open House protocol)
+        self.confidence_threshold = 0.45  # Match confidence > 45% for students (raised from 33% to reduce false positives)
+        self.confidence_max = 0.60  # Reject above 60% (likely false positive or too-close match)
+        self.review_threshold = 0.38  # Below 38% gets rejected outright (raised from 30%)
+        self.min_sightings = 2  # Require 2 detections before marking present (raised from 1)
         self.sighting_window = 600  # 10-minute window for sightings to accumulate
-        self.teacher_confidence_threshold = 0.30  # Teacher min threshold 30%
-        self.teacher_confidence_max = 0.50  # Teacher max threshold 50%
+        self.teacher_confidence_threshold = 0.40  # Teacher min threshold 40% (raised from 30%)
+        self.teacher_confidence_max = 0.60  # Teacher max threshold 60% (raised from 50%)
         self.entry_validated: dict[str, str] = {}  # person_id -> date (seen at entry/reception)
         self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
         self.known_faces: dict = {}
@@ -1517,9 +1517,9 @@ class AttendanceEngine:
                 pass
 
         # --- CHECK 4: Multi-frame verification ---
-        # Teachers: 1 sighting (immediate marking)
-        # Students: 3 sightings (multi-frame confirmation)
-        required_sightings = 1 if is_teacher else self.min_sightings
+        # Teachers: 2 sightings (require confirmation to prevent false positives)
+        # Students: 2 sightings (multi-frame confirmation)
+        required_sightings = 2 if is_teacher else self.min_sightings
         sighting_count = self._record_sighting(
             person_id, confidence, camera_source,
             embedding=embedding, face_size=face_size,
@@ -2727,7 +2727,10 @@ class AttendanceEngine:
                                 self._classwise_stats["errors"] += r[2]
                     gc.collect()
 
-                    # 2b. Scan ALL classroom cameras (summer camp mode — students in any room)
+                    # 2b. Scan classroom cameras — grade-specific matching
+                    # Each camera only checks faces of students in that grade.
+                    # This prevents cross-grade false positives (e.g. Grade 3C
+                    # student being matched on a Grade 9A camera).
                     active_classroom_cams = student_phase_cams_classroom
 
                     BATCH_SIZE = 10
@@ -2737,21 +2740,25 @@ class AttendanceEngine:
                             if not self.classwise_running:
                                 break
                             try:
-                                # Summer camp: scan against ALL student faces (not grade-specific)
-                                all_student_faces = {k: v for k, v in self.known_faces.items()
-                                                     if not k.startswith(("TEACHER_", "PRINCIPAL_"))}
-                                all_student_faces_if = {k: v for k, v in self.known_faces_insightface.items()
-                                                        if not k.startswith(("TEACHER_", "PRINCIPAL_"))}
+                                cam_grade = cam.get("grade")
+                                if cam_grade:
+                                    grade_faces = self.get_faces_for_grade(cam_grade)
+                                    grade_faces_if = self.get_insightface_for_grade(cam_grade)
+                                else:
+                                    grade_faces = {k: v for k, v in self.known_faces.items()
+                                                   if not k.startswith(("TEACHER_", "PRINCIPAL_"))}
+                                    grade_faces_if = {k: v for k, v in self.known_faces_insightface.items()
+                                                      if not k.startswith(("TEACHER_", "PRINCIPAL_"))}
 
-                                if not all_student_faces and not all_student_faces_if:
+                                if not grade_faces and not grade_faces_if:
                                     scanned += 1
                                     continue
 
                                 self._classwise_stats["current_camera"] = cam["label"]
                                 results = await self.scan_camera(
                                     cam["dvr"], cam["channel"], cam["label"],
-                                    faces_subset=all_student_faces,
-                                    insightface_subset=all_student_faces_if,
+                                    faces_subset=grade_faces,
+                                    insightface_subset=grade_faces_if,
                                 )
                                 scanned += 1
                                 faces_in_cycle += len(results)
