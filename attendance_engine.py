@@ -1076,7 +1076,7 @@ class AttendanceEngine:
         _ist = timezone(_td(hours=5, minutes=30))
         now = datetime.now(_ist)
 
-        is_student = not person_id.startswith("TEACHER_")
+        is_student = not person_id.startswith(("TEACHER_", "PRINCIPAL_"))
 
         # Students: block on ALL Saturdays and Sundays
         if is_student and now.weekday() >= 5:  # 5=Saturday, 6=Sunday
