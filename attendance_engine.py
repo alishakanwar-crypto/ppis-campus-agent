@@ -66,32 +66,76 @@ ATTENDANCE_SNAPSHOTS_DIR.mkdir(exist_ok=True)
 # Minimum seconds between attendance entries for the same person
 COOLDOWN_SECONDS = 300  # 5 minutes
 
-# Attendance time window (overall: 7:00 AM to 12:00 PM IST — Open House)
-ATTENDANCE_START_HOUR = 7
-ATTENDANCE_START_MINUTE = 0
+# Attendance time window (overall: 6:30 AM to 12:00 PM IST — varies by date)
+ATTENDANCE_START_HOUR = 6
+ATTENDANCE_START_MINUTE = 30
 ATTENDANCE_END_HOUR = 12
 ATTENDANCE_END_MINUTE = 0
 
-# Two-phase attendance windows (production mode)
-# Phase 1: Teacher recognition (7:00 AM - 7:45 AM)
-# Cameras: Administration ONLY (Open House protocol)
-TEACHER_PHASE_START_HOUR = 7
-TEACHER_PHASE_START_MIN = 0
-TEACHER_PHASE_END_HOUR = 7
-TEACHER_PHASE_END_MIN = 45
+# Three-phase attendance windows (production mode from 18 May 2026)
+# Phase 1: Teacher recognition (6:30-8:00 AM)
+#   DVR3 Ch23 Administration Camera ONLY, confidence 35-45%, min 1 sighting
+# Phase 2: Summer Camp students (8:15-9:15 AM)
+#   Scan ALL classroom cameras (students can sit anywhere), 35-50%, min 2 sightings
+# Phase 3: Grades 9-12 students (8:15-9:15 AM)
+#   Scan ONLY assigned classroom cameras, 35-50%, min 2 sightings
+# Open House (16 May 2026): special wider windows
 
-# Phase 2: Student recognition (7:30 AM - 12:00 PM)
-# Cameras: Classroom cameras ONLY (no gate/reception)
-# Admin Room camera stays active alongside student cameras during overlap
-STUDENT_PHASE_START_HOUR = 7
-STUDENT_PHASE_START_MIN = 30
-STUDENT_PHASE_END_HOUR = 12
-STUDENT_PHASE_END_MIN = 0
+OPEN_HOUSE_DATE = "2026-05-16"  # Saturday Open House
+
+# Default teacher window (regular days from Monday 18 May onwards)
+TEACHER_PHASE_START_HOUR = 6
+TEACHER_PHASE_START_MIN = 30
+TEACHER_PHASE_END_HOUR = 8
+TEACHER_PHASE_END_MIN = 0
+
+# Open House teacher window (wider)
+OPEN_HOUSE_TEACHER_START_HOUR = 6
+OPEN_HOUSE_TEACHER_START_MIN = 30
+OPEN_HOUSE_TEACHER_END_HOUR = 8
+OPEN_HOUSE_TEACHER_END_MIN = 0
+
+# Default student window (regular days from Monday 18 May onwards)
+STUDENT_PHASE_START_HOUR = 8
+STUDENT_PHASE_START_MIN = 15
+STUDENT_PHASE_END_HOUR = 9
+STUDENT_PHASE_END_MIN = 15
+
+# Open House student window
+OPEN_HOUSE_STUDENT_START_HOUR = 8
+OPEN_HOUSE_STUDENT_START_MIN = 15
+OPEN_HOUSE_STUDENT_END_HOUR = 12
+OPEN_HOUSE_STUDENT_END_MIN = 0
+
+
+def _is_open_house_today() -> bool:
+    """Check if today is Open House day."""
+    return date.today().isoformat() == OPEN_HOUSE_DATE
+
+
+def _get_teacher_phase_window() -> tuple[int, int, int, int]:
+    """Return (start_hour, start_min, end_hour, end_min) for teacher phase."""
+    if _is_open_house_today():
+        return (OPEN_HOUSE_TEACHER_START_HOUR, OPEN_HOUSE_TEACHER_START_MIN,
+                OPEN_HOUSE_TEACHER_END_HOUR, OPEN_HOUSE_TEACHER_END_MIN)
+    return (TEACHER_PHASE_START_HOUR, TEACHER_PHASE_START_MIN,
+            TEACHER_PHASE_END_HOUR, TEACHER_PHASE_END_MIN)
+
+
+def _get_student_phase_window() -> tuple[int, int, int, int]:
+    """Return (start_hour, start_min, end_hour, end_min) for student phase."""
+    if _is_open_house_today():
+        return (OPEN_HOUSE_STUDENT_START_HOUR, OPEN_HOUSE_STUDENT_START_MIN,
+                OPEN_HOUSE_STUDENT_END_HOUR, OPEN_HOUSE_STUDENT_END_MIN)
+    return (STUDENT_PHASE_START_HOUR, STUDENT_PHASE_START_MIN,
+            STUDENT_PHASE_END_HOUR, STUDENT_PHASE_END_MIN)
+
 
 # --- OPEN HOUSE SMART MODE ---
 # Students may move between classrooms during Open House.
 # Prevent duplicate attendance, allow cross-classroom detection.
-OPEN_HOUSE_MODE = True
+# Active ONLY on Open House day; regular days use normal classwise scanning.
+OPEN_HOUSE_MODE = False  # Computed dynamically via _is_open_house_today()
 
 # ---------------------------------------------------------------------------
 # HIGH-ACCURACY CONFIGURATION
@@ -115,12 +159,30 @@ ENTRY_VALIDATION_CAMERAS = {
 FORCE_RENOTIFY_TEST = False
 
 # ---------------------------------------------------------------------------
+# STUDENT CATEGORY DEFINITIONS (for Phase 2 & Phase 3 scanning)
+# ---------------------------------------------------------------------------
+# Grades 9-12: sit in their assigned classrooms ONLY → grade-specific scanning
+GRADES_9_TO_12 = {
+    "GRADE9A", "GRADE9B", "GRADE9C",
+    "GRADE10A", "GRADE10B", "GRADE10C",
+    "GRADE11A", "GRADE11B", "GRADE11C",
+    "GRADE12A", "GRADE12B", "GRADE12C",
+}
+
+# Summer camp students: may sit in ANY classroom → scan all cameras
+# Identified by person_id NOT matching any Grade 9-12 pattern
+def _is_grade_9_to_12_student(person_id: str) -> bool:
+    """Check if a student belongs to Grades 9-12 based on person_id."""
+    grade = _grade_from_person_id(person_id)
+    return grade in GRADES_9_TO_12 if grade else False
+
+# ---------------------------------------------------------------------------
 # MEAL SNAPSHOT NOTIFICATION SCHEDULE (Summer Camp)
 # ---------------------------------------------------------------------------
 # Sends classroom camera snapshots to parents of present children during
 # meal breaks. Uses ppis_meal_update template (force-send via template API).
 # Active: weekdays only, until May 26, 2026.
-MEAL_SNAPSHOT_ENABLED = True
+MEAL_SNAPSHOT_ENABLED = False
 MEAL_SNAPSHOT_END_DATE = "2026-05-26"  # Last day of summer camp
 MEAL_WINDOWS = [
     # (start_hour, start_min, end_hour, end_min, label)
@@ -340,13 +402,13 @@ class AttendanceEngine:
         self.classwise_running = False
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
-        self.confidence_threshold = 0.33  # Match confidence > 33% for students
-        self.confidence_max = 0.50  # Reject above 50% (likely false positive or too-close match)
+        self.confidence_threshold = 0.35  # Student min confidence 35%
+        self.confidence_max = 0.50  # Student max confidence 50%
         self.review_threshold = 0.30  # Below 30% gets rejected outright
-        self.min_sightings = 1  # ONE recognition cycle only (Open House protocol)
+        self.min_sightings = 2  # Students: require 2 independent sightings
         self.sighting_window = 600  # 10-minute window for sightings to accumulate
-        self.teacher_confidence_threshold = 0.30  # Teacher min threshold 30%
-        self.teacher_confidence_max = 0.50  # Teacher max threshold 50%
+        self.teacher_confidence_threshold = 0.35  # Teacher min threshold 35%
+        self.teacher_confidence_max = 0.45  # Teacher max threshold 45%
         self.entry_validated: dict[str, str] = {}  # person_id -> date (seen at entry/reception)
         self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
         self.known_faces: dict = {}
@@ -406,6 +468,16 @@ class AttendanceEngine:
         self._camera_alert_threshold = 5  # consecutive failures before alert
         self._admin_phones: list[str] = []  # phones to receive camera alerts
         self._camera_recovered: set = set()  # cameras that recovered after alert
+
+        # --- FAILSAFE MODE ---
+        # Automatically stops attendance marking when system instability detected.
+        self._failsafe_active = False
+        self._failsafe_reason = ""
+        self._consecutive_cycle_errors = 0
+        self._max_cycle_errors_before_failsafe = 5  # 5 consecutive error cycles → failsafe
+        self._false_positive_count_window: list[float] = []  # timestamps of rejected detections
+        self._max_false_positives_per_minute = 10  # high FP rate triggers failsafe
+        self._failsafe_recovery_count = 0  # consecutive successful cycles during failsafe
         self._last_dvrs: list[dict] = []
         self._last_camera_mapping: dict = {}
 
@@ -434,6 +506,77 @@ class AttendanceEngine:
             self._insightface_app = None
             self.use_insightface = False
             self._health["face_engine"] = "face_recognition"
+
+    def _check_failsafe(self, cycle_errors: int, scanned: int) -> bool:
+        """Check if failsafe mode should be activated.
+
+        Returns True if failsafe is active (scanning should stop).
+        Failsafe auto-recovers after 3 consecutive successful cycles.
+        """
+        if self._failsafe_active:
+            # Auto-recovery: if cameras are working again, deactivate failsafe
+            if scanned > 0 and cycle_errors == 0:
+                self._failsafe_recovery_count += 1
+                if self._failsafe_recovery_count >= 3:
+                    self._failsafe_active = False
+                    self._failsafe_reason = ""
+                    self._failsafe_recovery_count = 0
+                    self._consecutive_cycle_errors = 0
+                    self._false_positive_count_window.clear()
+                    self.add_debug_log("failsafe_recovered",
+                                       "System recovered after 3 consecutive successful cycles")
+                    logger.info("FAILSAFE RECOVERED: System back to normal operation")
+                    return False
+            else:
+                self._failsafe_recovery_count = 0
+            return True
+
+        # Check consecutive cycle errors
+        if cycle_errors > 0 and scanned == 0:
+            self._consecutive_cycle_errors += 1
+        else:
+            self._consecutive_cycle_errors = 0
+
+        if self._consecutive_cycle_errors >= self._max_cycle_errors_before_failsafe:
+            self._failsafe_active = True
+            self._failsafe_recovery_count = 0
+            self._failsafe_reason = (
+                f"FAILSAFE: {self._consecutive_cycle_errors} consecutive cycles "
+                f"with errors and zero successful scans"
+            )
+            self.add_debug_log("failsafe_activated", self._failsafe_reason)
+            logger.critical(self._failsafe_reason)
+            return True
+
+        return False
+
+    def _check_false_positive_rate(self) -> bool:
+        """Check if false positive rate is too high. Called every cycle.
+
+        Returns True if failsafe should activate due to high FP rate.
+        Only checks actual FP rate — does NOT short-circuit on _failsafe_active.
+        """
+        now = time.time()
+        self._false_positive_count_window = [
+            t for t in self._false_positive_count_window if now - t < 60
+        ]
+        if len(self._false_positive_count_window) >= self._max_false_positives_per_minute:
+            if not self._failsafe_active:
+                self._failsafe_active = True
+                self._failsafe_recovery_count = 0
+                self._failsafe_reason = (
+                    f"FAILSAFE: High false positive rate — "
+                    f"{len(self._false_positive_count_window)} rejected detections in 60s"
+                )
+                self.add_debug_log("failsafe_activated", self._failsafe_reason)
+                logger.critical(self._failsafe_reason)
+            return True
+
+        return False
+
+    def _record_false_positive(self):
+        """Record a rejected detection for failsafe rate monitoring."""
+        self._false_positive_count_window.append(time.time())
 
     def add_debug_log(self, event: str, details: str = "",
                       person_id: str = "", confidence: float = 0.0):
@@ -725,7 +868,10 @@ class AttendanceEngine:
                                    person_id=person_id,
                                    confidence=confidence)
 
-                if confidence >= self.confidence_threshold:
+                is_teacher_gate = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
+                effective_min = (self.teacher_confidence_threshold
+                                if is_teacher_gate else self.confidence_threshold)
+                if confidence >= effective_min:
                     result = self._process_attendance(
                         person_id=person_id,
                         name=match_result["name"],
@@ -742,7 +888,7 @@ class AttendanceEngine:
                 elif confidence >= self.review_threshold:
                     self.add_debug_log("manual_review",
                                        f"Confidence {confidence:.1%} in review band "
-                                       f"({self.review_threshold:.0%}-{self.confidence_threshold:.0%})",
+                                       f"({self.review_threshold:.0%}-{effective_min:.0%})",
                                        person_id=person_id,
                                        confidence=confidence)
                     self._queue_manual_review(
@@ -948,7 +1094,10 @@ class AttendanceEngine:
                                    person_id=person_id,
                                    confidence=confidence)
 
-                if confidence >= self.confidence_threshold:
+                is_teacher_if = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
+                effective_min_if = (self.teacher_confidence_threshold
+                                   if is_teacher_if else self.confidence_threshold)
+                if confidence >= effective_min_if:
                     result = self._process_attendance(
                         person_id=person_id,
                         name=match_result["name"],
@@ -965,7 +1114,7 @@ class AttendanceEngine:
                 else:
                     self.add_debug_log("low_confidence",
                                        f"Confidence {confidence:.1%} < "
-                                       f"{self.confidence_threshold:.0%} threshold [InsightFace]",
+                                       f"{effective_min_if:.0%} threshold [InsightFace]",
                                        person_id=person_id,
                                        confidence=confidence)
             else:
@@ -1069,12 +1218,20 @@ class AttendanceEngine:
 
         Uses a shorter window (7:00-8:00) for teachers vs students (7:00-9:30).
         Returns False on off-days (Sundays, 2nd Saturday) and holidays.
+        Students are blocked on ALL Saturdays and Sundays.
+        Teachers are only blocked on Sundays and 2nd Saturday.
         """
         from datetime import timezone, timedelta as _td
         _ist = timezone(_td(hours=5, minutes=30))
         now = datetime.now(_ist)
 
-        # Block on Sundays and 2nd Saturday only
+        is_student = not person_id.startswith(("TEACHER_", "PRINCIPAL_"))
+
+        # Students: block on ALL Saturdays and Sundays
+        if is_student and now.weekday() >= 5:  # 5=Saturday, 6=Sunday
+            return False
+
+        # Teachers: block on Sundays and 2nd Saturday only
         if self._is_off_day(now):
             return False
 
@@ -1429,12 +1586,14 @@ class AttendanceEngine:
                                f"{effective_threshold:.0%} threshold "
                                f"({'teacher' if is_teacher else 'student'})",
                                person_id=person_id, confidence=confidence)
+            self._record_false_positive()
             return None
         if confidence > effective_max:
             self.add_debug_log("confidence_too_high",
                                f"{name} confidence {confidence:.1%} > "
                                f"{effective_max:.0%} max — doubtful match, ignoring",
                                person_id=person_id, confidence=confidence)
+            self._record_false_positive()
             return None
 
         # --- CHECK 3: Time window ---
@@ -1474,8 +1633,8 @@ class AttendanceEngine:
                 pass
 
         # --- CHECK 4: Multi-frame verification ---
-        # Teachers: 1 sighting (immediate marking)
-        # Students: 3 sightings (multi-frame confirmation)
+        # Teachers: 1 sighting (single valid detection sufficient)
+        # Students: 2 sightings (multi-frame confirmation required)
         required_sightings = 1 if is_teacher else self.min_sightings
         sighting_count = self._record_sighting(
             person_id, confidence, camera_source,
@@ -1831,12 +1990,11 @@ class AttendanceEngine:
 
             grade = _grade_from_pid(pid)
 
-            # Pick the right snapshot based on summer camp room mapping
-            if grade in MEAL_OWN_CLASSROOM_GRADES:
-                snapshot = grade_snapshots.get(grade)
-            else:
-                # Summer camp students eat in camp rooms (1A/1B/2A/2B/Nursery/Prep)
-                snapshot = camp_room_snapshot
+            # Only send meal snapshots for Grades 9-12 (own classroom)
+            # Younger students (camp rooms) are excluded
+            if grade not in MEAL_OWN_CLASSROOM_GRADES:
+                continue
+            snapshot = grade_snapshots.get(grade)
 
             if not snapshot:
                 continue
@@ -2354,11 +2512,13 @@ class AttendanceEngine:
                               if "ADMISSION" in c["location"].upper()]
 
             # Phase 1 teacher cameras:
-            # OPEN HOUSE PROTOCOL:
-            #   - Administration Camera for ALL teachers
-            #   - Principal Room Camera ONLY for Ms. Deepi Bector
+            #   Open House: Administration Camera ONLY (no Principal Room)
+            #   Regular: Administration Camera + Principal Room for Deepi Bector
             teacher_priority_cams = administration_cams
-            teacher_principal_cams = principal_cams  # Scanned separately for Deepi Bector only
+            if _is_open_house_today():
+                teacher_principal_cams = []  # Open House: Admin Camera ONLY
+            else:
+                teacher_principal_cams = principal_cams  # Regular: Principal Room for Deepi Bector
             teacher_fallback_cams = []  # No fallback
             teacher_phase_cams = teacher_priority_cams + teacher_principal_cams
             # Phase 2 student cameras: Classroom cameras ONLY (no gate/reception)
@@ -2382,20 +2542,24 @@ class AttendanceEngine:
                 "errors": 0,
             }
             # Log camera breakdown
-            mode = "TEST (all cameras, all faces)" if FORCE_RENOTIFY_TEST else "OPEN HOUSE"
+            _tw_log = _get_teacher_phase_window()
+            _sw_log = _get_student_phase_window()
+            _is_oh = _is_open_house_today()
+            mode = "TEST (all cameras, all faces)" if FORCE_RENOTIFY_TEST else (
+                "OPEN HOUSE" if _is_oh else "REGULAR")
             self.add_debug_log(
                 "classwise_started",
                 f"Mode: {mode} | "
                 f"Phase1 teacher cams: {len(teacher_phase_cams)} "
-                f"(Admin={len(administration_cams)}, Principal={len(teacher_principal_cams)} [Deepi Bector only]) | "
+                f"(Admin={len(administration_cams)}, Principal={len(teacher_principal_cams)}) | "
                 f"Phase2 student cams: {len(student_phase_cams_classroom)} classroom ONLY | "
                 f"Other (skipped): {len(all_other_cams)} | "
                 f"{len(self.known_faces)} total faces loaded, "
                 f"{len(self._grade_face_cache)} grades with faces | "
-                f"Teacher window: {TEACHER_PHASE_START_HOUR}:{TEACHER_PHASE_START_MIN:02d}-"
-                f"{TEACHER_PHASE_END_HOUR}:{TEACHER_PHASE_END_MIN:02d} | "
-                f"Student window: {STUDENT_PHASE_START_HOUR}:{STUDENT_PHASE_START_MIN:02d}-"
-                f"{STUDENT_PHASE_END_HOUR}:{STUDENT_PHASE_END_MIN:02d}"
+                f"Teacher window: {_tw_log[0]}:{_tw_log[1]:02d}-"
+                f"{_tw_log[2]}:{_tw_log[3]:02d} | "
+                f"Student window: {_sw_log[0]}:{_sw_log[1]:02d}-"
+                f"{_sw_log[2]}:{_sw_log[3]:02d}"
             )
             if teacher_phase_cams:
                 logger.info(f"Phase1 teacher cameras: {[c['label'] for c in teacher_phase_cams]}")
@@ -2460,9 +2624,16 @@ class AttendanceEngine:
                     self._camera_errors.clear()
                     self._admin_alerted.clear()
                     self.entry_validated.clear()
+                    # Reset failsafe state for new day
+                    self._failsafe_active = False
+                    self._failsafe_reason = ""
+                    self._failsafe_recovery_count = 0
+                    self._consecutive_cycle_errors = 0
+                    self._false_positive_count_window.clear()
                     self.add_debug_log("daily_reset",
                                        f"New day {today}: cleared attendance marks, "
-                                       f"notifications, meal caches, sightings, and entry validations")
+                                       f"notifications, meal caches, sightings, entry validations, "
+                                       f"and failsafe state")
 
                 # Periodically reload faces (picks up new registrations)
                 if cycle % 20 == 0:
@@ -2475,10 +2646,13 @@ class AttendanceEngine:
                 _h, _m = _now_phase.hour, _now_phase.minute
                 _now_mins = _h * 60 + _m
 
-                teacher_start = TEACHER_PHASE_START_HOUR * 60 + TEACHER_PHASE_START_MIN
-                teacher_end = TEACHER_PHASE_END_HOUR * 60 + TEACHER_PHASE_END_MIN
-                student_start = STUDENT_PHASE_START_HOUR * 60 + STUDENT_PHASE_START_MIN
-                student_end = STUDENT_PHASE_END_HOUR * 60 + STUDENT_PHASE_END_MIN
+                # Use dynamic windows (Open House vs regular)
+                _tw = _get_teacher_phase_window()
+                teacher_start = _tw[0] * 60 + _tw[1]
+                teacher_end = _tw[2] * 60 + _tw[3]
+                _sw = _get_student_phase_window()
+                student_start = _sw[0] * 60 + _sw[1]
+                student_end = _sw[2] * 60 + _sw[3]
 
                 in_teacher_phase = teacher_start <= _now_mins < teacher_end
                 in_student_phase = student_start <= _now_mins < student_end
@@ -2509,10 +2683,10 @@ class AttendanceEngine:
                     if cycle <= 1 or cycle % 60 == 0:
                         self.add_debug_log("outside_window",
                                            f"Current time {_now_phase.strftime('%H:%M')} IST — "
-                                           f"outside both teacher ({TEACHER_PHASE_START_HOUR}:{TEACHER_PHASE_START_MIN:02d}-"
-                                           f"{TEACHER_PHASE_END_HOUR}:{TEACHER_PHASE_END_MIN:02d}) and "
-                                           f"student ({STUDENT_PHASE_START_HOUR}:{STUDENT_PHASE_START_MIN:02d}-"
-                                           f"{STUDENT_PHASE_END_HOUR}:{STUDENT_PHASE_END_MIN:02d}) windows")
+                                           f"outside both teacher ({_tw[0]}:{_tw[1]:02d}-"
+                                           f"{_tw[2]}:{_tw[3]:02d}) and "
+                                           f"student ({_sw[0]}:{_sw[1]:02d}-"
+                                           f"{_sw[2]}:{_sw[3]:02d}) windows")
                     # Memory cleanup during idle — every 5 minutes (10 idle cycles)
                     if cycle % 10 == 0:
                         self.cleanup_memory(aggressive=True)
@@ -2676,8 +2850,24 @@ class AttendanceEngine:
                                 self._classwise_stats["errors"] += r[2]
                     gc.collect()
 
-                    # 2b. Scan ALL classroom cameras (summer camp mode — students in any room)
+                    # 2b. Dual student scanning logic:
+                    #   Phase 2 (Summer Camp): Scan ALL cameras with ALL
+                    #     non-Grade-9-12 student faces (they can sit anywhere).
+                    #   Phase 3 (Grades 9-12): Scan ONLY assigned classroom
+                    #     cameras with grade-specific faces.
                     active_classroom_cams = student_phase_cams_classroom
+
+                    # Build face subsets once per cycle
+                    summer_camp_faces = {
+                        k: v for k, v in self.known_faces.items()
+                        if not k.startswith(("TEACHER_", "PRINCIPAL_"))
+                        and not _is_grade_9_to_12_student(k)
+                    }
+                    summer_camp_faces_if = {
+                        k: v for k, v in self.known_faces_insightface.items()
+                        if not k.startswith(("TEACHER_", "PRINCIPAL_"))
+                        and not _is_grade_9_to_12_student(k)
+                    }
 
                     BATCH_SIZE = 10
                     for batch_start in range(0, len(active_classroom_cams), BATCH_SIZE):
@@ -2686,21 +2876,30 @@ class AttendanceEngine:
                             if not self.classwise_running:
                                 break
                             try:
-                                # Summer camp: scan against ALL student faces (not grade-specific)
-                                all_student_faces = {k: v for k, v in self.known_faces.items()
-                                                     if not k.startswith(("TEACHER_", "PRINCIPAL_"))}
-                                all_student_faces_if = {k: v for k, v in self.known_faces_insightface.items()
-                                                        if not k.startswith(("TEACHER_", "PRINCIPAL_"))}
+                                cam_grade = cam.get("grade")
 
-                                if not all_student_faces and not all_student_faces_if:
+                                # Merge faces to scan on this camera:
+                                # 1) Summer camp students → always included (can be in any room)
+                                # 2) Grade 9-12 students → only if camera matches their grade
+                                faces_to_scan = dict(summer_camp_faces)
+                                faces_to_scan_if = dict(summer_camp_faces_if)
+
+                                if cam_grade and cam_grade in GRADES_9_TO_12:
+                                    # Add grade-specific 9-12 faces for this camera
+                                    grade_faces = self._grade_face_cache.get(cam_grade, {})
+                                    grade_faces_if = self._grade_face_cache_insightface.get(cam_grade, {})
+                                    faces_to_scan.update(grade_faces)
+                                    faces_to_scan_if.update(grade_faces_if)
+
+                                if not faces_to_scan and not faces_to_scan_if:
                                     scanned += 1
                                     continue
 
                                 self._classwise_stats["current_camera"] = cam["label"]
                                 results = await self.scan_camera(
                                     cam["dvr"], cam["channel"], cam["label"],
-                                    faces_subset=all_student_faces,
-                                    insightface_subset=all_student_faces_if,
+                                    faces_subset=faces_to_scan,
+                                    insightface_subset=faces_to_scan_if,
                                 )
                                 scanned += 1
                                 faces_in_cycle += len(results)
@@ -2741,21 +2940,37 @@ class AttendanceEngine:
                     if d == date.today().isoformat()
                 )
 
-                # Track full-cycle failures for auto-recovery
+                # Track full-cycle failures for health reporting
                 if scanned == 0 and cycle_errors > 0:
                     consecutive_full_failures += 1
                     self._health["camera_feed"] = "degraded"
                     if consecutive_full_failures >= 5:
                         self._health["camera_feed"] = "error"
-                        self.add_debug_log("auto_recovery",
-                                           "All cameras failed 5 cycles in a row — "
-                                           "waiting 30s before retry")
-                        await asyncio.sleep(30)
-                        consecutive_full_failures = 0
-                        self._health["total_recoveries"] += 1
                 else:
                     consecutive_full_failures = 0
                     self._health["camera_feed"] = "ok"
+
+                # Run failsafe checks EVERY cycle (handles both activation AND recovery)
+                failsafe_camera = self._check_failsafe(cycle_errors, scanned)
+                failsafe_fp = self._check_false_positive_rate()
+
+                if failsafe_camera or failsafe_fp:
+                    reason = self._failsafe_reason or "System instability detected"
+                    self.add_debug_log("failsafe_mode",
+                                       f"SAFE MODE active — {reason}. "
+                                       f"Automatic attendance marking suspended.")
+                    try:
+                        api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+                        async with httpx.AsyncClient(timeout=10) as _fc:
+                            await _fc.post(f"{api_url}/api/dashboard/failsafe",
+                                           json={"reason": reason,
+                                                 "timestamp": datetime.now(
+                                                     timezone(timedelta(hours=5, minutes=30))
+                                                 ).isoformat()})
+                    except Exception:
+                        pass
+                    await asyncio.sleep(60)
+                    continue
 
                 if cycle % 5 == 0:
                     self.add_debug_log(
