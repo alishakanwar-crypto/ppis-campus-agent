@@ -477,6 +477,7 @@ class AttendanceEngine:
         self._max_cycle_errors_before_failsafe = 5  # 5 consecutive error cycles → failsafe
         self._false_positive_count_window: list[float] = []  # timestamps of rejected detections
         self._max_false_positives_per_minute = 10  # high FP rate triggers failsafe
+        self._failsafe_recovery_count = 0  # consecutive successful cycles during failsafe
         self._last_dvrs: list[dict] = []
         self._last_camera_mapping: dict = {}
 
@@ -510,8 +511,24 @@ class AttendanceEngine:
         """Check if failsafe mode should be activated.
 
         Returns True if failsafe is active (scanning should stop).
+        Failsafe auto-recovers after 3 consecutive successful cycles.
         """
         if self._failsafe_active:
+            # Auto-recovery: if cameras are working again, deactivate failsafe
+            if scanned > 0 and cycle_errors == 0:
+                self._failsafe_recovery_count += 1
+                if self._failsafe_recovery_count >= 3:
+                    self._failsafe_active = False
+                    self._failsafe_reason = ""
+                    self._failsafe_recovery_count = 0
+                    self._consecutive_cycle_errors = 0
+                    self._false_positive_count_window.clear()
+                    self.add_debug_log("failsafe_recovered",
+                                       "System recovered after 3 consecutive successful cycles")
+                    logger.info("FAILSAFE RECOVERED: System back to normal operation")
+                    return False
+            else:
+                self._failsafe_recovery_count = 0
             return True
 
         # Check consecutive cycle errors
@@ -522,6 +539,7 @@ class AttendanceEngine:
 
         if self._consecutive_cycle_errors >= self._max_cycle_errors_before_failsafe:
             self._failsafe_active = True
+            self._failsafe_recovery_count = 0
             self._failsafe_reason = (
                 f"FAILSAFE: {self._consecutive_cycle_errors} consecutive cycles "
                 f"with errors and zero successful scans"
@@ -530,13 +548,23 @@ class AttendanceEngine:
             logger.critical(self._failsafe_reason)
             return True
 
-        # Check false positive rate (rejected detections per minute)
+        return False
+
+    def _check_false_positive_rate(self) -> bool:
+        """Check if false positive rate is too high. Called every cycle.
+
+        Returns True if failsafe should activate due to high FP rate.
+        """
+        if self._failsafe_active:
+            return True
+
         now = time.time()
         self._false_positive_count_window = [
             t for t in self._false_positive_count_window if now - t < 60
         ]
         if len(self._false_positive_count_window) >= self._max_false_positives_per_minute:
             self._failsafe_active = True
+            self._failsafe_recovery_count = 0
             self._failsafe_reason = (
                 f"FAILSAFE: High false positive rate — "
                 f"{len(self._false_positive_count_window)} rejected detections in 60s"
@@ -2589,9 +2617,16 @@ class AttendanceEngine:
                     self._camera_errors.clear()
                     self._admin_alerted.clear()
                     self.entry_validated.clear()
+                    # Reset failsafe state for new day
+                    self._failsafe_active = False
+                    self._failsafe_reason = ""
+                    self._failsafe_recovery_count = 0
+                    self._consecutive_cycle_errors = 0
+                    self._false_positive_count_window.clear()
                     self.add_debug_log("daily_reset",
                                        f"New day {today}: cleared attendance marks, "
-                                       f"notifications, meal caches, sightings, and entry validations")
+                                       f"notifications, meal caches, sightings, entry validations, "
+                                       f"and failsafe state")
 
                 # Periodically reload faces (picks up new registrations)
                 if cycle % 20 == 0:
@@ -2931,6 +2966,24 @@ class AttendanceEngine:
                 else:
                     consecutive_full_failures = 0
                     self._health["camera_feed"] = "ok"
+
+                # Check false positive rate every cycle (independent of camera failures)
+                if self._check_false_positive_rate():
+                    self.add_debug_log("failsafe_mode",
+                                       "SAFE MODE active — high false positive rate. "
+                                       "Automatic attendance marking suspended.")
+                    try:
+                        api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+                        async with httpx.AsyncClient(timeout=10) as _fc:
+                            await _fc.post(f"{api_url}/api/dashboard/failsafe",
+                                           json={"reason": self._failsafe_reason,
+                                                 "timestamp": datetime.now(
+                                                     timezone(timedelta(hours=5, minutes=30))
+                                                 ).isoformat()})
+                    except Exception:
+                        pass
+                    await asyncio.sleep(60)
+                    continue
 
                 if cycle % 5 == 0:
                     self.add_debug_log(
