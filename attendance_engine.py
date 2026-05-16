@@ -554,23 +554,22 @@ class AttendanceEngine:
         """Check if false positive rate is too high. Called every cycle.
 
         Returns True if failsafe should activate due to high FP rate.
+        Only checks actual FP rate — does NOT short-circuit on _failsafe_active.
         """
-        if self._failsafe_active:
-            return True
-
         now = time.time()
         self._false_positive_count_window = [
             t for t in self._false_positive_count_window if now - t < 60
         ]
         if len(self._false_positive_count_window) >= self._max_false_positives_per_minute:
-            self._failsafe_active = True
-            self._failsafe_recovery_count = 0
-            self._failsafe_reason = (
-                f"FAILSAFE: High false positive rate — "
-                f"{len(self._false_positive_count_window)} rejected detections in 60s"
-            )
-            self.add_debug_log("failsafe_activated", self._failsafe_reason)
-            logger.critical(self._failsafe_reason)
+            if not self._failsafe_active:
+                self._failsafe_active = True
+                self._failsafe_recovery_count = 0
+                self._failsafe_reason = (
+                    f"FAILSAFE: High false positive rate — "
+                    f"{len(self._false_positive_count_window)} rejected detections in 60s"
+                )
+                self.add_debug_log("failsafe_activated", self._failsafe_reason)
+                logger.critical(self._failsafe_reason)
             return True
 
         return False
@@ -2933,50 +2932,30 @@ class AttendanceEngine:
                     if d == date.today().isoformat()
                 )
 
-                # Track full-cycle failures for auto-recovery + failsafe
+                # Track full-cycle failures for health reporting
                 if scanned == 0 and cycle_errors > 0:
                     consecutive_full_failures += 1
                     self._health["camera_feed"] = "degraded"
                     if consecutive_full_failures >= 5:
                         self._health["camera_feed"] = "error"
-                        # Activate failsafe mode after persistent failures
-                        if self._check_failsafe(cycle_errors, scanned):
-                            self.add_debug_log("failsafe_mode",
-                                               "SAFE MODE active — automatic attendance "
-                                               "marking suspended. Manual review required.")
-                            # Notify admin via backend
-                            try:
-                                api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
-                                async with httpx.AsyncClient(timeout=10) as _fc:
-                                    await _fc.post(f"{api_url}/api/dashboard/failsafe",
-                                                   json={"reason": self._failsafe_reason,
-                                                         "timestamp": datetime.now(
-                                                             timezone(timedelta(hours=5, minutes=30))
-                                                         ).isoformat()})
-                            except Exception:
-                                pass
-                            await asyncio.sleep(60)
-                            continue
-                        self.add_debug_log("auto_recovery",
-                                           "All cameras failed 5 cycles in a row — "
-                                           "waiting 30s before retry")
-                        await asyncio.sleep(30)
-                        consecutive_full_failures = 0
-                        self._health["total_recoveries"] += 1
                 else:
                     consecutive_full_failures = 0
                     self._health["camera_feed"] = "ok"
 
-                # Check false positive rate every cycle (independent of camera failures)
-                if self._check_false_positive_rate():
+                # Run failsafe checks EVERY cycle (handles both activation AND recovery)
+                failsafe_camera = self._check_failsafe(cycle_errors, scanned)
+                failsafe_fp = self._check_false_positive_rate()
+
+                if failsafe_camera or failsafe_fp:
+                    reason = self._failsafe_reason or "System instability detected"
                     self.add_debug_log("failsafe_mode",
-                                       "SAFE MODE active — high false positive rate. "
-                                       "Automatic attendance marking suspended.")
+                                       f"SAFE MODE active — {reason}. "
+                                       f"Automatic attendance marking suspended.")
                     try:
                         api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
                         async with httpx.AsyncClient(timeout=10) as _fc:
                             await _fc.post(f"{api_url}/api/dashboard/failsafe",
-                                           json={"reason": self._failsafe_reason,
+                                           json={"reason": reason,
                                                  "timestamp": datetime.now(
                                                      timezone(timedelta(hours=5, minutes=30))
                                                  ).isoformat()})
