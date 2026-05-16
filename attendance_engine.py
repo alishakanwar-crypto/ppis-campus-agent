@@ -1069,12 +1069,20 @@ class AttendanceEngine:
 
         Uses a shorter window (7:00-8:00) for teachers vs students (7:00-9:30).
         Returns False on off-days (Sundays, 2nd Saturday) and holidays.
+        Students are blocked on ALL Saturdays and Sundays.
+        Teachers are only blocked on Sundays and 2nd Saturday.
         """
         from datetime import timezone, timedelta as _td
         _ist = timezone(_td(hours=5, minutes=30))
         now = datetime.now(_ist)
 
-        # Block on Sundays and 2nd Saturday only
+        is_student = not person_id.startswith("TEACHER_")
+
+        # Students: block on ALL Saturdays and Sundays
+        if is_student and now.weekday() >= 5:  # 5=Saturday, 6=Sunday
+            return False
+
+        # Teachers: block on Sundays and 2nd Saturday only
         if self._is_off_day(now):
             return False
 
