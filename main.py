@@ -317,11 +317,23 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
 
     # Hikvision uses channelNo * 100 + 1 for main stream snapshot
     stream_channel = channel * 100 + 1
-    # Request highest quality JPEG via ISAPI params
-    url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
-           f"?snapShotImageType=JPEG&videoResolutionWidth=1920&videoResolutionHeight=1080")
 
-    logger.info(f"Capturing snapshot from {ip} channel {channel} (stream {stream_channel})")
+    # Probe native resolution for highest quality capture
+    from attendance_engine import _probe_channel_resolution, _channel_resolution_cache
+    try:
+        async with httpx.AsyncClient(timeout=15.0,
+                                     auth=httpx.DigestAuth(user, pwd)) as probe_client:
+            native_res = await _probe_channel_resolution(
+                probe_client, ip, port, channel)
+        req_w = native_res[0] if native_res else 1920
+        req_h = native_res[1] if native_res else 1080
+    except Exception:
+        req_w, req_h = 1920, 1080
+
+    url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+           f"?snapShotImageType=JPEG&videoResolutionWidth={req_w}&videoResolutionHeight={req_h}")
+
+    logger.info(f"Capturing snapshot from {ip} channel {channel} (stream {stream_channel}) at {req_w}x{req_h}")
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -1749,6 +1761,38 @@ async def camera_alerts_status():
         "failure_threshold": attendance_engine._camera_alert_threshold,
         "cameras_with_errors": errors,
         "total_alerted": len(attendance_engine._admin_alerted),
+    }
+
+
+@app.get("/api/camera-resolutions")
+async def get_camera_resolutions():
+    """Probe and report native resolution for all mapped cameras.
+
+    Shows which cameras support HD (1080p), 2MP, 4MP, etc.
+    This helps identify which cameras could benefit from replacement.
+    """
+    dvrs = config.get("dvrs", [])
+    mapping = config.get("camera_mapping", {})
+    if not dvrs or not mapping:
+        return {"status": "error", "message": "No DVRs or camera mapping configured"}
+
+    results = await attendance_engine.probe_all_camera_resolutions(dvrs, mapping)
+
+    # Summarize
+    total = len(results)
+    hd_count = sum(1 for r in results.values() if r["width"] >= 1920)
+    above_hd = sum(1 for r in results.values() if r["width"] > 1920)
+    probed = sum(1 for r in results.values() if r["native_probed"])
+
+    return {
+        "status": "ok",
+        "summary": {
+            "total_cameras": total,
+            "probed_successfully": probed,
+            "hd_1080p_or_above": hd_count,
+            "above_1080p": above_hd,
+        },
+        "cameras": results,
     }
 
 
