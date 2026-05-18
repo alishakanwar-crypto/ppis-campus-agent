@@ -107,6 +107,33 @@ def save_config(cfg: dict):
         json.dump(cfg, f, indent=2)
 
 
+def cleanup_junk_face_entries():
+    """Remove known junk/duplicate face entries from local DB on startup.
+
+    These entries were registered with incorrect names and cause
+    false-positive matches and duplicate notifications.
+    """
+    import database as db_mod
+
+    junk_person_ids = [
+        "TEACHER_ALISHA",              # Incomplete name — duplicate of TEACHER_ALISHA_AHUJA
+        "TEACHER_RECOGNITION",         # Junk — someone registered with just "recognition"
+        "TEACHER_PRITY_SHARMA_TREACHER",  # Typo — "Treacher" instead of "Teacher"
+        "TEACHER_HARDIK_RAWAT_GRADE_4A",  # Has "Grade 4A" in name — registration error
+    ]
+
+    total_deleted = 0
+    for pid in junk_person_ids:
+        deleted = db_mod.delete_person_faces(pid)
+        if deleted:
+            total_deleted += deleted
+            logger.info(f"Cleanup: removed {deleted} junk entry(s) for {pid}")
+
+    if total_deleted:
+        logger.info(f"Cleanup: removed {total_deleted} total junk face entry(s)")
+    return total_deleted
+
+
 async def sync_faces_from_cloud() -> int:
     """Download registered face images from cloud and register locally.
 
@@ -981,6 +1008,9 @@ async def lifespan(app: FastAPI):
         f"Config loaded: {len(config.get('dvrs', []))} DVRs, "
         f"{len(config.get('camera_mapping', {}))} camera mappings"
     )
+    # Clean up known junk/duplicate face entries before syncing
+    cleanup_junk_face_entries()
+
     # Sync face registrations from cloud DB (downloads images, computes encodings)
     try:
         await sync_faces_from_cloud()
