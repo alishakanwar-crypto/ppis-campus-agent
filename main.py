@@ -147,6 +147,29 @@ async def sync_faces_from_cloud() -> int:
                 f for f in manifest
                 if (f["person_id"], f["angle"]) not in existing_keys
             ]
+
+            # Step 2b: Update phone numbers for existing faces
+            # Build lookup of local person_id -> phone
+            local_phones = {}
+            for r in existing:
+                pid = r["person_id"]
+                ph = r.get("phone", "") or ""
+                if pid not in local_phones or len(ph) > len(local_phones[pid]):
+                    local_phones[pid] = ph
+            # Check cloud manifest for updated phones
+            phones_updated = 0
+            for face_meta in manifest:
+                pid = face_meta["person_id"]
+                cloud_phone = face_meta.get("phone", "") or ""
+                local_phone = local_phones.get(pid, "")
+                if cloud_phone and cloud_phone != local_phone:
+                    # Cloud has a newer/different phone — update locally
+                    db_mod.update_face_phone(pid, cloud_phone)
+                    local_phones[pid] = cloud_phone
+                    phones_updated += 1
+            if phones_updated:
+                logger.info(f"Cloud face sync: updated phone numbers for {phones_updated} person(s)")
+
             if not missing:
                 logger.info(f"Cloud face sync: all {len(manifest)} faces already local")
                 return 0
