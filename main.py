@@ -162,7 +162,7 @@ async def sync_faces_from_cloud() -> int:
                 pid = face_meta["person_id"]
                 cloud_phone = face_meta.get("phone", "") or ""
                 local_phone = local_phones.get(pid, "")
-                if cloud_phone and cloud_phone != local_phone:
+                if pid in local_phones and cloud_phone and cloud_phone != local_phone:
                     # Cloud has a newer/different phone — update locally
                     db_mod.update_face_phone(pid, cloud_phone)
                     local_phones[pid] = cloud_phone
@@ -172,7 +172,7 @@ async def sync_faces_from_cloud() -> int:
 
             if not missing:
                 logger.info(f"Cloud face sync: all {len(manifest)} faces already local")
-                return 0
+                return phones_updated
 
             logger.info(f"Cloud face sync: {len(missing)} new face(s) to download")
 
