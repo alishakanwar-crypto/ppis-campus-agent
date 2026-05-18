@@ -120,6 +120,9 @@ def cleanup_junk_face_entries():
         "TEACHER_RECOGNITION",         # Junk — someone registered with just "recognition"
         "TEACHER_PRITY_SHARMA_TREACHER",  # Typo — "Treacher" instead of "Teacher"
         "TEACHER_HARDIK_RAWAT_GRADE_4A",  # Has "Grade 4A" in name — registration error
+        "TEACHER_SHAFEEN_KOMALAM_MOHAN",  # Removed per user request
+        "TEACHER_VIVEK_LAHORA",        # Local-only entry — not in cloud DB
+        "TEACHER_DEVANGI_MALIK",       # Local-only entry — not in cloud DB
     ]
 
     total_deleted = 0
