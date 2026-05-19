@@ -979,8 +979,6 @@ class AttendanceEngine:
 
         # Release the large image array to free memory
         del img_array
-        del pil_img
-        del clean_buf
 
         results = []
 
