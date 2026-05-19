@@ -18,6 +18,11 @@ from pathlib import Path
 import numpy as np
 
 try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
     import dlib
 except ImportError:
     dlib = None
@@ -56,15 +61,30 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
         logger.error("face_recognition library not installed")
         return None
 
-    # Load image via PIL -> numpy (avoids dlib numpy ABI issues on Windows)
+    # Load image via cv2 (preferred — always dlib-compatible) or PIL fallback.
+    # PIL + np.asarray can create read-only arrays that dlib rejects on
+    # numpy 2.x ("Unsupported image type").
     try:
-        if Image is not None:
+        img_array = None
+        if cv2 is not None:
+            nparr = np.frombuffer(image_bytes, dtype=np.uint8)
+            bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if bgr is not None:
+                img_array = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                # Resize if too large
+                max_dim = 480
+                h, w = img_array.shape[:2]
+                if max(h, w) > max_dim:
+                    scale = max_dim / max(h, w)
+                    img_array = cv2.resize(img_array, (int(w * scale), int(h * scale)))
+                img_array = np.ascontiguousarray(img_array, dtype=np.uint8)
+        if img_array is None and Image is not None:
             pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             max_dim = 480
             if max(pil_img.size) > max_dim:
                 pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
-            img_array = np.asarray(pil_img, dtype=np.uint8)
-        else:
+            img_array = np.array(pil_img, dtype=np.uint8).copy()
+        if img_array is None:
             tmp_path = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
@@ -149,10 +169,18 @@ def encode_face_insightface(image_bytes: bytes) -> tuple[np.ndarray, bytes] | No
         return None
 
     try:
-        pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_array = np.asarray(pil_img, dtype=np.uint8)
-        if img_array.ndim != 3 or img_array.shape[2] != 3:
-            logger.error(f"Bad image shape for InsightFace: {img_array.shape}")
+        img_array = None
+        if cv2 is not None:
+            nparr = np.frombuffer(image_bytes, dtype=np.uint8)
+            bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if bgr is not None:
+                img_array = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                img_array = np.ascontiguousarray(img_array, dtype=np.uint8)
+        if img_array is None and Image is not None:
+            pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            img_array = np.array(pil_img, dtype=np.uint8).copy()
+        if img_array is None or img_array.ndim != 3 or img_array.shape[2] != 3:
+            logger.error(f"Bad image shape for InsightFace: {getattr(img_array, 'shape', 'None')}")
             return None
         img_bgr = img_array[:, :, ::-1].copy()
     except Exception as e:

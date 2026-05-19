@@ -42,6 +42,37 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
+# --- dlib/numpy ABI compatibility check ---
+# dlib compiled against numpy 1.x rejects numpy 2.x arrays with
+# "Unsupported image type, must be 8bit gray or RGB image."
+# Auto-fix: downgrade numpy to last 1.x release.
+def _ensure_dlib_compat():
+    try:
+        import numpy as _np
+        import dlib as _dlib
+        _det = _dlib.get_frontal_face_detector()
+        _test = _np.zeros((100, 100, 3), dtype=_np.uint8)
+        _det(_test, 0)  # should not raise
+    except ImportError:
+        pass  # dlib not installed — nothing to check
+    except Exception as e:
+        if "Unsupported image type" in str(e):
+            print(f"[AUTOFIX] dlib/numpy ABI mismatch: {e}")
+            print("[AUTOFIX] Installing compatible numpy (1.26.4)...")
+            import subprocess
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "numpy==1.26.4"],
+                capture_output=True, text=True,
+            )
+            print(result.stdout[-500:] if result.stdout else "")
+            if result.returncode == 0:
+                print("[AUTOFIX] numpy fixed. Restarting...")
+                sys.exit(42)  # run_forever.bat will auto-restart
+            else:
+                print(f"[AUTOFIX] pip failed: {result.stderr[-300:]}")
+
+_ensure_dlib_compat()
+
 from attendance_engine import engine as attendance_engine
 import face_db
 
