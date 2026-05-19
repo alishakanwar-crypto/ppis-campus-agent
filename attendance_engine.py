@@ -771,17 +771,25 @@ class AttendanceEngine:
         faces_to_check = faces_subset if faces_subset is not None else self.known_faces
 
         # Load image: force to RGB uint8 numpy array
+        # Prefer cv2 decoder — it always produces dlib-compatible arrays.
+        # PIL + np.asarray can create arrays that dlib rejects on some
+        # numpy/dlib version combinations ("Unsupported image type").
+        img_array = None
         try:
-            pil_img = Image.open(io.BytesIO(image_bytes))
-            pil_img = pil_img.convert("RGB")
-            clean_buf = io.BytesIO()  # kept for del below
-            # Convert PIL image to numpy array directly (avoids dlib loader
-            # compatibility issues with numpy 2.x)
-            img_array = np.asarray(pil_img, dtype=np.uint8)
+            if cv2 is not None:
+                nparr = np.frombuffer(image_bytes, dtype=np.uint8)
+                bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if bgr is not None:
+                    img_array = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    img_array = np.ascontiguousarray(img_array, dtype=np.uint8)
+            # Fallback to PIL if cv2 unavailable or decode failed
+            if img_array is None:
+                pil_img = Image.open(io.BytesIO(image_bytes))
+                pil_img = pil_img.convert("RGB")
+                img_array = np.array(pil_img, dtype=np.uint8).copy()
+                del pil_img
             if img_array.ndim != 3 or img_array.shape[2] != 3:
                 raise ValueError(f"Bad image shape: {img_array.shape}")
-            # Ensure array is contiguous and writable (dlib requirement)
-            img_array = np.ascontiguousarray(img_array)
         except Exception as e:
             self.add_debug_log("error", f"Failed to load image: {e}")
             return []
@@ -796,9 +804,22 @@ class AttendanceEngine:
                 (d.top(), d.right(), d.bottom(), d.left()) for d in dlib_dets
             ]
         except Exception as e:
-            self.add_debug_log("error",
-                               f"Legacy face detection failed for {camera_source}: {e}")
-            return []
+            # Retry with grayscale — dlib also accepts 8-bit gray
+            try:
+                if cv2 is not None:
+                    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+                else:
+                    gray = np.mean(img_array, axis=2).astype(np.uint8)
+                gray = np.ascontiguousarray(gray)
+                dlib_dets = _detector(gray, 2)
+                face_locations = [
+                    (d.top(), d.right(), d.bottom(), d.left()) for d in dlib_dets
+                ]
+                logger.info("dlib face detection succeeded with grayscale fallback")
+            except Exception as e2:
+                self.add_debug_log("error",
+                                   f"Legacy face detection failed for {camera_source}: {e2}")
+                return []
 
         if not face_locations:
             if not self.classwise_running:
