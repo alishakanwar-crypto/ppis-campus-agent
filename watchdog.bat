@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 REM ============================================================
 REM PPIS Campus Agent — Watchdog (runs every 5 minutes)
 REM Checks if the agent is alive; restarts it if not.
@@ -28,11 +29,11 @@ start "" /B wscript.exe "%~dp0run_hidden.vbs"
 
 echo [%DATE% %TIME%] WATCHDOG: Restart triggered via run_hidden.vbs >> "%LOGFILE%"
 
-REM Keep log file from growing too large (keep last 200 lines)
+REM Keep log file from growing too large (rotate at 500 lines)
 if exist "%LOGFILE%" (
     set LINES=0
     for /f %%a in ('type "%LOGFILE%" ^| find /c /v ""') do set LINES=%%a
-    if %LINES% GTR 500 (
+    if !LINES! GTR 500 (
         move /y "%LOGFILE%" "%LOGFILE%.old" >nul 2>&1
         echo [%DATE% %TIME%] WATCHDOG: Log rotated >> "%LOGFILE%"
     )
