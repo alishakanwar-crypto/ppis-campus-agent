@@ -43,19 +43,22 @@ if sys.platform == "win32":
 def _kill_port_holder_early(port: int = 8897) -> None:
     if sys.platform != "win32":
         return
+    # CREATE_NO_WINDOW prevents cmd.exe from flashing a black window
+    _no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     try:
         result = subprocess.run(
             f'netstat -ano | findstr :{port} | findstr LISTENING',
             capture_output=True, text=True, shell=True,
+            creationflags=_no_win,
         )
         for line in result.stdout.strip().splitlines():
             parts = line.split()
             if parts:
                 pid = parts[-1]
-                # Don't kill ourselves
                 if pid != str(os.getpid()):
                     subprocess.run(f"taskkill /F /PID {pid}",
-                                   shell=True, capture_output=True)
+                                   shell=True, capture_output=True,
+                                   creationflags=_no_win)
     except Exception:
         pass
 
@@ -86,9 +89,11 @@ def _ensure_dlib_compat():
             print(f"[AUTOFIX] dlib/numpy ABI mismatch: {e}")
             print("[AUTOFIX] Installing compatible numpy (1.26.4)...")
             import subprocess
+            _nw = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             result = subprocess.run(
                 [sys.executable, "-m", "pip", "install", "numpy==1.26.4"],
                 capture_output=True, text=True,
+                creationflags=_nw if sys.platform == "win32" else 0,
             )
             print(result.stdout[-500:] if result.stdout else "")
             if result.returncode == 0:
