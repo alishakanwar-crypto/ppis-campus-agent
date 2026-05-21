@@ -24,14 +24,12 @@ echo.
 echo ============================================
 echo [%DATE% %TIME%] Killing any existing agent on port 8897...
 echo ============================================
-REM Kill ALL python.exe first to avoid duplicate instances
-taskkill /F /IM python.exe >nul 2>&1
-REM Also kill any process holding port 8897
+REM Kill any process holding port 8897 (main.py also does this early)
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8897 ^| findstr LISTENING') do (
     echo Killing PID %%a on port 8897...
     taskkill /F /PID %%a >nul 2>&1
 )
-timeout /t 3 /nobreak >nul
+timeout /t 2 /nobreak >nul
 
 echo ============================================
 echo [%DATE% %TIME%] Pulling latest code...

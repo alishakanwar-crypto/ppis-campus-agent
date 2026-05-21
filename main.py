@@ -20,6 +20,7 @@ import io
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -35,6 +36,31 @@ if sys.platform == "win32":
         ctypes.windll.kernel32.SetErrorMode(0x8003)  # type: ignore[attr-defined]
     except Exception:
         pass
+
+# --- Kill stale process on port 8897 BEFORE loading heavy DLLs ---
+# Must happen before face_recognition/dlib/cv2 imports because
+# subprocess.run(shell=True) crashes when those DLLs are loaded.
+def _kill_port_holder_early(port: int = 8897) -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        result = subprocess.run(
+            f'netstat -ano | findstr :{port} | findstr LISTENING',
+            capture_output=True, text=True, shell=True,
+        )
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if parts:
+                pid = parts[-1]
+                # Don't kill ourselves
+                if pid != str(os.getpid()):
+                    subprocess.run(f"taskkill /F /PID {pid}",
+                                   shell=True, capture_output=True)
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    _kill_port_holder_early()
 
 import httpx
 import websockets
