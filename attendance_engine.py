@@ -48,12 +48,23 @@ except ImportError:
     ImageEnhance = None
     ImageFilter = None
 
-try:
-    from insightface.app import FaceAnalysis
-    _INSIGHTFACE_AVAILABLE = True
-except ImportError:
-    FaceAnalysis = None
-    _INSIGHTFACE_AVAILABLE = False
+# InsightFace imported lazily to avoid DLL conflict with dlib on Windows.
+# Importing both face_recognition (dlib) and insightface (onnxruntime) at
+# module level causes a silent C-level crash on some Windows configurations.
+FaceAnalysis = None
+_INSIGHTFACE_AVAILABLE = False
+
+def _check_insightface_available():
+    global FaceAnalysis, _INSIGHTFACE_AVAILABLE
+    if _INSIGHTFACE_AVAILABLE:
+        return True
+    try:
+        from insightface.app import FaceAnalysis as _FA
+        FaceAnalysis = _FA
+        _INSIGHTFACE_AVAILABLE = True
+        return True
+    except Exception:
+        return False
 
 import database as db
 import face_db
@@ -573,7 +584,7 @@ class AttendanceEngine:
             "uptime_start": datetime.now().isoformat(),
             "total_recoveries": 0,
             "auto_start_enabled": True,
-            "face_engine": "insightface" if _INSIGHTFACE_AVAILABLE else "face_recognition",
+            "face_engine": "face_recognition",  # insightface loaded lazily if needed
         }
         self._admin_alerted: set = set()  # Track which issues already alerted
         self._camera_alert_threshold = 5  # consecutive failures before alert
@@ -600,7 +611,7 @@ class AttendanceEngine:
 
     def _init_insightface(self):
         """Initialize the InsightFace face analysis engine."""
-        if not _INSIGHTFACE_AVAILABLE:
+        if not _check_insightface_available():
             return
         try:
             self._insightface_app = FaceAnalysis(

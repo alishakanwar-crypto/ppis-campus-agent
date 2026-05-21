@@ -37,12 +37,23 @@ try:
 except ImportError:
     Image = None
 
-try:
-    from insightface.app import FaceAnalysis
-    _INSIGHTFACE_AVAILABLE = True
-except ImportError:
-    FaceAnalysis = None
-    _INSIGHTFACE_AVAILABLE = False
+# InsightFace imported lazily to avoid DLL conflict with dlib on Windows.
+# Importing both face_recognition (dlib) and insightface (onnxruntime) at
+# module level causes a silent C-level crash on some Windows configurations.
+FaceAnalysis = None
+_INSIGHTFACE_AVAILABLE = False
+
+def _check_insightface_available():
+    global FaceAnalysis, _INSIGHTFACE_AVAILABLE
+    if _INSIGHTFACE_AVAILABLE:
+        return True
+    try:
+        from insightface.app import FaceAnalysis as _FA
+        FaceAnalysis = _FA
+        _INSIGHTFACE_AVAILABLE = True
+        return True
+    except Exception:
+        return False
 
 import database as db
 
@@ -144,7 +155,7 @@ def _crop_face_jpeg(img_array: np.ndarray, location: tuple) -> bytes:
 
 def _get_insightface_app():
     """Lazily initialize and return a shared InsightFace FaceAnalysis instance."""
-    if not _INSIGHTFACE_AVAILABLE:
+    if not _check_insightface_available():
         return None
     if not hasattr(_get_insightface_app, "_app"):
         try:
@@ -242,7 +253,7 @@ def register_face(person_id: str, name: str, role: str, phone: str,
     """
     # Always try legacy encoding (for backward compatibility)
     legacy_result = encode_face_from_image(image_bytes)
-    if legacy_result is None and not _INSIGHTFACE_AVAILABLE:
+    if legacy_result is None and not _check_insightface_available():
         return {"success": False, "error": "No face detected in image"}
 
     # Save cropped face image to disk
@@ -348,7 +359,7 @@ def migrate_to_insightface() -> dict:
 
     Returns summary dict.
     """
-    if not _INSIGHTFACE_AVAILABLE:
+    if not _check_insightface_available():
         return {"success": False, "error": "InsightFace not installed"}
 
     rows = db.get_all_face_encodings(encoding_type="face_recognition_128d")
