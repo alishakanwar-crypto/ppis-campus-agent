@@ -283,6 +283,7 @@ def run_gui():
         run_headless()
         return
 
+    print("Starting Lunch Box Detector GUI...")
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
 
@@ -291,6 +292,7 @@ def run_gui():
             super().__init__()
             self.title("Lunch Box Detector - PPIS")
             self.geometry("1000x700")
+            self.minsize(800, 500)
             self.protocol("WM_DELETE_WINDOW", self.on_close)
 
             self.detector = LunchBoxDetector()
@@ -299,6 +301,7 @@ def run_gui():
             self.detector.on_status = self.update_status
 
             self._build_ui()
+            print("GUI window created successfully")
 
         def _build_ui(self):
             # Top bar
@@ -432,8 +435,16 @@ def run_gui():
             self.detector.stop()
             self.destroy()
 
-    app = LunchBoxApp()
-    app.mainloop()
+    try:
+        print("Creating application window...")
+        app = LunchBoxApp()
+        print("Window ready — starting main loop")
+        app.mainloop()
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        input("\nPress Enter to exit...")
 
 
 def run_headless():
@@ -464,4 +475,10 @@ def run_headless():
 
 
 if __name__ == "__main__":
-    run_gui()
+    try:
+        run_gui()
+    except Exception as e:
+        print(f"\nFATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        input("\nPress Enter to exit...")
