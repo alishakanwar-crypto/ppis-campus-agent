@@ -30,12 +30,22 @@ from datetime import datetime
 from collections import deque
 from pathlib import Path
 
+# Patch cv2 for headless builds (missing GUI functions that ultralytics expects)
+if not hasattr(cv2, "imshow"):
+    cv2.imshow = lambda *a, **k: None
+    cv2.destroyAllWindows = lambda *a, **k: None
+    cv2.waitKey = lambda *a, **k: 0
+
 print("[2/4] Checking YOLO library...")
 sys.stdout.flush()
 try:
     import ultralytics
 except ImportError:
     print("ERROR: ultralytics not installed. Run: pip install ultralytics")
+    input("Press Enter to exit...")
+    sys.exit(1)
+except Exception as e:
+    print(f"ERROR loading ultralytics: {e}")
     input("Press Enter to exit...")
     sys.exit(1)
 
