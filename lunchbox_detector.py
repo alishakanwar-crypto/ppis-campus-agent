@@ -30,16 +30,16 @@ from datetime import datetime
 from collections import deque
 from pathlib import Path
 
-print("[2/4] Loading YOLO model library...")
+print("[2/4] Checking YOLO library...")
 sys.stdout.flush()
 try:
-    from ultralytics import YOLO
+    import ultralytics
 except ImportError:
     print("ERROR: ultralytics not installed. Run: pip install ultralytics")
     input("Press Enter to exit...")
     sys.exit(1)
 
-print("[3/4] YOLO loaded successfully")
+print("[3/4] YOLO library ready")
 sys.stdout.flush()
 
 logging.basicConfig(
@@ -121,7 +121,7 @@ class LunchBoxDetector:
     def load_model(self):
         """Load YOLOv8 model."""
         logger.info(f"Loading YOLO model: {self.model_path}")
-        self.model = YOLO(self.model_path)
+        self.model = ultralytics.YOLO(self.model_path)
         logger.info("Model loaded successfully")
 
     def start(self):
