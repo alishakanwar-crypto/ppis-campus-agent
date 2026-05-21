@@ -26,6 +26,13 @@ from pathlib import Path
 import httpx
 import numpy as np
 
+# Import order matters on Windows: face_recognition must be imported BEFORE
+# cv2 to avoid a silent C-level DLL conflict crash.
+try:
+    import face_recognition
+except ImportError:
+    face_recognition = None
+
 try:
     import dlib
 except ImportError:
@@ -35,11 +42,6 @@ try:
     import cv2
 except ImportError:
     cv2 = None
-
-try:
-    import face_recognition
-except ImportError:
-    face_recognition = None
 
 try:
     from PIL import Image, ImageEnhance, ImageFilter
