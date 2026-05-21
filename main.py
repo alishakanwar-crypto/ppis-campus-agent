@@ -2942,21 +2942,30 @@ if __name__ == "__main__":
 
     port = config.get("local_port", 8897)
 
-    # Note: port-killing is handled by run_forever.bat before this script
-    # starts. Calling subprocess here can trigger C-level DLL conflicts
-    # with dlib/cv2/face_recognition on Windows.
-
     logger.info(f"Starting PPIS Campus Agent on http://localhost:{port}")
-    try:
-        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
-                    timeout_keep_alive=30, ws_max_size=16777216)
-    except OSError as e:
-        if "10048" in str(e) or "Address already in use" in str(e):
-            logger.warning(f"Port {port} still busy — another instance may be running. Exiting.")
-            sys.exit(1)
-        else:
-            logger.critical(f"FATAL OS ERROR: {e}", exc_info=True)
+
+    # Retry binding up to 5 times with delays — handles port still in
+    # TIME_WAIT or a stale process that hasn't released the socket yet.
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
+                        timeout_keep_alive=30, ws_max_size=16777216)
+            break  # Normal shutdown
+        except OSError as e:
+            if ("10048" in str(e) or "Address already in use" in str(e)):
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Port {port} busy (attempt {attempt}/{max_retries})."
+                        f" Retrying in {attempt * 3}s..."
+                    )
+                    time.sleep(attempt * 3)
+                else:
+                    logger.error(f"Port {port} still busy after {max_retries} attempts. Exiting.")
+                    sys.exit(1)
+            else:
+                logger.critical(f"FATAL OS ERROR: {e}", exc_info=True)
+                raise
+        except Exception as e:
+            logger.critical(f"FATAL CRASH: {e}", exc_info=True)
             raise
-    except Exception as e:
-        logger.critical(f"FATAL CRASH: {e}", exc_info=True)
-        raise

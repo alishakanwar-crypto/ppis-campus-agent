@@ -10,6 +10,16 @@ REM   - Cleans up old snapshot files to prevent disk fill
 title PPIS Campus Agent (24/7)
 cd /d "%~dp0"
 
+REM Prevent multiple instances of run_forever.bat
+set "LOCKFILE=%~dp0.agent_lock"
+if exist "%LOCKFILE%" (
+    echo Another run_forever.bat is already running! Exiting this instance.
+    echo If that's wrong, delete %LOCKFILE% and retry.
+    timeout /t 5
+    exit /b 1
+)
+echo %DATE% %TIME% > "%LOCKFILE%"
+
 REM Suppress Windows Error Reporting dialogs
 reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f >nul 2>&1
 reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v Disabled /t REG_DWORD /d 1 /f >nul 2>&1
@@ -54,3 +64,7 @@ echo.
 echo [%DATE% %TIME%] Agent stopped (exit code: %ERRORLEVEL%). Restarting in 10 seconds...
 timeout /t 10 /nobreak
 goto loop
+
+:cleanup
+REM Clean up lock file on exit
+if exist "%LOCKFILE%" del "%LOCKFILE%" 2>nul
