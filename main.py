@@ -2935,8 +2935,10 @@ def _kill_port_holder(port: int) -> None:
 
 
 if __name__ == "__main__":
+    print('[DBG] K: __main__ block entered', flush=True)
     import uvicorn
     import traceback
+    print('[DBG] L: uvicorn imported', flush=True)
 
     # Global crash logger
     def _log_crash(exc_type, exc_value, exc_tb):
@@ -2947,15 +2949,20 @@ if __name__ == "__main__":
     sys.excepthook = _log_crash
 
     port = config.get("local_port", 8897)
+    print(f'[DBG] M: port={port}, about to kill port holder', flush=True)
 
     # Kill any lingering process on our port before binding
     _kill_port_holder(port)
+    print('[DBG] N: port holder killed, about to start uvicorn', flush=True)
 
     logger.info(f"Starting PPIS Campus Agent on http://localhost:{port}")
     try:
+        print('[DBG] O: calling uvicorn.run() now...', flush=True)
         uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
                     timeout_keep_alive=30, ws_max_size=16777216)
+        print('[DBG] P: uvicorn exited normally', flush=True)
     except OSError as e:
+        print(f'[DBG] OSError: {e}', flush=True)
         if "10048" in str(e) or "Address already in use" in str(e):
             logger.warning(f"Port {port} still busy, retrying after kill...")
             _kill_port_holder(port)
@@ -2965,5 +2972,6 @@ if __name__ == "__main__":
             logger.critical(f"FATAL OS ERROR: {e}", exc_info=True)
             raise
     except Exception as e:
+        print(f'[DBG] Exception: {type(e).__name__}: {e}', flush=True)
         logger.critical(f"FATAL CRASH: {e}", exc_info=True)
         raise
