@@ -39,17 +39,10 @@ try:
 except ImportError:
     cv2 = None
 
-try:
-    import easyocr
-    _EASYOCR_AVAILABLE = True
-except ImportError:
-    _EASYOCR_AVAILABLE = False
-
-try:
-    import pytesseract
-    _TESSERACT_AVAILABLE = True
-except ImportError:
-    _TESSERACT_AVAILABLE = False
+# easyocr and pytesseract imported lazily to avoid DLL conflicts on Windows.
+# easyocr loads PyTorch which conflicts with dlib/cv2/face_recognition DLLs.
+_EASYOCR_AVAILABLE = None  # None = not yet checked, True/False after check
+_TESSERACT_AVAILABLE = None
 
 import database as db
 import face_db
@@ -67,11 +60,18 @@ CAPTURE_LOG_DIR.mkdir(exist_ok=True)
 
 def _get_ocr_reader():
     """Lazily initialize EasyOCR reader."""
-    global _ocr_reader
+    global _ocr_reader, _EASYOCR_AVAILABLE
     if _ocr_reader is not None:
         return _ocr_reader
+    if _EASYOCR_AVAILABLE is None:
+        try:
+            import easyocr as _easyocr_mod
+            _EASYOCR_AVAILABLE = True
+        except ImportError:
+            _EASYOCR_AVAILABLE = False
     if _EASYOCR_AVAILABLE:
         try:
+            import easyocr
             _ocr_reader = easyocr.Reader(['en'], gpu=False)
             logger.info("EasyOCR reader initialized")
             return _ocr_reader
@@ -98,8 +98,16 @@ def _ocr_from_image(img_array: np.ndarray) -> str:
             logger.warning(f"EasyOCR failed: {e}")
 
     # Fallback to Tesseract
+    global _TESSERACT_AVAILABLE
+    if _TESSERACT_AVAILABLE is None:
+        try:
+            import pytesseract as _pt
+            _TESSERACT_AVAILABLE = True
+        except ImportError:
+            _TESSERACT_AVAILABLE = False
     if _TESSERACT_AVAILABLE:
         try:
+            import pytesseract
             if Image is not None:
                 pil_img = Image.fromarray(img_array)
                 text = pytesseract.image_to_string(pil_img).strip().upper()

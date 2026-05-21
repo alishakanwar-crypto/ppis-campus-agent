@@ -25,28 +25,21 @@ from pathlib import Path
 
 import httpx
 import numpy as np
-print('[DEBUG] AE: numpy/httpx loaded', flush=True)
 
 # Import order matters on Windows: face_recognition must be imported BEFORE
 # cv2 to avoid a silent C-level DLL conflict crash.
 try:
-    print('[DEBUG] AE: importing face_recognition...', flush=True)
     import face_recognition
-    print('[DEBUG] AE: face_recognition OK', flush=True)
 except ImportError:
     face_recognition = None
 
 try:
-    print('[DEBUG] AE: importing dlib...', flush=True)
     import dlib
-    print('[DEBUG] AE: dlib OK', flush=True)
 except ImportError:
     dlib = None
 
 try:
-    print('[DEBUG] AE: importing cv2...', flush=True)
     import cv2
-    print('[DEBUG] AE: cv2 OK', flush=True)
 except ImportError:
     cv2 = None
 
@@ -75,11 +68,8 @@ def _check_insightface_available():
     except Exception:
         return False
 
-print('[DEBUG] AE: importing database...', flush=True)
 import database as db
-print('[DEBUG] AE: importing face_db...', flush=True)
 import face_db
-print('[DEBUG] AE: face_db OK', flush=True)
 
 logger = logging.getLogger("ppis-agent.attendance")
 
@@ -3356,6 +3346,4 @@ class AttendanceEngine:
 
 
 # Module-level singleton
-print('[DEBUG] AE: creating AttendanceEngine...', flush=True)
 engine = AttendanceEngine()
-print('[DEBUG] AE: engine created OK', flush=True)

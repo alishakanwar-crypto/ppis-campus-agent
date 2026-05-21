@@ -72,15 +72,9 @@ def _ensure_dlib_compat():
                 print(f"[AUTOFIX] pip failed: {result.stderr[-300:]}")
 
 _ensure_dlib_compat()
-print('[DEBUG] Step 1: dlib compat done', flush=True)
 
-print('[DEBUG] Step 1a: importing attendance_engine...', flush=True)
 from attendance_engine import engine as attendance_engine
-print('[DEBUG] Step 1b: attendance_engine done', flush=True)
-
-print('[DEBUG] Step 1c: importing face_db...', flush=True)
 import face_db
-print('[DEBUG] Step 2: imports done', flush=True)
 
 try:
     from PIL import Image
@@ -343,9 +337,7 @@ async def load_config() -> dict:
 
 
 # Config will be loaded async in lifespan; use local as placeholder
-print('[DEBUG] Step 3: about to load config', flush=True)
 config = load_config_local()
-print('[DEBUG] Step 4: config loaded', flush=True)
 
 # ---------------------------------------------------------------------------
 # Hikvision ISAPI — Snapshot capture
@@ -1084,10 +1076,7 @@ async def lifespan(app: FastAPI):
     logger.info("PPIS Campus Agent stopped")
 
 
-print('[DEBUG] Step 5: creating FastAPI app', flush=True)
 app = FastAPI(title="PPIS Campus Agent", lifespan=lifespan)
-print('[DEBUG] Step 6: FastAPI app created', flush=True)
-print('[DEBUG] Step 6a: mounting static dirs...', flush=True)
 
 # Ensure static directories exist
 (Path(__file__).parent / "static").mkdir(exist_ok=True)
@@ -1105,8 +1094,6 @@ async def dashboard():
     """Main dashboard page."""
     return get_dashboard_html()
 
-
-print('[DEBUG] Step 6b: routes up to /', flush=True)
 
 @app.get("/api/config")
 async def get_config():
@@ -1495,8 +1482,6 @@ async def list_snapshots():
 # Face Recognition Attendance API
 # ---------------------------------------------------------------------------
 
-print('[DEBUG] Step 6c: routes up to /api/mapping', flush=True)
-
 @app.post("/api/face/register")
 async def register_face(
     image: UploadFile = File(...),
@@ -1761,8 +1746,6 @@ async def scan_specific_camera(location: str):
         return {"error": str(e), "camera": label}
 
 
-print('[DEBUG] Step 6d: routes up to /api/attendance/scan', flush=True)
-
 @app.get("/api/attendance/status")
 async def get_attendance_status():
     """Get attendance engine status."""
@@ -1896,8 +1879,6 @@ async def get_camera_resolutions():
         "cameras": results,
     }
 
-
-print('[DEBUG] Step 6e: routes up to /api/camera-resolutions', flush=True)
 
 @app.post("/api/attendance/sync-to-cloud")
 async def sync_attendance_to_cloud():
@@ -2155,8 +2136,6 @@ async def get_unrecognized_faces(limit: int = 50, all: bool = False):
 
 import a4_capture
 
-
-print('[DEBUG] Step 6f: routes up to /api/a4-capture', flush=True)
 
 @app.post("/api/a4-capture/single")
 async def a4_capture_single(
@@ -2943,10 +2922,7 @@ def _kill_port_holder(port: int) -> None:
         pass
 
 
-print('[DEBUG] Step 7: module-level code complete', flush=True)
-
 if __name__ == "__main__":
-    print('[DEBUG] Step 8: entering __main__', flush=True)
     import uvicorn
     import traceback
 
