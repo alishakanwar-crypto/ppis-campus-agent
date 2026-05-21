@@ -22,7 +22,6 @@ os.environ.setdefault("ULTRALYTICS_OFFLINE", "1")
 print("[1/4] Loading core modules...")
 sys.stdout.flush()
 
-import cv2
 import time
 import logging
 import threading
@@ -30,24 +29,44 @@ from datetime import datetime
 from collections import deque
 from pathlib import Path
 
-# Patch cv2 for headless builds (missing GUI functions that ultralytics expects)
-if not hasattr(cv2, "imshow"):
-    cv2.imshow = lambda *a, **k: None
-    cv2.destroyAllWindows = lambda *a, **k: None
-    cv2.waitKey = lambda *a, **k: 0
-
-print("[2/4] Checking YOLO library...")
+print("[2/4] Loading YOLO library (this may take a moment)...")
 sys.stdout.flush()
+
+# Import ultralytics FIRST (before cv2) to avoid DLL conflicts on Windows.
+# ultralytics imports cv2 internally; if cv2 is headless (no imshow),
+# we catch the error, patch cv2, and retry.
 try:
     import ultralytics
-except ImportError:
-    print("ERROR: ultralytics not installed. Run: pip install ultralytics")
-    input("Press Enter to exit...")
-    sys.exit(1)
+except (ImportError, AttributeError) as e:
+    if "imshow" in str(e) or "cv2" in str(e):
+        # cv2 headless - patch missing GUI functions and retry
+        import cv2
+        cv2.imshow = lambda *a, **k: None
+        cv2.destroyAllWindows = lambda *a, **k: None
+        cv2.waitKey = lambda *a, **k: 0
+        # Clear partially-loaded ultralytics modules
+        for mod_name in list(sys.modules.keys()):
+            if mod_name.startswith("ultralytics"):
+                del sys.modules[mod_name]
+        import ultralytics
+    elif "ultralytics" in str(e).lower():
+        print("ERROR: ultralytics not installed. Run: pip install ultralytics")
+        input("Press Enter to exit...")
+        sys.exit(1)
+    else:
+        raise
 except Exception as e:
     print(f"ERROR loading ultralytics: {e}")
     input("Press Enter to exit...")
     sys.exit(1)
+
+# Now import cv2 (already loaded by ultralytics, no new DLL loading)
+import cv2
+# Ensure headless patches are applied
+if not hasattr(cv2, "imshow"):
+    cv2.imshow = lambda *a, **k: None
+    cv2.destroyAllWindows = lambda *a, **k: None
+    cv2.waitKey = lambda *a, **k: 0
 
 print("[3/4] YOLO library ready")
 sys.stdout.flush()
