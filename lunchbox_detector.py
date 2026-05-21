@@ -389,23 +389,28 @@ def run_gui():
             """Update camera feed in GUI (called from detection thread)."""
             try:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # Resize to fit
                 h, w = frame_rgb.shape[:2]
                 max_w, max_h = 900, 450
                 scale = min(max_w / w, max_h / h)
                 new_w, new_h = int(w * scale), int(h * scale)
                 frame_resized = cv2.resize(frame_rgb, (new_w, new_h))
-
                 img = Image.fromarray(frame_resized)
-                photo = ImageTk.PhotoImage(img)
-
-                self.camera_label.configure(image=photo, text="")
-                self.camera_label.image = photo  # Keep reference
+                self.after(0, lambda: self._update_frame_ui(img))
             except Exception:
                 pass
 
+        def _update_frame_ui(self, img):
+            """Update frame on main thread."""
+            photo = ImageTk.PhotoImage(img)
+            self.camera_label.configure(image=photo, text="")
+            self.camera_label.image = photo
+
         def handle_alert(self, event):
-            """Handle detection alert."""
+            """Handle detection alert (called from detection thread)."""
+            self.after(0, lambda: self._handle_alert_ui(event))
+
+        def _handle_alert_ui(self, event):
+            """Update alert UI on main thread."""
             items = ", ".join(event["items_detected"])
             timestamp = datetime.now().strftime("%H:%M:%S")
             msg = f"[{timestamp}] LUNCH BOX OPENED - Items: {items}"
@@ -414,11 +419,9 @@ def run_gui():
             self.alert_label.configure(text=f"ALERT: {msg}")
             self.event_label.configure(text=f"Events: {event['event_number']}")
 
-            # Add to log
             self.log_text.insert("end", msg + "\n")
             self.log_text.see("end")
 
-            # Clear alert color after 5 seconds
             self.after(5000, lambda: self.alert_frame.configure(fg_color="transparent"))
 
         def update_status(self, status):
