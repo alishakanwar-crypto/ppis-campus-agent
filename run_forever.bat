@@ -40,6 +40,9 @@ REM Force-sync to latest remote code (nuclear but reliable)
 git fetch origin 2>nul
 git reset --hard origin/devin/1777002178-cloud-config-fetch 2>nul
 
+REM Clear bytecode cache to avoid stale .pyc files after code updates
+if exist "%~dp0__pycache__" rmdir /s /q "%~dp0__pycache__" 2>nul
+
 REM Clean up old snapshot files (older than 1 day) to prevent disk fill
 echo [%DATE% %TIME%] Cleaning old snapshots...
 forfiles /p "%~dp0snapshots" /d -1 /c "cmd /c del @path" 2>nul
@@ -48,7 +51,7 @@ forfiles /p "%~dp0attendance_snapshots" /d -1 /c "cmd /c del @path" 2>nul
 echo.
 echo [%DATE% %TIME%] Starting PPIS Campus Agent...
 echo ============================================
-py -3.12 main.py
+py -3.12 -B main.py
 echo.
 echo [%DATE% %TIME%] Agent stopped (exit code: %ERRORLEVEL%). Restarting in 10 seconds...
 timeout /t 10 /nobreak
