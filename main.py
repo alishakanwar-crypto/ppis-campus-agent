@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import faulthandler
 faulthandler.enable()  # Print C-level crash tracebacks
+print('[DBG] A: faulthandler enabled', flush=True)
 
 import asyncio
 import base64
@@ -72,9 +73,12 @@ def _ensure_dlib_compat():
                 print(f"[AUTOFIX] pip failed: {result.stderr[-300:]}")
 
 _ensure_dlib_compat()
+print('[DBG] B: dlib compat done', flush=True)
 
 from attendance_engine import engine as attendance_engine
+print('[DBG] C: attendance_engine loaded', flush=True)
 import face_db
+print('[DBG] D: face_db loaded', flush=True)
 
 try:
     from PIL import Image
@@ -338,6 +342,7 @@ async def load_config() -> dict:
 
 # Config will be loaded async in lifespan; use local as placeholder
 config = load_config_local()
+print('[DBG] E: config loaded', flush=True)
 
 # ---------------------------------------------------------------------------
 # Hikvision ISAPI — Snapshot capture
@@ -1077,6 +1082,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="PPIS Campus Agent", lifespan=lifespan)
+print('[DBG] F: FastAPI app created', flush=True)
 
 # Ensure static directories exist
 (Path(__file__).parent / "static").mkdir(exist_ok=True)
@@ -2134,7 +2140,9 @@ async def get_unrecognized_faces(limit: int = 50, all: bool = False):
 # A4 Sheet Capture — Controlled face registration
 # ---------------------------------------------------------------------------
 
+print('[DBG] G: about to import a4_capture', flush=True)
 import a4_capture
+print('[DBG] H: a4_capture loaded', flush=True)
 
 
 @app.post("/api/a4-capture/single")
@@ -2240,6 +2248,8 @@ async def get_capture_cameras():
 # ---------------------------------------------------------------------------
 # Dashboard HTML (embedded for simplicity — no external templates needed)
 # ---------------------------------------------------------------------------
+
+print('[DBG] I: about to define dashboard HTML', flush=True)
 
 def get_dashboard_html() -> str:
     return """<!DOCTYPE html>
@@ -2896,6 +2906,8 @@ setInterval(async () => {
 </body>
 </html>"""
 
+
+print('[DBG] J: end of module, about to define entry point', flush=True)
 
 # ---------------------------------------------------------------------------
 # Entry point
