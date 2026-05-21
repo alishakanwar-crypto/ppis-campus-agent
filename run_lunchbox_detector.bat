@@ -4,26 +4,30 @@ echo   Lunch Box Detector - PPIS Campus Agent
 echo =============================================
 echo.
 
-:: Check if Python is available
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Python is not installed or not in PATH
-    echo Please install Python 3.10+ from https://python.org
-    pause
-    exit /b 1
+:: Use Python312 explicitly to avoid wrong Python
+set PYTHON="C:\Users\DELL\AppData\Local\Programs\Python\Python312\python.exe"
+
+:: Check if Python312 exists
+if not exist %PYTHON% (
+    echo Python312 not found, trying system python...
+    set PYTHON=python
 )
+
+echo Using: %PYTHON%
+echo.
 
 :: Install requirements if needed
 echo Checking dependencies...
-pip install -q ultralytics opencv-python customtkinter Pillow
+%PYTHON% -m pip install -q ultralytics opencv-python customtkinter Pillow 2>nul
 
 echo.
 echo Starting Lunch Box Detector...
 echo.
-python lunchbox_detector.py
+%PYTHON% lunchbox_detector.py
 
-if errorlevel 1 (
-    echo.
-    echo Error occurred. Press any key to exit.
-    pause
-)
+echo.
+echo =============================================
+echo   Detector has stopped.
+echo =============================================
+echo.
+pause
