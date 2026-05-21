@@ -1,20 +1,8 @@
 @echo off
+setlocal enabledelayedexpansion
 REM ============================================================
 REM PPIS Campus Agent — Windows Auto-Start Installer
 REM Run this ONCE as Administrator to set up background service.
-REM ============================================================
-REM
-REM This creates TWO Windows Scheduled Tasks:
-REM   1. "PPIS Campus Agent" — starts on boot/logon
-REM   2. "PPIS Campus Agent Watchdog" — runs every 5 minutes to
-REM      verify the agent is alive and restarts it if not
-REM
-REM The agent will survive:
-REM   - Closing all windows
-REM   - Logging out of Windows
-REM   - PC restarts and power cuts
-REM   - Agent crashes (auto-restart in 10 seconds via run_forever)
-REM   - run_forever.bat itself dying (watchdog restarts within 5 min)
 REM ============================================================
 
 echo.
@@ -33,62 +21,192 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+set AGENT_DIR=%~dp0
+set TASK_OK=0
+set WATCHDOG_OK=0
+
 REM Kill any existing agent processes
-echo [1/5] Stopping any running agent instances...
+echo [1/6] Stopping any running agent instances...
 taskkill /F /IM python.exe /FI "WINDOWTITLE eq PPIS*" >nul 2>&1
 
-REM ── Task 1: Main startup task ──────────────────────────────────
+REM ── Task 1: Main startup task via XML ──────────────────────────
 
-REM Remove old task if it exists
+echo [2/6] Creating startup task...
 schtasks /delete /tn "PPIS Campus Agent" /f >nul 2>&1
 
-REM Try SYSTEM-level onstart first (survives logoff)
-echo [2/5] Creating startup task (boot trigger)...
-schtasks /create /tn "PPIS Campus Agent" /tr "wscript.exe \"%~dp0run_hidden.vbs\"" /sc onstart /rl highest /delay 0000:30 /ru SYSTEM /f 2>nul
+REM Generate XML task definition (most reliable method)
+set XMLFILE=%TEMP%\ppis_agent_task.xml
+(
+echo ^<?xml version="1.0" encoding="UTF-16"?^>
+echo ^<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"^>
+echo   ^<Triggers^>
+echo     ^<LogonTrigger^>
+echo       ^<Enabled^>true^</Enabled^>
+echo       ^<Delay^>PT30S^</Delay^>
+echo     ^</LogonTrigger^>
+echo     ^<BootTrigger^>
+echo       ^<Enabled^>true^</Enabled^>
+echo       ^<Delay^>PT60S^</Delay^>
+echo     ^</BootTrigger^>
+echo   ^</Triggers^>
+echo   ^<Principals^>
+echo     ^<Principal id="Author"^>
+echo       ^<LogonType^>InteractiveToken^</LogonType^>
+echo       ^<RunLevel^>HighestAvailable^</RunLevel^>
+echo     ^</Principal^>
+echo   ^</Principals^>
+echo   ^<Settings^>
+echo     ^<MultipleInstancesPolicy^>IgnoreNew^</MultipleInstancesPolicy^>
+echo     ^<DisallowStartIfOnBatteries^>false^</DisallowStartIfOnBatteries^>
+echo     ^<StopIfGoingOnBatteries^>false^</StopIfGoingOnBatteries^>
+echo     ^<AllowHardTerminate^>true^</AllowHardTerminate^>
+echo     ^<StartWhenAvailable^>true^</StartWhenAvailable^>
+echo     ^<RunOnlyIfNetworkAvailable^>false^</RunOnlyIfNetworkAvailable^>
+echo     ^<AllowStartOnDemand^>true^</AllowStartOnDemand^>
+echo     ^<Enabled^>true^</Enabled^>
+echo     ^<Hidden^>false^</Hidden^>
+echo     ^<ExecutionTimeLimit^>PT0S^</ExecutionTimeLimit^>
+echo     ^<Priority^>7^</Priority^>
+echo     ^<RestartOnFailure^>
+echo       ^<Interval^>PT1M^</Interval^>
+echo       ^<Count^>999^</Count^>
+echo     ^</RestartOnFailure^>
+echo   ^</Settings^>
+echo   ^<Actions Context="Author"^>
+echo     ^<Exec^>
+echo       ^<Command^>wscript.exe^</Command^>
+echo       ^<Arguments^>"!AGENT_DIR!run_hidden.vbs"^</Arguments^>
+echo       ^<WorkingDirectory^>!AGENT_DIR!^</WorkingDirectory^>
+echo     ^</Exec^>
+echo   ^</Actions^>
+echo ^</Task^>
+) > "%XMLFILE%"
 
-if %ERRORLEVEL% NEQ 0 (
-    echo       SYSTEM task failed, trying current user with logon trigger...
-    schtasks /create /tn "PPIS Campus Agent" /tr "wscript.exe \"%~dp0run_hidden.vbs\"" /sc onlogon /rl highest /f
+schtasks /create /tn "PPIS Campus Agent" /xml "%XMLFILE%" /f >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo       Boot/Logon task created (XML method)
+    set TASK_OK=1
+) else (
+    echo       XML method failed, trying simple command...
+    schtasks /create /tn "PPIS Campus Agent" /tr "wscript.exe \"%AGENT_DIR%run_hidden.vbs\"" /sc onlogon /rl highest /f >nul 2>&1
+    if !ERRORLEVEL! EQU 0 (
+        echo       Logon task created (simple method)
+        set TASK_OK=1
+    ) else (
+        echo       WARNING: Could not create scheduled task
+    )
 )
+del "%XMLFILE%" >nul 2>&1
 
-REM ── Task 2: Watchdog (every 5 minutes) ────────────────────────
+REM ── Task 2: Watchdog (every 5 minutes) via XML ────────────────
 
+echo [3/6] Creating watchdog task (every 5 minutes)...
 schtasks /delete /tn "PPIS Campus Agent Watchdog" /f >nul 2>&1
 
-echo [3/5] Creating watchdog task (every 5 minutes)...
-schtasks /create /tn "PPIS Campus Agent Watchdog" /tr "cmd.exe /c \"%~dp0watchdog.bat\"" /sc minute /mo 5 /rl highest /ru SYSTEM /f 2>nul
+set XMLFILE2=%TEMP%\ppis_watchdog_task.xml
+(
+echo ^<?xml version="1.0" encoding="UTF-16"?^>
+echo ^<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"^>
+echo   ^<Triggers^>
+echo     ^<TimeTrigger^>
+echo       ^<Repetition^>
+echo         ^<Interval^>PT5M^</Interval^>
+echo         ^<StopAtDurationEnd^>false^</StopAtDurationEnd^>
+echo       ^</Repetition^>
+echo       ^<StartBoundary^>2026-01-01T00:00:00^</StartBoundary^>
+echo       ^<Enabled^>true^</Enabled^>
+echo     ^</TimeTrigger^>
+echo   ^</Triggers^>
+echo   ^<Principals^>
+echo     ^<Principal id="Author"^>
+echo       ^<LogonType^>InteractiveToken^</LogonType^>
+echo       ^<RunLevel^>HighestAvailable^</RunLevel^>
+echo     ^</Principal^>
+echo   ^</Principals^>
+echo   ^<Settings^>
+echo     ^<MultipleInstancesPolicy^>IgnoreNew^</MultipleInstancesPolicy^>
+echo     ^<DisallowStartIfOnBatteries^>false^</DisallowStartIfOnBatteries^>
+echo     ^<StopIfGoingOnBatteries^>false^</StopIfGoingOnBatteries^>
+echo     ^<AllowHardTerminate^>true^</AllowHardTerminate^>
+echo     ^<StartWhenAvailable^>true^</StartWhenAvailable^>
+echo     ^<AllowStartOnDemand^>true^</AllowStartOnDemand^>
+echo     ^<Enabled^>true^</Enabled^>
+echo     ^<Hidden^>true^</Hidden^>
+echo     ^<ExecutionTimeLimit^>PT2M^</ExecutionTimeLimit^>
+echo   ^</Settings^>
+echo   ^<Actions Context="Author"^>
+echo     ^<Exec^>
+echo       ^<Command^>cmd.exe^</Command^>
+echo       ^<Arguments^>/c "!AGENT_DIR!watchdog.bat"^</Arguments^>
+echo       ^<WorkingDirectory^>!AGENT_DIR!^</WorkingDirectory^>
+echo     ^</Exec^>
+echo   ^</Actions^>
+echo ^</Task^>
+) > "%XMLFILE2%"
 
-if %ERRORLEVEL% NEQ 0 (
-    echo       SYSTEM watchdog failed, trying current user...
-    schtasks /create /tn "PPIS Campus Agent Watchdog" /tr "cmd.exe /c \"%~dp0watchdog.bat\"" /sc minute /mo 5 /rl highest /f
+schtasks /create /tn "PPIS Campus Agent Watchdog" /xml "%XMLFILE2%" /f >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo       Watchdog task created (XML method)
+    set WATCHDOG_OK=1
+) else (
+    echo       XML method failed, trying simple command...
+    schtasks /create /tn "PPIS Campus Agent Watchdog" /tr "cmd.exe /c \"%AGENT_DIR%watchdog.bat\"" /sc minute /mo 5 /f >nul 2>&1
+    if !ERRORLEVEL! EQU 0 (
+        echo       Watchdog task created (simple method)
+        set WATCHDOG_OK=1
+    ) else (
+        echo       WARNING: Could not create watchdog task
+    )
 )
+del "%XMLFILE2%" >nul 2>&1
 
-REM ── Startup folder shortcut (belt-and-suspenders) ─────────────
+REM ── Startup folder shortcut (always works) ─────────────────────
 
-echo [4/5] Adding startup folder shortcut as backup...
+echo [4/6] Adding startup folder shortcut...
 set STARTUP_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
 
-REM Create a VBS shortcut in Startup folder as a third fallback
-echo Set WshShell = CreateObject("WScript.Shell") > "%STARTUP_DIR%\PPIS Agent.vbs"
-echo scriptDir = "%~dp0" >> "%STARTUP_DIR%\PPIS Agent.vbs"
-echo WshShell.CurrentDirectory = scriptDir >> "%STARTUP_DIR%\PPIS Agent.vbs"
-echo WshShell.Run """" ^& scriptDir ^& "run_forever.bat""", 0, False >> "%STARTUP_DIR%\PPIS Agent.vbs"
+> "%STARTUP_DIR%\PPIS Agent.vbs" (
+    echo Set WshShell = CreateObject^("WScript.Shell"^)
+    echo WshShell.CurrentDirectory = "%AGENT_DIR%"
+    echo WshShell.Run """" ^& "%AGENT_DIR%run_forever.bat" ^& """", 0, False
+)
+echo       Startup folder shortcut created
+
+REM ── Verify tasks ───────────────────────────────────────────────
+
+echo [5/6] Verifying installation...
+echo.
+
+schtasks /query /tn "PPIS Campus Agent" >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo       [OK] Boot/Logon task: INSTALLED
+) else (
+    echo       [!!] Boot/Logon task: NOT INSTALLED
+)
+
+schtasks /query /tn "PPIS Campus Agent Watchdog" >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo       [OK] Watchdog task:   INSTALLED
+) else (
+    echo       [!!] Watchdog task:   NOT INSTALLED
+)
+
+if exist "%STARTUP_DIR%\PPIS Agent.vbs" (
+    echo       [OK] Startup folder:  INSTALLED
+) else (
+    echo       [!!] Startup folder:  NOT INSTALLED
+)
 
 REM ── Start the agent NOW ───────────────────────────────────────
 
-echo [5/5] Starting the agent now...
-start "" /B wscript.exe "%~dp0run_hidden.vbs"
+echo.
+echo [6/6] Starting the agent now...
+start "" wscript.exe "%AGENT_DIR%run_hidden.vbs"
 
 echo.
 echo ============================================================
-echo   SUCCESS! PPIS Campus Agent fully installed.
+echo   INSTALLATION COMPLETE
 echo ============================================================
-echo.
-echo   THREE layers of protection installed:
-echo.
-echo   1. BOOT TRIGGER  — Agent starts when PC turns on
-echo   2. WATCHDOG       — Checks every 5 min, restarts if dead
-echo   3. STARTUP FOLDER — Backup trigger on user login
 echo.
 echo   The agent is now RUNNING in the background.
 echo.
@@ -100,3 +218,4 @@ echo              del "%STARTUP_DIR%\PPIS Agent.vbs"
 echo.
 
 pause
+endlocal
