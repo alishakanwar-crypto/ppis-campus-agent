@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import faulthandler
 faulthandler.enable()  # Print C-level crash tracebacks
-print('[DBG] A: faulthandler enabled', flush=True)
 
 import asyncio
 import base64
@@ -73,12 +72,9 @@ def _ensure_dlib_compat():
                 print(f"[AUTOFIX] pip failed: {result.stderr[-300:]}")
 
 _ensure_dlib_compat()
-print('[DBG] B: dlib compat done', flush=True)
 
 from attendance_engine import engine as attendance_engine
-print('[DBG] C: attendance_engine loaded', flush=True)
 import face_db
-print('[DBG] D: face_db loaded', flush=True)
 
 try:
     from PIL import Image
@@ -342,7 +338,6 @@ async def load_config() -> dict:
 
 # Config will be loaded async in lifespan; use local as placeholder
 config = load_config_local()
-print('[DBG] E: config loaded', flush=True)
 
 # ---------------------------------------------------------------------------
 # Hikvision ISAPI — Snapshot capture
@@ -1082,7 +1077,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="PPIS Campus Agent", lifespan=lifespan)
-print('[DBG] F: FastAPI app created', flush=True)
 
 # Ensure static directories exist
 (Path(__file__).parent / "static").mkdir(exist_ok=True)
@@ -2140,9 +2134,7 @@ async def get_unrecognized_faces(limit: int = 50, all: bool = False):
 # A4 Sheet Capture — Controlled face registration
 # ---------------------------------------------------------------------------
 
-print('[DBG] G: about to import a4_capture', flush=True)
 import a4_capture
-print('[DBG] H: a4_capture loaded', flush=True)
 
 
 @app.post("/api/a4-capture/single")
@@ -2248,8 +2240,6 @@ async def get_capture_cameras():
 # ---------------------------------------------------------------------------
 # Dashboard HTML (embedded for simplicity — no external templates needed)
 # ---------------------------------------------------------------------------
-
-print('[DBG] I: about to define dashboard HTML', flush=True)
 
 def get_dashboard_html() -> str:
     return """<!DOCTYPE html>
@@ -2907,38 +2897,14 @@ setInterval(async () => {
 </html>"""
 
 
-print('[DBG] J: end of module, about to define entry point', flush=True)
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def _kill_port_holder(port: int) -> None:
-    """Kill any process currently listening on the given port (Windows only)."""
-    if sys.platform != "win32":
-        return
-    import subprocess
-    try:
-        result = subprocess.run(
-            f'netstat -ano | findstr :{port} | findstr LISTENING',
-            capture_output=True, text=True, shell=True,
-        )
-        for line in result.stdout.strip().splitlines():
-            parts = line.split()
-            if parts:
-                pid = parts[-1]
-                subprocess.run(f"taskkill /F /PID {pid}", shell=True,
-                               capture_output=True)
-                logger.info(f"Killed stale process PID {pid} on port {port}")
-        time.sleep(3)
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":
-    print('[DBG] K: __main__ block entered', flush=True)
     import uvicorn
     import traceback
-    print('[DBG] L: uvicorn imported', flush=True)
 
     # Global crash logger
     def _log_crash(exc_type, exc_value, exc_tb):
@@ -2949,29 +2915,22 @@ if __name__ == "__main__":
     sys.excepthook = _log_crash
 
     port = config.get("local_port", 8897)
-    print(f'[DBG] M: port={port}, about to kill port holder', flush=True)
 
-    # Kill any lingering process on our port before binding
-    _kill_port_holder(port)
-    print('[DBG] N: port holder killed, about to start uvicorn', flush=True)
+    # Note: port-killing is handled by run_forever.bat before this script
+    # starts. Calling subprocess here can trigger C-level DLL conflicts
+    # with dlib/cv2/face_recognition on Windows.
 
     logger.info(f"Starting PPIS Campus Agent on http://localhost:{port}")
     try:
-        print('[DBG] O: calling uvicorn.run() now...', flush=True)
         uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
                     timeout_keep_alive=30, ws_max_size=16777216)
-        print('[DBG] P: uvicorn exited normally', flush=True)
     except OSError as e:
-        print(f'[DBG] OSError: {e}', flush=True)
         if "10048" in str(e) or "Address already in use" in str(e):
-            logger.warning(f"Port {port} still busy, retrying after kill...")
-            _kill_port_holder(port)
-            time.sleep(5)
-            uvicorn.run(app, host="0.0.0.0", port=port)
+            logger.warning(f"Port {port} still busy — another instance may be running. Exiting.")
+            sys.exit(1)
         else:
             logger.critical(f"FATAL OS ERROR: {e}", exc_info=True)
             raise
     except Exception as e:
-        print(f'[DBG] Exception: {type(e).__name__}: {e}', flush=True)
         logger.critical(f"FATAL CRASH: {e}", exc_info=True)
         raise
