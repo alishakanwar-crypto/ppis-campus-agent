@@ -72,9 +72,11 @@ def _ensure_dlib_compat():
                 print(f"[AUTOFIX] pip failed: {result.stderr[-300:]}")
 
 _ensure_dlib_compat()
+print('[DEBUG] Step 1: dlib compat done', flush=True)
 
 from attendance_engine import engine as attendance_engine
 import face_db
+print('[DEBUG] Step 2: imports done', flush=True)
 
 try:
     from PIL import Image
@@ -337,7 +339,9 @@ async def load_config() -> dict:
 
 
 # Config will be loaded async in lifespan; use local as placeholder
+print('[DEBUG] Step 3: about to load config', flush=True)
 config = load_config_local()
+print('[DEBUG] Step 4: config loaded', flush=True)
 
 # ---------------------------------------------------------------------------
 # Hikvision ISAPI — Snapshot capture
@@ -1076,7 +1080,9 @@ async def lifespan(app: FastAPI):
     logger.info("PPIS Campus Agent stopped")
 
 
+print('[DEBUG] Step 5: creating FastAPI app', flush=True)
 app = FastAPI(title="PPIS Campus Agent", lifespan=lifespan)
+print('[DEBUG] Step 6: FastAPI app created', flush=True)
 
 # Ensure static directories exist
 (Path(__file__).parent / "static").mkdir(exist_ok=True)
@@ -2922,7 +2928,10 @@ def _kill_port_holder(port: int) -> None:
         pass
 
 
+print('[DEBUG] Step 7: module-level code complete', flush=True)
+
 if __name__ == "__main__":
+    print('[DEBUG] Step 8: entering __main__', flush=True)
     import uvicorn
     import traceback
 
