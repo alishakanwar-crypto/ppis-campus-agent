@@ -17,10 +17,14 @@ from pathlib import Path
 
 import numpy as np
 
+# Import order matters on Windows: face_recognition must be imported BEFORE
+# cv2 to avoid a silent C-level DLL conflict crash (exit code 1, zero output).
+# face_recognition internally loads dlib; loading cv2 first can corrupt the
+# dlib DLL state and cause face_recognition's import to segfault.
 try:
-    import cv2
+    import face_recognition
 except ImportError:
-    cv2 = None
+    face_recognition = None
 
 try:
     import dlib
@@ -28,9 +32,9 @@ except ImportError:
     dlib = None
 
 try:
-    import face_recognition
+    import cv2
 except ImportError:
-    face_recognition = None
+    cv2 = None
 
 try:
     from PIL import Image
