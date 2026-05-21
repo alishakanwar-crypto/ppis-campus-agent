@@ -9,9 +9,11 @@ Usage:
     python lunchbox_detector.py
 
 Requirements:
-    pip install ultralytics opencv-python-headless customtkinter Pillow
+    pip install ultralytics opencv-python customtkinter Pillow
 """
+print("[1/4] Loading core modules...")
 
+import sys
 import cv2
 import time
 import logging
@@ -21,11 +23,15 @@ from datetime import datetime
 from collections import deque
 from pathlib import Path
 
+print("[2/4] Loading YOLO model library...")
 try:
     from ultralytics import YOLO
 except ImportError:
     print("ERROR: ultralytics not installed. Run: pip install ultralytics")
-    raise
+    input("Press Enter to exit...")
+    sys.exit(1)
+
+print("[3/4] YOLO loaded successfully")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -476,9 +482,11 @@ def run_headless():
 
 if __name__ == "__main__":
     try:
+        print("[4/4] Launching GUI...")
         run_gui()
-    except Exception as e:
-        print(f"\nFATAL ERROR: {e}")
+    except BaseException as e:
+        print(f"\nFATAL ERROR: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
+    finally:
         input("\nPress Enter to exit...")
