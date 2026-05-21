@@ -11,19 +11,27 @@ Usage:
 Requirements:
     pip install ultralytics opencv-python customtkinter Pillow
 """
-print("[1/4] Loading core modules...")
-
 import sys
+import os
+
+# Disable YOLO online checks to prevent crashes on startup
+os.environ["YOLO_AUTOINSTALL"] = "false"
+os.environ["YOLO_OFFLINE"] = "true"
+os.environ.setdefault("ULTRALYTICS_OFFLINE", "1")
+
+print("[1/4] Loading core modules...")
+sys.stdout.flush()
+
 import cv2
 import time
 import logging
 import threading
-import os
 from datetime import datetime
 from collections import deque
 from pathlib import Path
 
 print("[2/4] Loading YOLO model library...")
+sys.stdout.flush()
 try:
     from ultralytics import YOLO
 except ImportError:
@@ -32,6 +40,7 @@ except ImportError:
     sys.exit(1)
 
 print("[3/4] YOLO loaded successfully")
+sys.stdout.flush()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -444,7 +453,7 @@ def run_gui():
     try:
         print("Creating application window...")
         app = LunchBoxApp()
-        print("Window ready — starting main loop")
+        print("Window ready - starting main loop")
         app.mainloop()
     except Exception as e:
         print(f"\nERROR: {e}")
@@ -481,12 +490,21 @@ def run_headless():
 
 
 if __name__ == "__main__":
+    _log = open("lunchbox_debug.log", "w")
     try:
+        _log.write("Starting...\n"); _log.flush()
         print("[4/4] Launching GUI...")
+        sys.stdout.flush()
+        _log.write("Calling run_gui...\n"); _log.flush()
         run_gui()
+        _log.write("run_gui returned normally\n"); _log.flush()
     except BaseException as e:
-        print(f"\nFATAL ERROR: {type(e).__name__}: {e}")
+        msg = f"FATAL ERROR: {type(e).__name__}: {e}"
+        print(f"\n{msg}")
+        _log.write(msg + "\n"); _log.flush()
         import traceback
         traceback.print_exc()
+        traceback.print_exc(file=_log)
     finally:
+        _log.write("Exiting\n"); _log.close()
         input("\nPress Enter to exit...")
