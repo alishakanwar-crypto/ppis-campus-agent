@@ -256,6 +256,50 @@ def _click_query(driver):
     return False
 
 
+def _capture_row_photo(driver, row) -> str:
+    """Try to capture a face photo from a table row.
+
+    Looks for <img> elements in the row, converts to base64 via canvas.
+    Returns base64-encoded JPEG string or empty string if no image found.
+    """
+    from selenium.webdriver.common.by import By
+
+    try:
+        imgs = row.find_elements(By.TAG_NAME, "img")
+        for img in imgs:
+            src = img.get_attribute("src") or ""
+            # Skip tiny icons / placeholders
+            width = img.get_attribute("naturalWidth") or img.get_attribute("width") or "0"
+            try:
+                if int(width) < 20:
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+            if src.startswith("data:image"):
+                # Already a data URL — extract base64 part
+                if "," in src:
+                    return src.split(",", 1)[1]
+                continue
+
+            # Convert via canvas to base64
+            b64 = driver.execute_script("""
+                var img = arguments[0];
+                if (!img.complete || img.naturalWidth === 0) return '';
+                var c = document.createElement('canvas');
+                c.width = img.naturalWidth;
+                c.height = img.naturalHeight;
+                c.getContext('2d').drawImage(img, 0, 0);
+                try { return c.toDataURL('image/jpeg', 0.85).split(',')[1]; }
+                catch(e) { return ''; }
+            """, img)
+            if b64:
+                return b64
+    except Exception as e:
+        logger.debug("Photo capture failed for row: %s", e)
+    return ""
+
+
 def _extract_events(driver) -> list[dict]:
     """Extract face recognition events from the records table."""
     from selenium.webdriver.common.by import By
@@ -279,11 +323,18 @@ def _extract_events(driver) -> list[dict]:
         if method not in ("Face", "Fingerprint"):
             continue
 
-        events.append({
+        evt = {
             "pin": uid,
             "name": name,
             "timestamp": timestamp,
-        })
+        }
+
+        # Try to capture the face photo from this row
+        photo_b64 = _capture_row_photo(driver, row)
+        if photo_b64:
+            evt["photo"] = photo_b64
+
+        events.append(evt)
 
     return events
 
