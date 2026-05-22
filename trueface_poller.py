@@ -1,13 +1,13 @@
 """
-TrueFace Attendance Poller — Dahua JSON-RPC Protocol.
+TrueFace 3000 Attendance Notifier.
 
-The TrueFace 300 uses a Dahua-based web interface with JSON-RPC API.
-This script authenticates, searches for access control records,
-and sends WhatsApp notifications for new face recognition events.
+Connects to the TrueFace device's real-time event stream and CGI API.
+When a face is recognized (access granted), sends a WhatsApp notification.
+
+Flow: Face recognized → Access Granted → This script catches event → WhatsApp sent
 
 Run: python trueface_poller.py
 """
-import asyncio
 import hashlib
 import logging
 import json
@@ -17,446 +17,350 @@ import httpx
 from datetime import datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("trueface_poller")
+logger = logging.getLogger("trueface")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 DEVICE_IP = "192.168.1.112"
-DEVICE_URL = f"http://{DEVICE_IP}"
 DEVICE_USER = "admin"
 DEVICE_PASS = "tipl9910"
-POLL_INTERVAL = 10  # seconds between polls
+CLOUD_API = "https://ppis-whatsapp-bot.fly.dev/api/send-whatsapp"
 
 USERS_FILE = "trueface_users.json"
 try:
     with open(USERS_FILE) as f:
         USERS = json.load(f)
-    logger.info(f"Loaded {len(USERS)} TrueFace users from {USERS_FILE}")
+    logger.info(f"Loaded {len(USERS)} users from {USERS_FILE}")
 except Exception:
     USERS = {}
-    logger.warning(f"No {USERS_FILE} found, using empty user map")
+    logger.warning(f"No {USERS_FILE} found")
 
 _notified_today = {}
-_last_dedup_date = ""
-_seen_events = set()
+_last_date = ""
 
 
-def _clear_daily_dedup():
-    global _last_dedup_date, _notified_today, _seen_events
+def _check_dedup(pin):
+    global _last_date, _notified_today
     today = datetime.now(IST).strftime("%Y-%m-%d")
-    if today != _last_dedup_date:
+    if today != _last_date:
         _notified_today.clear()
-        _seen_events.clear()
-        _last_dedup_date = today
+        _last_date = today
+    if _notified_today.get(pin) == today:
+        return True  # already notified
+    now = datetime.now(IST)
+    if now.weekday() in (5, 6):
+        logger.info("Weekend — skipping notification")
+        return True
+    return False
 
 
-async def _send_whatsapp(name: str, phone: str, time_str: str):
-    import httpx as hx
+def _send_whatsapp(name, phone, time_str):
     try:
-        async with hx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://ppis-whatsapp-bot.fly.dev/api/send-whatsapp",
-                json={
-                    "to": phone,
-                    "template_name": "ppis_teacher_present_text",
-                    "language_code": "en",
-                    "body_params": [name, time_str],
-                },
-            )
-            logger.info(f"WhatsApp: {resp.status_code} {resp.text[:200]}")
-            return resp.status_code == 200
+        resp = httpx.post(CLOUD_API, json={
+            "to": phone,
+            "template_name": "ppis_teacher_present_text",
+            "language_code": "en",
+            "body_params": [name, time_str],
+        }, timeout=30)
+        logger.info(f"WhatsApp -> {phone}: {resp.status_code} {resp.text[:100]}")
+        return resp.status_code == 200
     except Exception as e:
         logger.error(f"WhatsApp error: {e}")
         return False
 
 
-async def _process_attendance(pin: str, timestamp: str):
-    _clear_daily_dedup()
+def _process_event(user_id, timestamp=None):
+    pin = str(user_id)
     user = USERS.get(pin)
     if not user:
-        logger.warning(f"Unknown PIN={pin}")
+        logger.warning(f"Unknown user ID: {pin}")
         return
     name = user["name"]
     phone = user.get("phone", "")
-    logger.info(f"ATTENDANCE: {name} PIN={pin} time={timestamp}")
-    today = datetime.now(IST).strftime("%Y-%m-%d")
-    if _notified_today.get(pin) == today:
+    if not phone:
+        logger.warning(f"No phone for {name}")
+        return
+    if _check_dedup(pin):
         logger.info(f"Already notified {name} today")
         return
+    if timestamp:
+        try:
+            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+            time_str = dt.strftime("%I:%M %p")
+        except (ValueError, TypeError):
+            time_str = datetime.now(IST).strftime("%I:%M %p")
+    else:
+        time_str = datetime.now(IST).strftime("%I:%M %p")
+
+    logger.info(f">>> ATTENDANCE: {name} at {time_str} — sending WhatsApp to {phone}")
+    _notified_today[pin] = datetime.now(IST).strftime("%Y-%m-%d")
+    _send_whatsapp(name, phone, time_str)
+
+
+def dahua_digest_auth():
+    """Create httpx client with Dahua digest authentication."""
+    return httpx.DigestAuth(DEVICE_USER, DEVICE_PASS)
+
+
+def try_cgi_event_stream():
+    """Listen to real-time events via CGI event manager (Server-Sent Events).
+    This gives instant notifications when access is granted."""
+    url = f"http://{DEVICE_IP}/cgi-bin/eventManager.cgi"
+    auth = dahua_digest_auth()
+
+    # Try different event codes
+    event_codes = [
+        "AccessControl",
+        "All",
+    ]
+
+    for codes in event_codes:
+        try:
+            logger.info(f"Trying CGI event stream: codes=[{codes}]...")
+            with httpx.stream(
+                "GET",
+                f"{url}?action=attach&codes=[{codes}]&heartbeat=5",
+                auth=auth,
+                timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
+            ) as response:
+                logger.info(f"Event stream response: {response.status_code}")
+                if response.status_code == 200:
+                    logger.info(f"Connected to event stream! Waiting for events...")
+                    for line in response.iter_lines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        logger.info(f"EVENT: {line[:200]}")
+                        # Parse event data
+                        _parse_event_line(line)
+                    return True
+                else:
+                    logger.warning(f"Event stream returned {response.status_code}")
+        except httpx.TimeoutException:
+            logger.warning(f"Event stream timeout for codes=[{codes}]")
+        except Exception as e:
+            logger.warning(f"Event stream error for codes=[{codes}]: {e}")
+
+    return False
+
+
+def _parse_event_line(line):
+    """Parse a Dahua event line and process attendance."""
+    # Dahua events come as key=value pairs like:
+    # Code=AccessControl;action=Pulse;index=0
+    # Or as multipart boundary data with JSON
+    if "UserID=" in line or "UserID\":" in line:
+        # Try to extract UserID
+        m = re.search(r'UserID[=:"\s]+(\d+)', line)
+        if m:
+            user_id = m.group(1)
+            # Extract time if present
+            tm = re.search(r'Time[=:"\s]+([\d-]+ [\d:]+)', line)
+            timestamp = tm.group(1) if tm else None
+            _process_event(user_id, timestamp)
+    elif "Code=AccessControl" in line or '"Code":"AccessControl"' in line:
+        logger.info("Access control event detected, waiting for details...")
+
+
+def try_cgi_records():
+    """Try CGI-based record finder as fallback."""
+    base = f"http://{DEVICE_IP}/cgi-bin/recordFinder.cgi"
+    auth = dahua_digest_auth()
+
+    # Step 1: Create a record finder instance
+    names = ["AccessControlCardRec", "TrafficSnapRecord", "AccessOpenDoorRecord"]
+    for name in names:
+        try:
+            r = httpx.get(f"{base}?action=factory.create&name={name}", auth=auth, timeout=10)
+            logger.info(f"CGI factory({name}): {r.status_code} -> {r.text[:200]}")
+            if r.status_code == 200 and "result=" in r.text:
+                # Extract object ID
+                m = re.search(r'result=(\d+)', r.text)
+                if m:
+                    obj = m.group(1)
+                    logger.info(f"  Created RecordFinder object: {obj}")
+                    return _cgi_find_records(base, auth, obj)
+        except Exception as e:
+            logger.warning(f"CGI factory({name}) error: {e}")
+
+    return False
+
+
+def _cgi_find_records(base, auth, obj):
+    """Use CGI record finder to get today's records."""
     now = datetime.now(IST)
-    if now.weekday() in (5, 6):
-        logger.info(f"Weekend skip for {name}")
-        return
+    start = now.strftime("%Y-%m-%d%%2000:00:00")
+    end = now.strftime("%Y-%m-%d%%2023:59:59")
+
     try:
-        dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-        time_str = dt.strftime("%I:%M %p")
-    except (ValueError, TypeError):
-        time_str = now.strftime("%I:%M %p")
-    if phone:
-        _notified_today[pin] = today
-        logger.info(f">>> Sending WhatsApp to {phone} for {name} at {time_str}")
-        await _send_whatsapp(name, phone, time_str)
-
-
-class DahuaRPC:
-    """Dahua JSON-RPC client for TrueFace device."""
-
-    def __init__(self, host: str, user: str, password: str):
-        self.host = host
-        self.base_url = f"http://{host}"
-        self.user = user
-        self.password = password
-        self.session_id = None
-        self.request_id = 0
-        self.client = None
-
-    async def connect(self):
-        self.client = httpx.AsyncClient(timeout=10, follow_redirects=True)
-
-    async def close(self):
-        if self.client:
-            await self.client.aclose()
-
-    def _next_id(self):
-        self.request_id += 1
-        return self.request_id
-
-    async def _rpc(self, method: str, params=None, endpoint="/RPC2", session=None):
-        """Send a JSON-RPC request."""
-        payload = {
-            "method": method,
-            "id": self._next_id(),
-        }
-        if params is not None:
-            payload["params"] = params
-        if session or self.session_id:
-            payload["session"] = session or self.session_id
-
-        try:
-            resp = await self.client.post(
-                f"{self.base_url}{endpoint}",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            data = resp.json()
-            return data
-        except Exception as e:
-            logger.error(f"RPC error ({method}): {e}")
-            return None
-
-    async def login(self) -> bool:
-        """Authenticate using Dahua digest login protocol."""
-        logger.info(f"Logging in to {self.base_url} as {self.user}...")
-
-        # Step 1: Send initial login to get challenge
-        resp = await self._rpc(
-            "global.login",
-            {
-                "userName": self.user,
-                "password": "",
-                "clientType": "Web3.0",
-            },
-            endpoint="/RPC2_Login",
+        # Start find
+        r = httpx.get(
+            f"{base}?action=startFind&object={obj}"
+            f"&condition.StartTime={start}&condition.EndTime={end}",
+            auth=auth, timeout=10
         )
+        logger.info(f"CGI startFind: {r.status_code} -> {r.text[:200]}")
 
-        if not resp:
-            logger.error("No response from login step 1")
-            return False
+        # Get count
+        r = httpx.get(f"{base}?action=getQuerySize&object={obj}", auth=auth, timeout=10)
+        logger.info(f"CGI getQuerySize: {r.status_code} -> {r.text[:200]}")
 
-        logger.info(f"Login step 1 response: {json.dumps(resp)[:300]}")
+        # Do find
+        r = httpx.get(f"{base}?action=doFind&object={obj}&count=100", auth=auth, timeout=10)
+        logger.info(f"CGI doFind: {r.status_code} -> {r.text[:500]}")
 
-        # Extract challenge parameters
-        session = resp.get("session")
-        params = resp.get("params", {})
-        realm = params.get("realm", "")
-        random_str = params.get("random", "")
-        encryption = params.get("encryption", "Default")
+        if r.status_code == 200:
+            # Parse records from response
+            records = _parse_cgi_records(r.text)
+            logger.info(f"Found {len(records)} records via CGI")
+            return records
 
-        if not session or not realm:
-            # Maybe the device uses a simpler auth
-            logger.warning(f"No challenge received, trying direct login...")
-            # Try with password directly
-            resp2 = await self._rpc(
-                "global.login",
-                {
-                    "userName": self.user,
-                    "password": self.password,
-                    "clientType": "Web3.0",
-                    "loginType": "Direct",
-                },
-                endpoint="/RPC2_Login",
-            )
-            if resp2 and resp2.get("result"):
-                self.session_id = resp2.get("session")
-                logger.info(f"Direct login successful! Session: {self.session_id}")
-                return True
-            logger.error(f"Direct login failed: {resp2}")
-            return False
+    except Exception as e:
+        logger.error(f"CGI find error: {e}")
 
-        # Step 2: Compute digest authentication
-        # Dahua digest: MD5(user:realm:password) then MD5(user:random:ha1)
-        ha1 = hashlib.md5(f"{self.user}:{realm}:{self.password}".encode()).hexdigest().upper()
-        auth_response = hashlib.md5(f"{self.user}:{random_str}:{ha1}".encode()).hexdigest().upper()
+    return []
 
-        logger.info(f"Computing auth: realm={realm}, random={random_str[:8]}...")
 
-        # Step 3: Send authenticated login
-        resp2 = await self._rpc(
-            "global.login",
-            {
-                "userName": self.user,
-                "password": auth_response,
-                "clientType": "Web3.0",
-                "loginType": "Direct",
-                "authorityType": encryption,
-            },
-            endpoint="/RPC2_Login",
-            session=session,
-        )
+def _parse_cgi_records(text):
+    """Parse CGI record finder response into record list."""
+    records = []
+    current = {}
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        if '=' in line:
+            key, _, val = line.partition('=')
+            current[key.strip()] = val.strip()
+    if current:
+        records.append(current)
+    return records
 
-        if not resp2:
-            logger.error("No response from login step 2")
-            return False
 
-        logger.info(f"Login step 2 response: {json.dumps(resp2)[:300]}")
+def try_rpc_approach():
+    """Use Dahua JSON-RPC API as another fallback — poll via AccessAttendance."""
+    logger.info("Trying JSON-RPC approach...")
 
-        if resp2.get("result"):
-            self.session_id = resp2.get("session", session)
-            logger.info(f"Login successful! Session: {self.session_id}")
-            return True
-        else:
-            error = resp2.get("error", {})
-            logger.error(f"Login failed: {error}")
-            return False
+    client = httpx.Client(timeout=10)
 
-    async def search_records(self, start_time: str, end_time: str) -> list:
-        """Search access control / attendance records.
-        
-        Dahua uses RecordFinder pattern:
-        1. factory -> create finder
-        2. startFind -> set search params
-        3. doFind -> get results
-        4. stopFind -> cleanup
-        5. destroy -> release
-        """
-        records = []
+    # Login
+    r = client.post(f'http://{DEVICE_IP}/RPC2_Login', json={
+        'method': 'global.login',
+        'params': {'userName': DEVICE_USER, 'password': '', 'clientType': 'Web3.0'},
+        'id': 1
+    }).json()
 
-        # Try multiple record finder names
-        finder_names = [
-            "AccessControlCardRec",
-            "TrafficEventDetail",
-            "AccessEvent",
-            "AttendanceRecord",
-        ]
+    session = r.get('session', '')
+    realm = r.get('params', {}).get('realm', '')
+    random = r.get('params', {}).get('random', '')
 
-        for finder_name in finder_names:
-            try:
-                result = await self._search_with_finder(finder_name, start_time, end_time)
-                if result:
-                    records.extend(result)
-                    logger.info(f"Found {len(result)} records with finder '{finder_name}'")
-                    break
-            except Exception as e:
-                logger.debug(f"Finder '{finder_name}' failed: {e}")
-
-        return records
-
-    async def _search_with_finder(self, finder_name: str, start_time: str, end_time: str) -> list:
-        """Use RecordFinder to search for records."""
-        # Step 1: Create finder
-        resp = await self._rpc("RecordFinder.factory", {"name": finder_name})
-        if not resp or not resp.get("result"):
-            return []
-
-        object_id = resp["result"]
-        logger.info(f"Created finder '{finder_name}' -> object_id={object_id}")
-
-        try:
-            # Step 2: Start search
-            condition = {
-                "QueryCondition": {
-                    "StartTime": start_time,
-                    "EndTime": end_time,
-                }
-            }
-            resp = await self._rpc(f"{object_id}.startFind", condition)
-            if not resp or not resp.get("result"):
-                logger.debug(f"startFind failed for {finder_name}")
-                return []
-
-            # Step 3: Get results
-            resp = await self._rpc(f"{object_id}.doFind", {"count": 100})
-            if not resp:
-                return []
-
-            found = resp.get("params", {}).get("found", 0)
-            items = resp.get("params", {}).get("records", [])
-            logger.info(f"doFind: found={found}, items={len(items)}")
-
-            # Step 4: Stop and destroy
-            await self._rpc(f"{object_id}.stopFind")
-            await self._rpc(f"{object_id}.destroy")
-
-            return items
-
-        except Exception as e:
-            logger.error(f"Search error: {e}")
-            # Cleanup
-            try:
-                await self._rpc(f"{object_id}.stopFind")
-                await self._rpc(f"{object_id}.destroy")
-            except Exception:
-                pass
-            return []
-
-    async def list_services(self):
-        """List all available services/methods on the device."""
-        logger.info("Listing available services...")
-        
-        # Try system.listService to discover all available RPC methods
-        for method in ["system.listService", "system.listMethod", "magicBox.listMethod"]:
-            resp = await self._rpc(method)
-            if resp and resp.get("result"):
-                logger.info(f"  {method} -> SUCCESS")
-                params = resp.get("params", {})
-                if isinstance(params, dict):
-                    for key, val in params.items():
-                        logger.info(f"    {key}: {str(val)[:200]}")
-                elif isinstance(params, list):
-                    for item in params[:50]:
-                        logger.info(f"    {item}")
-                return params
-            elif resp:
-                logger.info(f"  {method} -> {resp.get('error', {})}")
+    if not realm:
+        logger.error("RPC login failed — no challenge")
         return None
 
-    async def try_alternative_apis(self):
-        """Try various Dahua API methods to find records."""
-        now = datetime.now(IST)
-        start = now.strftime("%Y-%m-%d 00:00:00")
-        end = now.strftime("%Y-%m-%d 23:59:59")
-        
-        methods_to_try = [
-            # List available services first
-            ("system.listService", None),
-            ("system.listMethod", None),
-            # Event/log methods
-            ("EventManager.factory", {"name": "AccessControlAlarmRecord"}),
-            ("EventManager.factory", {"name": "AccessControl"}),
-            ("MediaFinder.factory", {"name": "AccessControlEvent"}),
-            ("RecordUpdater.factory", {"name": "AccessControlCardRec"}),
-            ("QueryRecordManager.factory", None),
-            # Direct query methods
-            ("AccessService.getAccessEventList", {
-                "StartTime": start, "EndTime": end,
-            }),
-            ("AccessService.searchAccessEvent", {
-                "StartTime": start, "EndTime": end, "type": "All",
-            }),
-            ("configManager.getConfig", {"name": "AccessControl"}),
-            ("accessControlManager.getCaps", None),
-            ("accessControlManager.getRecordCount", None),
-            ("accessControlManager.searchRecord", {
-                "StartTime": start, "EndTime": end,
-            }),
-            # Attendance specific
-            ("attendanceManager.getRecordCount", None),
-            ("attendanceManager.findRecord", {
-                "StartTime": start, "EndTime": end,
-            }),
-            # Generic finders with different names
-            ("RecordFinder.factory", {"name": "AccessControlRecord"}),
-            ("RecordFinder.factory", {"name": "EventRecord"}),
-            ("RecordFinder.factory", {"name": "CardRecord"}),
-            ("RecordFinder.factory", {"name": "FaceRecord"}),
-            # Log manager variants
-            ("log.startFind", {
-                "condition": {"StartTime": start, "EndTime": end, "Types": ["All"]}
-            }),
-            ("log.factory", {"name": "All"}),
-        ]
+    ha1 = hashlib.md5(f'{DEVICE_USER}:{realm}:{DEVICE_PASS}'.encode()).hexdigest().upper()
+    auth_resp = hashlib.md5(f'{DEVICE_USER}:{random}:{ha1}'.encode()).hexdigest().upper()
 
-        logger.info("Trying alternative API methods...")
-        for method, params in methods_to_try:
-            resp = await self._rpc(method, params)
-            if resp:
-                result = resp.get("result", False)
-                error = resp.get("error", {})
-                p = resp.get("params", {})
-                status = "SUCCESS" if result else f"FAIL({error.get('message', '')})"
-                logger.info(f"  {method} -> {status} params={str(p)[:200]}")
+    r2 = client.post(f'http://{DEVICE_IP}/RPC2_Login', json={
+        'method': 'global.login',
+        'params': {'userName': DEVICE_USER, 'password': auth_resp,
+                   'clientType': 'Web3.0', 'loginType': 'Direct', 'authorityType': 'Default'},
+        'id': 2, 'session': session
+    }).json()
+
+    if not r2.get('result'):
+        logger.error("RPC login failed")
+        return None
+
+    sid = r2['session']
+    logger.info(f"RPC login OK, session={sid}")
+    return client, sid
 
 
-async def main():
-    logger.info("=" * 60)
-    logger.info("TrueFace Attendance Poller — Dahua JSON-RPC Protocol")
-    logger.info("=" * 60)
-    logger.info(f"Device: {DEVICE_URL}")
-    logger.info(f"Users: {json.dumps(USERS, indent=2)}")
+def rpc_poll_loop(client, sid):
+    """Poll for new records via RPC."""
+    seen = set()
+    rid = 2
 
-    rpc = DahuaRPC(DEVICE_IP, DEVICE_USER, DEVICE_PASS)
-    await rpc.connect()
-
-    # Step 1: Login
-    if not await rpc.login():
-        logger.error("Failed to login! Trying alternative endpoints...")
-
-        # Try /RPC2 directly (some devices don't use /RPC2_Login)
-        for endpoint in ["/RPC2", "/RPC", "/OutsideCmd"]:
-            logger.info(f"Trying endpoint: {endpoint}")
-            resp = await rpc._rpc(
-                "global.login",
-                {"userName": DEVICE_USER, "password": DEVICE_PASS, "clientType": "Web3.0"},
-                endpoint=endpoint,
-            )
-            if resp:
-                logger.info(f"  Response: {json.dumps(resp)[:300]}")
-                if resp.get("result"):
-                    rpc.session_id = resp.get("session")
-                    logger.info(f"  Login via {endpoint} successful!")
-                    break
-
-    if not rpc.session_id:
-        logger.error("All login attempts failed. Trying unauthenticated requests...")
-
-    # Step 2: List available services to discover the right API
-    services = await rpc.list_services()
-
-    # Step 3: Try to find records
-    now = datetime.now(IST)
-    start = now.strftime("%Y-%m-%d 00:00:00")
-    end = now.strftime("%Y-%m-%d 23:59:59")
-
-    records = await rpc.search_records(start, end)
-    if records:
-        logger.info(f"Found {len(records)} attendance records!")
-        for r in records:
-            logger.info(f"  Record: {json.dumps(r)[:200]}")
-    else:
-        logger.warning("No records found via RecordFinder. Trying alternatives...")
-        await rpc.try_alternative_apis()
-
-    # Step 3: If we found a working method, start polling loop
-    if records:
-        logger.info(f"\nStarting polling loop (every {POLL_INTERVAL}s)...")
-        last_event_time = ""
-        while True:
-            await asyncio.sleep(POLL_INTERVAL)
+    while True:
+        try:
             now = datetime.now(IST)
             start = now.strftime("%Y-%m-%d 00:00:00")
             end = now.strftime("%Y-%m-%d 23:59:59")
-            new_records = await rpc.search_records(start, end)
-            for r in new_records:
-                event_id = f"{r.get('UserID', '')}-{r.get('Time', '')}"
-                if event_id not in _seen_events:
-                    _seen_events.add(event_id)
-                    pin = str(r.get("UserID", ""))
-                    ts = r.get("Time", "")
-                    await _process_attendance(pin, ts)
-    else:
-        logger.info("\nCould not find records API. Share this output for debugging.")
 
-    await rpc.close()
+            rid += 1
+            r = client.post(f'http://{DEVICE_IP}/RPC2', json={
+                'method': 'AccessAttendance.startFind',
+                'params': {'condition': {'StartTime': start, 'EndTime': end}},
+                'id': rid, 'session': sid
+            }).json()
+
+            if r.get('result'):
+                token = r.get('params', {}).get('Token')
+                if token:
+                    rid += 1
+                    r2 = client.post(f'http://{DEVICE_IP}/RPC2', json={
+                        'method': 'AccessAttendance.doFind',
+                        'params': {'Token': token, 'Count': 100},
+                        'id': rid, 'session': sid
+                    }).json()
+
+                    records = r2.get('params', {}).get('Records', [])
+                    for rec in records:
+                        uid = rec.get('UserID', '')
+                        ts = rec.get('Time', '')
+                        key = f"{uid}-{ts}"
+                        if key not in seen:
+                            seen.add(key)
+                            _process_event(uid, ts)
+
+                    rid += 1
+                    client.post(f'http://{DEVICE_IP}/RPC2', json={
+                        'method': 'AccessAttendance.stopFind',
+                        'params': {'Token': token},
+                        'id': rid, 'session': sid
+                    })
+
+        except Exception as e:
+            logger.error(f"RPC poll error: {e}")
+
+        time.sleep(10)
+
+
+def main():
+    logger.info("=" * 50)
+    logger.info("TrueFace 3000 Attendance Notifier")
+    logger.info("=" * 50)
+    logger.info(f"Device: {DEVICE_IP}")
+    logger.info(f"Users: {json.dumps(USERS, indent=2)}")
+    logger.info("")
+
+    # Method 1: Real-time event stream (best — instant notifications)
+    logger.info("=== Method 1: Real-time event stream ===")
+    if try_cgi_event_stream():
+        return  # This blocks forever listening to events
+
+    # Method 2: CGI record finder
+    logger.info("\n=== Method 2: CGI record finder ===")
+    records = try_cgi_records()
+    if records:
+        logger.info(f"CGI found {len(records)} records")
+        for rec in records:
+            uid = rec.get('UserID', rec.get('records[0].UserID', ''))
+            ts = rec.get('Time', rec.get('records[0].Time', ''))
+            if uid:
+                _process_event(uid, ts)
+
+    # Method 3: RPC polling
+    logger.info("\n=== Method 3: RPC polling ===")
+    result = try_rpc_approach()
+    if result:
+        client, sid = result
+        logger.info("Starting RPC poll loop (every 10 seconds)...")
+        rpc_poll_loop(client, sid)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
