@@ -1,15 +1,15 @@
 """
-Standalone TrueFace ADMS listener.
+Standalone TrueFace ADMS / Push Protocol listener.
 
-Listens on port 8898 for raw TCP connections from the TrueFace device.
-Parses the ZKTeco ADMS protocol and forwards attendance events to the
-campus agent's /api/trueface endpoints.
+The TimeWatch TrueFace 300 uses a ZKTeco binary push protocol (NOT HTTP).
+This listener handles the binary handshake, keeps the connection alive,
+and processes real-time attendance events.
 
 Run: python trueface_listener.py
 """
 import asyncio
+import struct
 import logging
-import urllib.parse
 import json
 from datetime import datetime, timezone, timedelta
 
@@ -17,7 +17,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("trueface_listener")
 
 IST = timezone(timedelta(hours=5, minutes=30))
-AGENT_URL = "http://127.0.0.1:8897"
 
 # Load user mappings
 USERS_FILE = "trueface_users.json"
@@ -62,165 +61,182 @@ async def _send_whatsapp(name: str, phone: str, time_str: str):
         return False
 
 
-def _parse_attlog(body: str):
+def _hex_dump(data: bytes, max_bytes: int = 256) -> str:
+    """Create a readable hex dump of binary data."""
+    lines = []
+    for i in range(0, min(len(data), max_bytes), 16):
+        chunk = data[i:i+16]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"  {i:04x}: {hex_part:<48} {ascii_part}")
+    if len(data) > max_bytes:
+        lines.append(f"  ... ({len(data) - max_bytes} more bytes)")
+    return "\n".join(lines)
+
+
+def _extract_serial(data: bytes) -> str:
+    """Extract the device serial number from binary data."""
+    try:
+        text = data.decode("ascii", errors="ignore")
+        # Look for TW serial number pattern
+        import re
+        match = re.search(r"(TW\d{13,16})", text)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def _extract_attendance_data(data: bytes) -> list:
+    """Try to extract attendance records from binary data.
+    
+    ZKTeco push protocol attendance records may contain:
+    - User PIN (numeric)
+    - Timestamp
+    - Verification mode
+    - Status
+    
+    Records are often embedded as text within binary frames.
+    """
     records = []
-    for line in body.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split("\t")
-        if len(parts) >= 2:
+    try:
+        text = data.decode("ascii", errors="ignore")
+        # Look for tab-separated attendance records: PIN\tTimestamp\tStatus...
+        import re
+        # Pattern: number, tab, datetime, tab, digits...
+        pattern = r"(\d+)\t(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\t(\d+)\t(\d+)"
+        for match in re.finditer(pattern, text):
             records.append({
-                "pin": parts[0].strip(),
-                "timestamp": parts[1].strip() if len(parts) > 1 else "",
-                "status": parts[2].strip() if len(parts) > 2 else "0",
-                "verify": parts[3].strip() if len(parts) > 3 else "0",
+                "pin": match.group(1),
+                "timestamp": match.group(2),
+                "status": match.group(3),
+                "verify": match.group(4),
             })
+        
+        # Also try space-separated or other formats
+        if not records:
+            # Some devices use: USER_ID TIMESTAMP VERIFY_MODE STATUS
+            pattern2 = r"(\d+)\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+(\d+)"
+            for match in re.finditer(pattern2, text):
+                records.append({
+                    "pin": match.group(1),
+                    "timestamp": match.group(2),
+                    "status": "0",
+                    "verify": match.group(3),
+                })
+    except Exception as e:
+        logger.error(f"Error parsing attendance data: {e}")
+    
     return records
 
 
+async def _process_attendance(pin: str, timestamp: str):
+    """Process a single attendance event."""
+    _clear_daily_dedup()
+    
+    user = USERS.get(pin)
+    if not user:
+        logger.warning(f"[TRUEFACE] Unknown PIN={pin}")
+        return
+    
+    name = user["name"]
+    phone = user.get("phone", "")
+    logger.info(f"[TRUEFACE] Attendance: {name} PIN={pin} time={timestamp}")
+    
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    if _notified_today.get(pin) == today:
+        logger.info(f"[TRUEFACE] Already notified {name} today, skipping")
+        return
+    
+    now = datetime.now(IST)
+    if now.weekday() in (5, 6):
+        logger.info(f"[TRUEFACE] Weekend skip for {name}")
+        return
+    
+    try:
+        dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        time_str = dt.strftime("%I:%M %p")
+    except (ValueError, TypeError):
+        time_str = now.strftime("%I:%M %p")
+    
+    if phone:
+        _notified_today[pin] = today
+        logger.info(f"[TRUEFACE] Sending WhatsApp to {phone} for {name} at {time_str}")
+        asyncio.create_task(_send_whatsapp(name, phone, time_str))
+
+
 async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Handle a raw TCP connection from the TrueFace device."""
+    """Handle a persistent TCP connection from the TrueFace device."""
     addr = writer.get_extra_info("peername")
-    logger.info(f"[TRUEFACE] Connection from {addr}")
+    logger.info(f"[TRUEFACE] === New connection from {addr} ===")
+
+    serial = ""
+    msg_count = 0
 
     try:
-        # Read the full HTTP request
-        raw = await asyncio.wait_for(reader.read(65536), timeout=10.0)
-        raw_text = raw.decode("utf-8", errors="replace")
-        logger.info(f"[TRUEFACE] Raw data ({len(raw)} bytes):\n{raw_text[:500]}")
-
-        # Parse HTTP request line
-        lines = raw_text.split("\r\n")
-        if not lines:
-            writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            await writer.drain()
-            writer.close()
-            return
-
-        request_line = lines[0]
-        logger.info(f"[TRUEFACE] Request: {request_line}")
-
-        # Find body (after blank line)
-        body = ""
-        blank_idx = raw_text.find("\r\n\r\n")
-        if blank_idx >= 0:
-            body = raw_text[blank_idx + 4:]
-
-        # Parse method and path
-        parts = request_line.split(" ")
-        method = parts[0] if parts else "GET"
-        path = parts[1] if len(parts) > 1 else "/"
-
-        # Parse query string
-        parsed = urllib.parse.urlparse(path)
-        params = urllib.parse.parse_qs(parsed.query)
-        sn = params.get("SN", [params.get("sn", ["unknown"])[0]])[0]
-        table = params.get("table", [""])[0].upper()
-
-        logger.info(f"[TRUEFACE] {method} {parsed.path} SN={sn} table={table}")
-
-        if "cdata" in parsed.path.lower():
-            if method == "GET":
-                # Handshake response
-                response = (
-                    f"GET OPTION FROM: {sn}\r\n"
-                    f"ATTLOGStamp=0\r\n"
-                    f"OPERLOGStamp=0\r\n"
-                    f"ATTPHOTOStamp=0\r\n"
-                    f"ErrorDelay=30\r\n"
-                    f"Delay=5\r\n"
-                    f"TransTimes=00:00;14:05\r\n"
-                    f"TransInterval=1\r\n"
-                    f"TransFlag=TransData AttLog\tOpLog\r\n"
-                    f"TimeZone=5\r\n"
-                    f"Realtime=1\r\n"
-                    f"Encrypt=0\r\n"
-                )
-                http_resp = (
-                    f"HTTP/1.1 200 OK\r\n"
-                    f"Content-Type: text/plain\r\n"
-                    f"Content-Length: {len(response)}\r\n"
-                    f"\r\n"
-                    f"{response}"
-                )
-                writer.write(http_resp.encode())
-                logger.info(f"[TRUEFACE] Sent handshake for SN={sn}")
-
-            elif method == "POST":
-                logger.info(f"[TRUEFACE] POST body: {body[:300]}")
-
-                if table == "ATTLOG":
-                    records = _parse_attlog(body)
-                    _clear_daily_dedup()
-
-                    for record in records:
-                        pin = record["pin"]
-                        timestamp = record["timestamp"]
-                        user = USERS.get(pin)
-
-                        if not user:
-                            logger.warning(f"[TRUEFACE] Unknown PIN={pin}")
-                            continue
-
-                        logger.info(f"[TRUEFACE] Attendance: {user['name']} PIN={pin} time={timestamp}")
-
-                        today = datetime.now(IST).strftime("%Y-%m-%d")
-                        if _notified_today.get(pin) == today:
-                            logger.info(f"[TRUEFACE] Already notified {user['name']} today")
-                            continue
-
-                        now = datetime.now(IST)
-                        if now.weekday() in (5, 6):
-                            logger.info(f"[TRUEFACE] Weekend skip for {user['name']}")
-                            continue
-
-                        try:
-                            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-                            time_str = dt.strftime("%I:%M %p")
-                        except (ValueError, TypeError):
-                            time_str = now.strftime("%I:%M %p")
-
-                        phone = user.get("phone", "")
-                        if phone:
-                            _notified_today[pin] = today
-                            name = user["name"]
-                            logger.info(f"[TRUEFACE] Sending WhatsApp to {phone} for {name} at {time_str}")
-                            asyncio.create_task(_send_whatsapp(name, phone, time_str))
-
-                http_resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
-                writer.write(http_resp.encode())
-
-        elif "getrequest" in parsed.path.lower():
-            # Device polling for commands
-            http_resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
-            writer.write(http_resp.encode())
-            logger.info(f"[TRUEFACE] getrequest poll from SN={sn}")
-
-        elif "devicecmd" in parsed.path.lower():
-            http_resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
-            writer.write(http_resp.encode())
-
-        else:
-            http_resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
-            writer.write(http_resp.encode())
-
-        await writer.drain()
-
-    except asyncio.TimeoutError:
-        logger.warning(f"[TRUEFACE] Timeout reading from {addr}")
+        while True:
+            try:
+                raw = await asyncio.wait_for(reader.read(65536), timeout=120.0)
+            except asyncio.TimeoutError:
+                logger.info(f"[TRUEFACE] Timeout waiting for data from {addr}, keeping alive")
+                continue
+            
+            if not raw:
+                logger.info(f"[TRUEFACE] Connection closed by {addr}")
+                break
+            
+            msg_count += 1
+            logger.info(f"[TRUEFACE] Message #{msg_count} from {addr} ({len(raw)} bytes)")
+            logger.info(f"[TRUEFACE] Hex dump:\n{_hex_dump(raw)}")
+            
+            # Extract serial number if we haven't yet
+            if not serial:
+                serial = _extract_serial(raw)
+                if serial:
+                    logger.info(f"[TRUEFACE] Device serial: {serial}")
+            
+            # Try to extract attendance records
+            records = _extract_attendance_data(raw)
+            if records:
+                logger.info(f"[TRUEFACE] Found {len(records)} attendance record(s)")
+                for r in records:
+                    await _process_attendance(r["pin"], r["timestamp"])
+            
+            # Analyze the binary header
+            if len(raw) >= 8:
+                header = struct.unpack("<HHHH", raw[:8])
+                cmd_id, checksum, session_id, reply_id = header
+                logger.info(f"[TRUEFACE] Header: cmd=0x{cmd_id:04x} chk=0x{checksum:04x} "
+                           f"sess=0x{session_id:04x} reply=0x{reply_id:04x}")
+                
+                # Build acknowledgment response with same session
+                # ZKTeco protocol: reply with CMD_ACK_OK (0x7d05) or echo back
+                ack_cmd = 0x7d05  # CMD_ACK_OK
+                ack_data = b""
+                ack_len = 8 + len(ack_data)
+                
+                # Try simple echo-back acknowledgment
+                reply = struct.pack("<HHHH", ack_cmd, 0, session_id, reply_id)
+                writer.write(reply)
+                await writer.drain()
+                logger.info(f"[TRUEFACE] Sent ACK (cmd=0x{ack_cmd:04x} sess=0x{session_id:04x})")
+            else:
+                # For short messages, just echo back
+                writer.write(raw)
+                await writer.drain()
+                logger.info(f"[TRUEFACE] Echoed back {len(raw)} bytes")
+    
+    except ConnectionResetError:
+        logger.info(f"[TRUEFACE] Connection reset by {addr}")
     except Exception as e:
-        logger.error(f"[TRUEFACE] Error: {e}", exc_info=True)
-        try:
-            writer.write(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
-            await writer.drain()
-        except Exception:
-            pass
+        logger.error(f"[TRUEFACE] Error handling {addr}: {e}", exc_info=True)
     finally:
         try:
             writer.close()
         except Exception:
             pass
+        logger.info(f"[TRUEFACE] Connection from {addr} ended (serial={serial}, msgs={msg_count})")
 
 
 async def main():
@@ -228,6 +244,7 @@ async def main():
     server = await asyncio.start_server(handle_connection, "0.0.0.0", port)
     logger.info(f"[TRUEFACE] Standalone listener started on port {port}")
     logger.info(f"[TRUEFACE] Registered users: {json.dumps(USERS, indent=2)}")
+    logger.info(f"[TRUEFACE] Waiting for TrueFace device connections...")
     async with server:
         await server.serve_forever()
 
