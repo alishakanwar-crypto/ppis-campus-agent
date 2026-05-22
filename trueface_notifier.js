@@ -13,7 +13,7 @@
  */
 (function () {
   var CLOUD_API = "https://ppis-whatsapp-bot.fly.dev/api/trueface/event";
-  var POLL_MS = 10000;
+  var POLL_MS = 3000;
   var seen = {};
   var nDate = "";
 
@@ -119,7 +119,7 @@
       }
     }
     if (clicked) {
-      setTimeout(scan, 3000);
+      setTimeout(scan, 1500);
     } else {
       scan();
     }
