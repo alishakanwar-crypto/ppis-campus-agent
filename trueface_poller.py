@@ -308,23 +308,71 @@ class DahuaRPC:
                 pass
             return []
 
+    async def list_services(self):
+        """List all available services/methods on the device."""
+        logger.info("Listing available services...")
+        
+        # Try system.listService to discover all available RPC methods
+        for method in ["system.listService", "system.listMethod", "magicBox.listMethod"]:
+            resp = await self._rpc(method)
+            if resp and resp.get("result"):
+                logger.info(f"  {method} -> SUCCESS")
+                params = resp.get("params", {})
+                if isinstance(params, dict):
+                    for key, val in params.items():
+                        logger.info(f"    {key}: {str(val)[:200]}")
+                elif isinstance(params, list):
+                    for item in params[:50]:
+                        logger.info(f"    {item}")
+                return params
+            elif resp:
+                logger.info(f"  {method} -> {resp.get('error', {})}")
+        return None
+
     async def try_alternative_apis(self):
         """Try various Dahua API methods to find records."""
+        now = datetime.now(IST)
+        start = now.strftime("%Y-%m-%d 00:00:00")
+        end = now.strftime("%Y-%m-%d 23:59:59")
+        
         methods_to_try = [
-            ("RecordFinder.factory", {"name": "AccessControlCardRec"}),
-            ("RecordFinder.factory", {"name": "TrafficEventDetail"}),
-            ("RecordFinder.factory", {"name": "AccessEvent"}),
-            ("configManager.getConfig", {"name": "AccessControl"}),
-            ("accessControl.getConfig", None),
-            ("accessControlManager.getCaps", None),
-            ("LogManager.getCaps", None),
-            ("LogManager.startFind", {
-                "condition": {
-                    "StartTime": datetime.now(IST).strftime("%Y-%m-%d 00:00:00"),
-                    "EndTime": datetime.now(IST).strftime("%Y-%m-%d 23:59:59"),
-                    "Types": ["All"],
-                }
+            # List available services first
+            ("system.listService", None),
+            ("system.listMethod", None),
+            # Event/log methods
+            ("EventManager.factory", {"name": "AccessControlAlarmRecord"}),
+            ("EventManager.factory", {"name": "AccessControl"}),
+            ("MediaFinder.factory", {"name": "AccessControlEvent"}),
+            ("RecordUpdater.factory", {"name": "AccessControlCardRec"}),
+            ("QueryRecordManager.factory", None),
+            # Direct query methods
+            ("AccessService.getAccessEventList", {
+                "StartTime": start, "EndTime": end,
             }),
+            ("AccessService.searchAccessEvent", {
+                "StartTime": start, "EndTime": end, "type": "All",
+            }),
+            ("configManager.getConfig", {"name": "AccessControl"}),
+            ("accessControlManager.getCaps", None),
+            ("accessControlManager.getRecordCount", None),
+            ("accessControlManager.searchRecord", {
+                "StartTime": start, "EndTime": end,
+            }),
+            # Attendance specific
+            ("attendanceManager.getRecordCount", None),
+            ("attendanceManager.findRecord", {
+                "StartTime": start, "EndTime": end,
+            }),
+            # Generic finders with different names
+            ("RecordFinder.factory", {"name": "AccessControlRecord"}),
+            ("RecordFinder.factory", {"name": "EventRecord"}),
+            ("RecordFinder.factory", {"name": "CardRecord"}),
+            ("RecordFinder.factory", {"name": "FaceRecord"}),
+            # Log manager variants
+            ("log.startFind", {
+                "condition": {"StartTime": start, "EndTime": end, "Types": ["All"]}
+            }),
+            ("log.factory", {"name": "All"}),
         ]
 
         logger.info("Trying alternative API methods...")
@@ -334,7 +382,8 @@ class DahuaRPC:
                 result = resp.get("result", False)
                 error = resp.get("error", {})
                 p = resp.get("params", {})
-                logger.info(f"  {method} -> result={result} error={error} params={str(p)[:200]}")
+                status = "SUCCESS" if result else f"FAIL({error.get('message', '')})"
+                logger.info(f"  {method} -> {status} params={str(p)[:200]}")
 
 
 async def main():
@@ -369,7 +418,10 @@ async def main():
     if not rpc.session_id:
         logger.error("All login attempts failed. Trying unauthenticated requests...")
 
-    # Step 2: Try to find records
+    # Step 2: List available services to discover the right API
+    services = await rpc.list_services()
+
+    # Step 3: Try to find records
     now = datetime.now(IST)
     start = now.strftime("%Y-%m-%d 00:00:00")
     end = now.strftime("%Y-%m-%d 23:59:59")
