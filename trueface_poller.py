@@ -171,50 +171,68 @@ def _login(driver):
 
 
 def _navigate_to_search_records(driver):
-    """Navigate to the Search Records page."""
+    """Navigate to the Search Records page.
+
+    The TrueFace web UI sidebar has:
+        System Log  (parent — click to expand)
+          ├── System Log
+          ├── Admin Log
+          ├── Search Records  ← we need this
+          └── Alarm Log
+    """
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
 
     logger.info("Navigating to Search Records page...")
     time.sleep(2)
 
-    # Try clicking menu items to get to Search Records
-    links = driver.find_elements(By.CSS_SELECTOR, "a, span, div, li")
-    for link in links:
+    # Step 1: Click "System Log" in the sidebar to expand submenu
+    clicked_parent = False
+    elements = driver.find_elements(By.CSS_SELECTOR, "a, span, div, li, p")
+    for el in elements:
         try:
-            text = link.text.strip().lower()
-            if "search" in text and "record" in text:
-                link.click()
-                time.sleep(2)
-                logger.info("Clicked 'Search Records' link")
+            text = el.text.strip()
+            if text == "System Log" or text == "\u7cfb\u7edf\u65e5\u5fd7":
+                el.click()
+                time.sleep(1)
+                logger.info("Clicked 'System Log' parent menu")
+                clicked_parent = True
+                break
+        except Exception:
+            continue
+
+    if not clicked_parent:
+        logger.warning("Could not find 'System Log' menu — trying direct navigation")
+
+    # Step 2: Click "Search Records" in the expanded submenu
+    time.sleep(1)
+    elements = driver.find_elements(By.CSS_SELECTOR, "a, span, div, li, p")
+    for el in elements:
+        try:
+            text = el.text.strip()
+            if text == "Search Records" or text == "\u67e5\u8be2\u8bb0\u5f55":
+                el.click()
+                time.sleep(3)
+                logger.info("Clicked 'Search Records' — current URL: %s", driver.current_url)
                 return True
         except Exception:
             continue
 
-    # Try direct URL navigation (common Dahua path)
-    for path in ["#/SearchRecord", "#/Record", "#/searchrecord"]:
+    # Fallback: try direct URL hash navigation
+    for path in [
+        "#/SearchRecord", "#/searchRecord", "#/Record",
+        "#/SystemLog/SearchRecord", "#/systemLog/searchRecord",
+    ]:
         try:
             driver.get(f"{DEVICE_URL}/{path}")
             time.sleep(3)
-            # Check if we got records
             tables = driver.find_elements(By.TAG_NAME, "table")
-            if tables:
+            btns = [b for b in driver.find_elements(By.TAG_NAME, "button")
+                    if b.text.strip().lower() in ("query", "search", "\u67e5\u8be2")]
+            if tables or btns:
                 logger.info("Found records page via %s", path)
                 return True
-        except Exception:
-            continue
-
-    # Fall back: look for any navigation that mentions records
-    all_elements = driver.find_elements(By.CSS_SELECTOR, "*")
-    for el in all_elements[:200]:
-        try:
-            text = el.text.strip().lower()
-            if ("record" in text or "log" in text) and len(text) < 30:
-                el.click()
-                time.sleep(2)
-                tables = driver.find_elements(By.TAG_NAME, "table")
-                if tables:
-                    logger.info("Found records page via element: %s", el.text.strip())
-                    return True
         except Exception:
             continue
 
