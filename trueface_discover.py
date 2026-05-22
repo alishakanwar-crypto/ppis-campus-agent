@@ -1,4 +1,4 @@
-"""Discover TrueFace AccessAttendance API query format."""
+"""Discover TrueFace record query API — round 3."""
 import httpx, hashlib, json
 
 c = httpx.Client(timeout=10)
@@ -39,91 +39,102 @@ def rpc(method, params=None):
         return None
 
 
-# Try different condition formats for AccessAttendance.startFind
-conditions = [
-    # Format 1: flat condition
-    {"condition": {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59"}},
-    # Format 2: with Channels
-    {"condition": {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59", "Channels": [0]}},
-    # Format 3: with Doors
-    {"condition": {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59", "Doors": [0]}},
-    # Format 4: without condition wrapper
-    {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59"},
-    # Format 5: with Type
-    {"condition": {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59", "Type": "All"}},
-    # Format 6: with UserID
-    {"condition": {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59", "UserID": ""}},
-    # Format 7: nested QueryCondition
-    {"QueryCondition": {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59"}},
-    # Format 8: with Order
-    {"condition": {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59", "Order": "Descend"}},
-]
+def show(label, resp):
+    if not resp:
+        print(f"  {label} -> NO RESPONSE")
+        return
+    ok = resp.get('result')
+    err = resp.get('error', {}).get('message', '')
+    p = resp.get('params', {})
+    tag = f'OK (result={ok})' if ok else f'FAIL({err})'
+    print(f"  {label} -> {tag}")
+    if ok or (ok is not False and ok is not None):
+        print(f"    FULL: {json.dumps(resp)[:600]}")
 
-print("\n=== Testing AccessAttendance.startFind with different conditions ===")
-for i, cond in enumerate(conditions):
-    r = rpc('AccessAttendance.startFind', cond)
-    if r:
-        ok = r.get('result', False)
-        p = r.get('params', {})
-        token = p.get('Token', p.get('token'))
-        total = p.get('Total', p.get('total', '?'))
-        err = r.get('error', {}).get('message', '')
-        print(f"  Format {i+1}: result={ok} Token={token} Total={total} err={err}")
 
-        if ok and token:
-            # Try doFind
-            r2 = rpc('AccessAttendance.doFind', {'Token': token, 'Count': 10})
-            if r2:
-                ok2 = r2.get('result', False)
-                p2 = r2.get('params', {})
-                found = p2.get('Found', p2.get('found', 0))
-                records = p2.get('Records', p2.get('records', []))
-                print(f"    doFind: result={ok2} found={found} records={len(records)}")
-                for rec in records[:3]:
-                    print(f"      {json.dumps(rec)[:300]}")
-            # Cleanup
-            rpc('AccessAttendance.stopFind', {'Token': token})
+cond = {
+    'condition': {
+        'StartTime': '2026-05-22 00:00:00',
+        'EndTime': '2026-05-22 23:59:59',
+    }
+}
 
-# Also try AccessOpenDoorRecManager with different formats
-print("\n=== Testing AccessOpenDoorRecManager.startFind ===")
-for i, cond in enumerate(conditions[:4]):
-    r = rpc('AccessOpenDoorRecManager.startFind', cond)
-    if r:
-        ok = r.get('result', False)
-        p = r.get('params', {})
-        err = r.get('error', {}).get('message', '')
-        print(f"  Format {i+1}: result={ok} params={json.dumps(p)[:200]} err={err}")
-        if ok:
-            token = p.get('Token', p.get('token'))
-            if token:
-                r2 = rpc('AccessOpenDoorRecManager.doFind', {'Token': token, 'Count': 10})
-                if r2:
-                    print(f"    doFind: {json.dumps(r2.get('params',{}))[:500]}")
-                rpc('AccessOpenDoorRecManager.stopFind', {'Token': token})
+# Test 1: log.startFind (from JS — different from LogManager.startFind)
+print("\n=== Test 1: log.startFind ===")
+r = rpc('log.startFind', cond)
+show('log.startFind', r)
+if r and r.get('result'):
+    token = r['result'] if isinstance(r['result'], int) else r.get('params', {}).get('Token')
+    print(f"  Token: {token}")
+    if token:
+        r2 = rpc('log.getCount', {'token': token})
+        show('log.getCount', r2)
+        r3 = rpc('log.doFind', {'token': token, 'count': 10})
+        show('log.doFind', r3)
+        rpc('log.stopFind', {'token': token})
 
-# Try to search the JS for clues
-print("\n=== Checking trueface_app.js for SearchRecord API calls ===")
-try:
-    with open('trueface_app.js', 'r', errors='ignore') as f:
-        js = f.read()
-    # Search for attendance/record related method calls
-    import re
-    patterns = [
-        r'["\']([A-Za-z]+\.(?:startFind|doFind|stopFind|factory|getRecordCount|search|query))["\']',
-        r'["\']([A-Za-z]*(?:Record|Attendance|Event|Log)[A-Za-z]*\.[a-zA-Z]+)["\']',
-        r'startFind.*?condition',
-    ]
-    found_methods = set()
-    for pat in patterns:
-        for m in re.finditer(pat, js):
-            found_methods.add(m.group(0)[:100])
-    if found_methods:
-        print("  Found in JS:")
-        for m in sorted(found_methods):
-            print(f"    {m}")
-    else:
-        print("  No specific record methods found in app.js")
-except FileNotFoundError:
-    print("  trueface_app.js not found")
+# Test 2: log.startFind with Types
+print("\n=== Test 2: log.startFind with Types ===")
+for types in [['All'], ['Access'], ['Alarm'], ['Event']]:
+    cond2 = {'condition': {
+        'StartTime': '2026-05-22 00:00:00',
+        'EndTime': '2026-05-22 23:59:59',
+        'Types': types,
+    }}
+    r = rpc('log.startFind', cond2)
+    show(f'log.startFind Types={types}', r)
+    if r and r.get('result'):
+        token = r['result'] if isinstance(r['result'], int) else r.get('params', {}).get('Token')
+        if token:
+            r2 = rpc('log.getCount', {'token': token})
+            show(f'  log.getCount', r2)
+            r3 = rpc('log.doFind', {'token': token, 'count': 5})
+            show(f'  log.doFind', r3)
+            rpc('log.stopFind', {'token': token})
+        break  # Stop after first success
+
+# Test 3: AccessAttendance.list
+print("\n=== Test 3: AccessAttendance.list ===")
+r = rpc('AccessAttendance.list', None)
+show('AccessAttendance.list (no params)', r)
+r = rpc('AccessAttendance.list', {'count': 10})
+show('AccessAttendance.list (count=10)', r)
+r = rpc('AccessAttendance.list', {'UserID': '1'})
+show('AccessAttendance.list (UserID=1)', r)
+
+# Test 4: RecordFinder instance pattern from JS
+# JS: this.instance({name:e}).then(...startFind...)
+print("\n=== Test 4: RecordFinder instance pattern ===")
+for name in ['AccessControlCardRec', 'trafficSnapRecord', 'AccessOpenDoorRecord']:
+    # Try creating instance via different method names
+    for factory in ['RecordFinder.factory', 'RecordFinder.create', 'RecordFinder.instance']:
+        r = rpc(factory, {'name': name})
+        if r and r.get('result'):
+            show(f'{factory}({name})', r)
+            obj = r['result']
+            r2 = rpc(f'{obj}.startFind', cond)
+            show(f'  {obj}.startFind', r2)
+            if r2 and r2.get('result'):
+                r3 = rpc(f'{obj}.doFind', {'count': 5})
+                show(f'  {obj}.doFind', r3)
+            rpc(f'{obj}.destroy', None)
+            break
+
+# Test 5: Direct record search via Attendance service
+print("\n=== Test 5: Attendance service methods ===")
+show('Attendance.webStatis', rpc('Attendance.webStatis', cond))
+show('Attendance.getCheckGroup', rpc('Attendance.getCheckGroup', None))
+
+# Test 6: Try the exact JS pattern for Search Records page
+# The JS shows the page uses D.AccessAttendance or similar
+print("\n=== Test 6: Search pattern from JS (instance-based) ===")
+# Maybe AccessAttendance needs instance creation first
+for method in ['AccessAttendance.instance', 'AccessAttendance.create', 'AccessAttendance.factory']:
+    r = rpc(method, {'name': 'default'})
+    show(method, r)
+    if r and r.get('result'):
+        obj = r['result']
+        r2 = rpc(f'{obj}.startFind', cond)
+        show(f'  {obj}.startFind', r2)
 
 print("\nDone!")
