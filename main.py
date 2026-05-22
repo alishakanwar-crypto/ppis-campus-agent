@@ -2942,13 +2942,14 @@ if __name__ == "__main__":
     logger.info(f"Starting PPIS Campus Agent on http://localhost:{port}")
     try:
         uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
-                    timeout_keep_alive=30, ws_max_size=16777216)
+                    timeout_keep_alive=30, ws_max_size=16777216,
+                    http="httptools")
     except OSError as e:
         if "10048" in str(e) or "Address already in use" in str(e):
             logger.warning(f"Port {port} still busy, retrying after kill...")
             _kill_port_holder(port)
             time.sleep(5)
-            uvicorn.run(app, host="0.0.0.0", port=port)
+            uvicorn.run(app, host="0.0.0.0", port=port, http="httptools")
         else:
             logger.critical(f"FATAL OS ERROR: {e}", exc_info=True)
             raise
