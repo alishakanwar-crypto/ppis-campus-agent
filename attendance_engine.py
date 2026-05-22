@@ -1732,6 +1732,10 @@ class AttendanceEngine:
         now = time.time()
         is_teacher = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
 
+        # --- Teacher attendance handled by TrueFace 3000 device ---
+        if is_teacher:
+            return None
+
         # --- CHECK 1: Confidence range check ---
         effective_threshold = (self.teacher_confidence_threshold
                                if is_teacher else self.confidence_threshold)
@@ -2861,10 +2865,10 @@ class AttendanceEngine:
                     await asyncio.sleep(30)
                     continue
 
-                # === PHASE 1: Teacher Recognition (OPEN HOUSE PROTOCOL) ===
-                # Administration Camera: ALL teachers
-                # Principal Room Camera: Ms. Deepi Bector ONLY
-                if in_teacher_phase:
+                # === PHASE 1: Teacher Recognition — DISABLED ===
+                # Teacher attendance is now handled by TrueFace 3000 device.
+                # DVR-based teacher scanning skipped entirely.
+                if False and in_teacher_phase:  # noqa: SIM223
                     if cycle <= 1 or (cycle % 30 == 0):
                         self.add_debug_log("teacher_phase",
                                            f"Phase 1 ACTIVE (OPEN HOUSE): scanning "
@@ -2920,37 +2924,13 @@ class AttendanceEngine:
 
                     gc.collect()
 
-                # --- Trigger teacher report email once Phase 1 ends ---
-                if not in_teacher_phase and getattr(self, '_teacher_report_sent_today', None) != date.today().isoformat():
-                    if _now_mins >= teacher_end and _now_mins < student_end:
-                        self._teacher_report_sent_today = date.today().isoformat()
-                        self.add_debug_log("teacher_report",
-                                           "Phase 1 ended — triggering teacher attendance report email")
-                        try:
-                            api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
-                            agent_secret = os.environ.get("AGENT_SECRET", "")
-                            headers = {"Content-Type": "application/json"}
-                            if agent_secret:
-                                headers["X-Agent-Secret"] = agent_secret
-                            async with httpx.AsyncClient(timeout=30) as _rpt_client:
-                                _rpt_resp = await _rpt_client.post(
-                                    f"{api_url}/api/dashboard/attendance/teacher-report/email",
-                                    json={}, headers=headers,
-                                )
-                                if _rpt_resp.status_code == 200:
-                                    _rpt_data = _rpt_resp.json()
-                                    self.add_debug_log("teacher_report_sent",
-                                                       f"Teacher report emailed: {_rpt_data.get('present', 0)} present, "
-                                                       f"{_rpt_data.get('absent', 0)} absent")
-                                else:
-                                    self.add_debug_log("teacher_report_error",
-                                                       f"Report email failed: HTTP {_rpt_resp.status_code}")
-                        except Exception as _rpt_e:
-                            self.add_debug_log("teacher_report_error",
-                                               f"Report email error: {_rpt_e}")
+                # --- Teacher report email — DISABLED ---
+                # Teacher reports now handled by TrueFace system (8 AM + 3 PM)
+                # if not in_teacher_phase and ...:  # old DVR-based report trigger
 
-                # === Administration camera: keep scanning for teachers even during student phase ===
-                if in_student_phase and not in_teacher_phase and teacher_priority_cams:
+                # === Administration camera teacher scanning — DISABLED ===
+                # Teacher attendance now handled by TrueFace 3000 device.
+                if False and in_student_phase and not in_teacher_phase and teacher_priority_cams:  # noqa: SIM223
                     teacher_faces = getattr(self, '_teacher_faces_cache', {})
                     teacher_faces_if = getattr(self, '_teacher_faces_cache_insightface', {})
                     for cam in teacher_priority_cams:
