@@ -64,10 +64,10 @@ def _check_dedup(pin):
 def _send_whatsapp(name, phone, time_str):
     try:
         resp = httpx.post(CLOUD_API, json={
-            "to": phone,
+            "phone": phone,
             "template_name": "ppis_teacher_present_text",
             "language_code": "en",
-            "body_params": [name, time_str],
+            "template_params": [name, time_str],
         }, timeout=30)
         logger.info(f"WhatsApp -> {phone}: {resp.status_code} {resp.text[:200]}")
         return resp.status_code == 200

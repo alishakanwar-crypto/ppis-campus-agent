@@ -57,10 +57,10 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        to: phone,
+        phone: phone,
         template_name: "ppis_teacher_present_text",
         language_code: "en",
-        body_params: [name, timeStr],
+        template_params: [name, timeStr],
       }),
     })
       .then(function (r) { return r.json(); })
