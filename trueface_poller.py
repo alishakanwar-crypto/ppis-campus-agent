@@ -107,58 +107,80 @@ def try_cgi_event_stream():
     url = f"http://{DEVICE_IP}/cgi-bin/eventManager.cgi"
     auth = dahua_digest_auth()
 
-    # Try different event codes
-    event_codes = [
-        "AccessControl",
-        "All",
-    ]
+    # Subscribe to ALL events to discover what the device sends
+    codes = "All"
+    try:
+        logger.info(f"Connecting to event stream: codes=[{codes}]...")
+        with httpx.stream(
+            "GET",
+            f"{url}?action=attach&codes=[{codes}]&heartbeat=5",
+            auth=auth,
+            timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
+        ) as response:
+            logger.info(f"Event stream response: {response.status_code}")
+            if response.status_code != 200:
+                logger.warning(f"Event stream returned {response.status_code}")
+                return False
 
-    for codes in event_codes:
-        try:
-            logger.info(f"Trying CGI event stream: codes=[{codes}]...")
-            with httpx.stream(
-                "GET",
-                f"{url}?action=attach&codes=[{codes}]&heartbeat=5",
-                auth=auth,
-                timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
-            ) as response:
-                logger.info(f"Event stream response: {response.status_code}")
-                if response.status_code == 200:
-                    logger.info(f"Connected to event stream! Waiting for events...")
-                    for line in response.iter_lines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        logger.info(f"EVENT: {line[:200]}")
-                        # Parse event data
-                        _parse_event_line(line)
-                    return True
-                else:
-                    logger.warning(f"Event stream returned {response.status_code}")
-        except httpx.TimeoutException:
-            logger.warning(f"Event stream timeout for codes=[{codes}]")
-        except Exception as e:
-            logger.warning(f"Event stream error for codes=[{codes}]: {e}")
+            logger.info("Connected! Waiting for events (show face to device)...")
+            event_buffer = []
+            for line in response.iter_lines():
+                line = line.strip()
+                if not line:
+                    if event_buffer:
+                        full_event = "\n".join(event_buffer)
+                        if "Heartbeat" not in full_event:
+                            logger.info(f">>> EVENT:\n{full_event[:800]}")
+                            _parse_event_block(full_event)
+                        event_buffer = []
+                    continue
+                event_buffer.append(line)
+                if "Heartbeat" not in line and "--myboundary" not in line \
+                        and "Content-Type" not in line and "Content-Length" not in line:
+                    logger.info(f"EVENT LINE: {line[:500]}")
+            return True
+
+    except httpx.TimeoutException:
+        logger.warning("Event stream timeout")
+    except Exception as e:
+        logger.warning(f"Event stream error: {e}")
 
     return False
 
 
-def _parse_event_line(line):
-    """Parse a Dahua event line and process attendance."""
-    # Dahua events come as key=value pairs like:
-    # Code=AccessControl;action=Pulse;index=0
-    # Or as multipart boundary data with JSON
-    if "UserID=" in line or "UserID\":" in line:
-        # Try to extract UserID
-        m = re.search(r'UserID[=:"\s]+(\d+)', line)
+def _parse_event_block(block):
+    """Parse a multipart event block from Dahua CGI event stream."""
+    # Try JSON first
+    json_match = re.search(r'\{.*\}', block, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(0))
+            logger.info(f"Parsed JSON event: {json.dumps(data)[:500]}")
+            code = data.get("Code", "")
+            action = data.get("Action", data.get("action", ""))
+            info = data.get("Data", data.get("data", {}))
+            if isinstance(info, dict):
+                user_id = info.get("UserID", info.get("userId", ""))
+                timestamp = info.get("Time", info.get("time", ""))
+                if user_id:
+                    _process_event(user_id, timestamp)
+            return
+        except json.JSONDecodeError:
+            pass
+
+    # Try key=value format
+    if "UserID=" in block or "UserID\":" in block:
+        m = re.search(r'UserID[=:"\s]+(\d+)', block)
         if m:
             user_id = m.group(1)
-            # Extract time if present
-            tm = re.search(r'Time[=:"\s]+([\d-]+ [\d:]+)', line)
+            tm = re.search(r'Time[=:"\s]+([\d-]+ [\d:]+)', block)
             timestamp = tm.group(1) if tm else None
             _process_event(user_id, timestamp)
-    elif "Code=AccessControl" in line or '"Code":"AccessControl"' in line:
-        logger.info("Access control event detected, waiting for details...")
+
+    # Log Code if present
+    code_match = re.search(r'Code[=:]+(\w+)', block)
+    if code_match:
+        logger.info(f"Event code: {code_match.group(1)}")
 
 
 def try_cgi_records():
