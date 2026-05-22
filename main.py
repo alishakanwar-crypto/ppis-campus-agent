@@ -1109,6 +1109,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="PPIS Campus Agent", lifespan=lifespan)
 
+# --- TrueFace 3000 ADMS integration ---
+from trueface_adms import router as trueface_router
+app.include_router(trueface_router)
+
 # Ensure static directories exist
 (Path(__file__).parent / "static").mkdir(exist_ok=True)
 (Path(__file__).parent / "face_images").mkdir(exist_ok=True)
