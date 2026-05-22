@@ -1,17 +1,22 @@
 """
 TrueFace 3000 Attendance Notifier.
 
-Connects to the TrueFace device's real-time event stream and CGI API.
-When a face is recognized (access granted), sends a WhatsApp notification.
+Two modes:
+  1. Browser mode (default): Paste trueface_notifier.js into Chrome Console
+     on the device's Search Records page. It polls the table and sends
+     WhatsApp notifications directly from the browser.
 
-Flow: Face recognized → Access Granted → This script catches event → WhatsApp sent
+  2. Selenium mode: python trueface_poller.py --selenium
+     Automates Chrome to read the device's Search Records page.
+     Requires: pip install selenium
 
-Run: python trueface_poller.py
+Run 'python trueface_poller.py --test' to send a test WhatsApp notification.
 """
 import hashlib
-import logging
 import json
+import logging
 import re
+import sys
 import time
 import httpx
 from datetime import datetime, timezone, timedelta
@@ -24,6 +29,7 @@ DEVICE_IP = "192.168.1.112"
 DEVICE_USER = "admin"
 DEVICE_PASS = "tipl9910"
 CLOUD_API = "https://ppis-whatsapp-bot.fly.dev/api/send-whatsapp"
+POLL_INTERVAL = 30  # seconds
 
 USERS_FILE = "trueface_users.json"
 try:
@@ -31,8 +37,10 @@ try:
         USERS = json.load(f)
     logger.info(f"Loaded {len(USERS)} users from {USERS_FILE}")
 except Exception:
-    USERS = {}
-    logger.warning(f"No {USERS_FILE} found")
+    USERS = {
+        "1": {"name": "Alisha Ahuja", "phone": "918076455224", "person_id": "TEACHER_ALISHA_AHUJA"}
+    }
+    logger.info("Using default user list (Alisha only)")
 
 _notified_today = {}
 _last_date = ""
@@ -45,7 +53,7 @@ def _check_dedup(pin):
         _notified_today.clear()
         _last_date = today
     if _notified_today.get(pin) == today:
-        return True  # already notified
+        return True
     now = datetime.now(IST)
     if now.weekday() in (5, 6):
         logger.info("Weekend — skipping notification")
@@ -61,7 +69,7 @@ def _send_whatsapp(name, phone, time_str):
             "language_code": "en",
             "body_params": [name, time_str],
         }, timeout=30)
-        logger.info(f"WhatsApp -> {phone}: {resp.status_code} {resp.text[:100]}")
+        logger.info(f"WhatsApp -> {phone}: {resp.status_code} {resp.text[:200]}")
         return resp.status_code == 200
     except Exception as e:
         logger.error(f"WhatsApp error: {e}")
@@ -96,292 +104,152 @@ def _process_event(user_id, timestamp=None):
     _send_whatsapp(name, phone, time_str)
 
 
-def dahua_digest_auth():
-    """Create httpx client with Dahua digest authentication."""
-    return httpx.DigestAuth(DEVICE_USER, DEVICE_PASS)
+def test_whatsapp():
+    """Send a test WhatsApp notification for Alisha."""
+    logger.info("Sending test WhatsApp notification...")
+    time_str = datetime.now(IST).strftime("%I:%M %p")
+    user = USERS.get("1", {})
+    name = user.get("name", "Alisha Ahuja")
+    phone = user.get("phone", "918076455224")
+    _send_whatsapp(name, phone, time_str)
 
 
-def try_cgi_event_stream():
-    """Listen to real-time events via CGI event manager (Server-Sent Events).
-    This gives instant notifications when access is granted."""
-    url = f"http://{DEVICE_IP}/cgi-bin/eventManager.cgi"
-    auth = dahua_digest_auth()
-
-    # Subscribe to ALL events to discover what the device sends
-    codes = "All"
+def selenium_mode():
+    """Automate Chrome to read Search Records from the device web UI."""
     try:
-        logger.info(f"Connecting to event stream: codes=[{codes}]...")
-        with httpx.stream(
-            "GET",
-            f"{url}?action=attach&codes=[{codes}]&heartbeat=5",
-            auth=auth,
-            timeout=httpx.Timeout(connect=10, read=None, write=10, pool=10),
-        ) as response:
-            logger.info(f"Event stream response: {response.status_code}")
-            if response.status_code != 200:
-                logger.warning(f"Event stream returned {response.status_code}")
-                return False
+        from selenium import webdriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+    except ImportError:
+        logger.error("Selenium not installed. Run: pip install selenium")
+        logger.info("Alternative: paste trueface_notifier.js into Chrome Console")
+        return
 
-            logger.info("Connected! Waiting for events (show face to device)...")
-            event_buffer = []
-            for line in response.iter_lines():
-                line = line.strip()
-                if not line:
-                    if event_buffer:
-                        full_event = "\n".join(event_buffer)
-                        if "Heartbeat" not in full_event:
-                            logger.info(f">>> EVENT:\n{full_event[:800]}")
-                            _parse_event_block(full_event)
-                        event_buffer = []
-                    continue
-                event_buffer.append(line)
-                if "Heartbeat" not in line and "--myboundary" not in line \
-                        and "Content-Type" not in line and "Content-Length" not in line:
-                    logger.info(f"EVENT LINE: {line[:500]}")
-            return True
+    logger.info("Starting Chrome via Selenium...")
+    options = webdriver.ChromeOptions()
+    options.add_argument("--disable-gpu")
+    driver = webdriver.Chrome(options=options)
+    seen_keys = set()
 
-    except httpx.TimeoutException:
-        logger.warning("Event stream timeout")
-    except Exception as e:
-        logger.warning(f"Event stream error: {e}")
+    try:
+        # Step 1: Open device page
+        driver.get(f"http://{DEVICE_IP}")
+        logger.info("Opened device page, waiting for login form...")
+        time.sleep(3)
 
-    return False
-
-
-def _parse_event_block(block):
-    """Parse a multipart event block from Dahua CGI event stream."""
-    # Try JSON first
-    json_match = re.search(r'\{.*\}', block, re.DOTALL)
-    if json_match:
+        # Step 2: Login
         try:
-            data = json.loads(json_match.group(0))
-            logger.info(f"Parsed JSON event: {json.dumps(data)[:500]}")
-            code = data.get("Code", "")
-            action = data.get("Action", data.get("action", ""))
-            info = data.get("Data", data.get("data", {}))
-            if isinstance(info, dict):
-                user_id = info.get("UserID", info.get("userId", ""))
-                timestamp = info.get("Time", info.get("time", ""))
-                if user_id:
+            user_input = driver.find_element(By.CSS_SELECTOR, "input[type='text'], input[name='username'], #username")
+            user_input.clear()
+            user_input.send_keys(DEVICE_USER)
+            pass_input = driver.find_element(By.CSS_SELECTOR, "input[type='password'], input[name='password'], #password")
+            pass_input.clear()
+            pass_input.send_keys(DEVICE_PASS)
+            login_btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit'], .login-btn, button")
+            login_btn.click()
+            logger.info("Login submitted, waiting for dashboard...")
+            time.sleep(5)
+        except Exception as e:
+            logger.warning(f"Login form not found or already logged in: {e}")
+
+        # Step 3: Navigate to Search Records
+        try:
+            links = driver.find_elements(By.TAG_NAME, "a")
+            for link in links:
+                text = link.text.strip().lower()
+                if "search" in text or "record" in text or "query" in text:
+                    link.click()
+                    logger.info(f"Clicked '{link.text.strip()}' link")
+                    time.sleep(3)
+                    break
+            else:
+                menus = driver.find_elements(By.CSS_SELECTOR, "li, .menu-item, [class*='menu']")
+                for menu in menus:
+                    text = menu.text.strip().lower()
+                    if "search" in text or "record" in text:
+                        menu.click()
+                        logger.info(f"Clicked menu: '{menu.text.strip()}'")
+                        time.sleep(3)
+                        break
+        except Exception as e:
+            logger.warning(f"Could not find Search Records link: {e}")
+
+        # Step 4: Poll loop
+        logger.info("Starting poll loop...")
+        while True:
+            try:
+                # Click Query button
+                buttons = driver.find_elements(By.TAG_NAME, "button")
+                for btn in buttons:
+                    text = btn.text.strip().lower()
+                    if text in ("query", "search", "查询"):
+                        btn.click()
+                        time.sleep(3)
+                        break
+
+                # Read table
+                rows = driver.find_elements(By.CSS_SELECTOR, "table tr")
+                for row in rows:
+                    cells = row.find_elements(By.TAG_NAME, "td")
+                    if len(cells) < 8:
+                        continue
+                    user_id = cells[1].text.strip()
+                    timestamp = cells[4].text.strip()
+                    status = cells[5].text.strip()
+                    method = cells[7].text.strip()
+
+                    if status != "OK" or not user_id:
+                        continue
+                    if method not in ("Face", "Fingerprint"):
+                        continue
+
+                    key = f"{user_id}-{timestamp}"
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
                     _process_event(user_id, timestamp)
-            return
-        except json.JSONDecodeError:
-            pass
 
-    # Try key=value format
-    if "UserID=" in block or "UserID\":" in block:
-        m = re.search(r'UserID[=:"\s]+(\d+)', block)
-        if m:
-            user_id = m.group(1)
-            tm = re.search(r'Time[=:"\s]+([\d-]+ [\d:]+)', block)
-            timestamp = tm.group(1) if tm else None
-            _process_event(user_id, timestamp)
+            except Exception as e:
+                logger.error(f"Poll error: {e}")
 
-    # Log Code if present
-    code_match = re.search(r'Code[=:]+(\w+)', block)
-    if code_match:
-        logger.info(f"Event code: {code_match.group(1)}")
+            time.sleep(POLL_INTERVAL)
 
-
-def try_cgi_records():
-    """Try CGI-based record finder as fallback."""
-    base = f"http://{DEVICE_IP}/cgi-bin/recordFinder.cgi"
-    auth = dahua_digest_auth()
-
-    # Step 1: Create a record finder instance
-    names = ["AccessControlCardRec", "TrafficSnapRecord", "AccessOpenDoorRecord"]
-    for name in names:
-        try:
-            r = httpx.get(f"{base}?action=factory.create&name={name}", auth=auth, timeout=10)
-            logger.info(f"CGI factory({name}): {r.status_code} -> {r.text[:200]}")
-            if r.status_code == 200 and "result=" in r.text:
-                # Extract object ID
-                m = re.search(r'result=(\d+)', r.text)
-                if m:
-                    obj = m.group(1)
-                    logger.info(f"  Created RecordFinder object: {obj}")
-                    return _cgi_find_records(base, auth, obj)
-        except Exception as e:
-            logger.warning(f"CGI factory({name}) error: {e}")
-
-    return False
-
-
-def _cgi_find_records(base, auth, obj):
-    """Use CGI record finder to get today's records."""
-    now = datetime.now(IST)
-    start = now.strftime("%Y-%m-%d%%2000:00:00")
-    end = now.strftime("%Y-%m-%d%%2023:59:59")
-
-    try:
-        # Start find
-        r = httpx.get(
-            f"{base}?action=startFind&object={obj}"
-            f"&condition.StartTime={start}&condition.EndTime={end}",
-            auth=auth, timeout=10
-        )
-        logger.info(f"CGI startFind: {r.status_code} -> {r.text[:200]}")
-
-        # Get count
-        r = httpx.get(f"{base}?action=getQuerySize&object={obj}", auth=auth, timeout=10)
-        logger.info(f"CGI getQuerySize: {r.status_code} -> {r.text[:200]}")
-
-        # Do find
-        r = httpx.get(f"{base}?action=doFind&object={obj}&count=100", auth=auth, timeout=10)
-        logger.info(f"CGI doFind: {r.status_code} -> {r.text[:500]}")
-
-        if r.status_code == 200:
-            # Parse records from response
-            records = _parse_cgi_records(r.text)
-            logger.info(f"Found {len(records)} records via CGI")
-            return records
-
-    except Exception as e:
-        logger.error(f"CGI find error: {e}")
-
-    return []
-
-
-def _parse_cgi_records(text):
-    """Parse CGI record finder response into record list."""
-    records = []
-    current = {}
-    for line in text.split('\n'):
-        line = line.strip()
-        if not line:
-            if current:
-                records.append(current)
-                current = {}
-            continue
-        if '=' in line:
-            key, _, val = line.partition('=')
-            current[key.strip()] = val.strip()
-    if current:
-        records.append(current)
-    return records
-
-
-def try_rpc_approach():
-    """Use Dahua JSON-RPC API as another fallback — poll via AccessAttendance."""
-    logger.info("Trying JSON-RPC approach...")
-
-    client = httpx.Client(timeout=10)
-
-    # Login
-    r = client.post(f'http://{DEVICE_IP}/RPC2_Login', json={
-        'method': 'global.login',
-        'params': {'userName': DEVICE_USER, 'password': '', 'clientType': 'Web3.0'},
-        'id': 1
-    }).json()
-
-    session = r.get('session', '')
-    realm = r.get('params', {}).get('realm', '')
-    random = r.get('params', {}).get('random', '')
-
-    if not realm:
-        logger.error("RPC login failed — no challenge")
-        return None
-
-    ha1 = hashlib.md5(f'{DEVICE_USER}:{realm}:{DEVICE_PASS}'.encode()).hexdigest().upper()
-    auth_resp = hashlib.md5(f'{DEVICE_USER}:{random}:{ha1}'.encode()).hexdigest().upper()
-
-    r2 = client.post(f'http://{DEVICE_IP}/RPC2_Login', json={
-        'method': 'global.login',
-        'params': {'userName': DEVICE_USER, 'password': auth_resp,
-                   'clientType': 'Web3.0', 'loginType': 'Direct', 'authorityType': 'Default'},
-        'id': 2, 'session': session
-    }).json()
-
-    if not r2.get('result'):
-        logger.error("RPC login failed")
-        return None
-
-    sid = r2['session']
-    logger.info(f"RPC login OK, session={sid}")
-    return client, sid
-
-
-def rpc_poll_loop(client, sid):
-    """Poll for new records via RPC."""
-    seen = set()
-    rid = 2
-
-    while True:
-        try:
-            now = datetime.now(IST)
-            start = now.strftime("%Y-%m-%d 00:00:00")
-            end = now.strftime("%Y-%m-%d 23:59:59")
-
-            rid += 1
-            r = client.post(f'http://{DEVICE_IP}/RPC2', json={
-                'method': 'AccessAttendance.startFind',
-                'params': {'condition': {'StartTime': start, 'EndTime': end}},
-                'id': rid, 'session': sid
-            }).json()
-
-            if r.get('result'):
-                token = r.get('params', {}).get('Token')
-                if token:
-                    rid += 1
-                    r2 = client.post(f'http://{DEVICE_IP}/RPC2', json={
-                        'method': 'AccessAttendance.doFind',
-                        'params': {'Token': token, 'Count': 100},
-                        'id': rid, 'session': sid
-                    }).json()
-
-                    records = r2.get('params', {}).get('Records', [])
-                    for rec in records:
-                        uid = rec.get('UserID', '')
-                        ts = rec.get('Time', '')
-                        key = f"{uid}-{ts}"
-                        if key not in seen:
-                            seen.add(key)
-                            _process_event(uid, ts)
-
-                    rid += 1
-                    client.post(f'http://{DEVICE_IP}/RPC2', json={
-                        'method': 'AccessAttendance.stopFind',
-                        'params': {'Token': token},
-                        'id': rid, 'session': sid
-                    })
-
-        except Exception as e:
-            logger.error(f"RPC poll error: {e}")
-
-        time.sleep(10)
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
+    finally:
+        driver.quit()
 
 
 def main():
+    if "--test" in sys.argv:
+        test_whatsapp()
+        return
+
+    if "--selenium" in sys.argv:
+        selenium_mode()
+        return
+
+    # Default: print instructions for browser-based approach
     logger.info("=" * 50)
     logger.info("TrueFace 3000 Attendance Notifier")
     logger.info("=" * 50)
-    logger.info(f"Device: {DEVICE_IP}")
-    logger.info(f"Users: {json.dumps(USERS, indent=2)}")
     logger.info("")
-
-    # Method 1: Real-time event stream (best — instant notifications)
-    logger.info("=== Method 1: Real-time event stream ===")
-    if try_cgi_event_stream():
-        return  # This blocks forever listening to events
-
-    # Method 2: CGI record finder
-    logger.info("\n=== Method 2: CGI record finder ===")
-    records = try_cgi_records()
-    if records:
-        logger.info(f"CGI found {len(records)} records")
-        for rec in records:
-            uid = rec.get('UserID', rec.get('records[0].UserID', ''))
-            ts = rec.get('Time', rec.get('records[0].Time', ''))
-            if uid:
-                _process_event(uid, ts)
-
-    # Method 3: RPC polling
-    logger.info("\n=== Method 3: RPC polling ===")
-    result = try_rpc_approach()
-    if result:
-        client, sid = result
-        logger.info("Starting RPC poll loop (every 10 seconds)...")
-        rpc_poll_loop(client, sid)
+    logger.info("BROWSER MODE (recommended):")
+    logger.info("  1. Open Chrome to http://192.168.1.112 and log in")
+    logger.info("  2. Go to Search Records page")
+    logger.info("  3. Click Query to load initial records")
+    logger.info("  4. Press Ctrl+Shift+J to open Chrome Console")
+    logger.info("  5. Paste the contents of trueface_notifier.js")
+    logger.info("  6. Done! It polls every 30 seconds automatically")
+    logger.info("")
+    logger.info("OTHER MODES:")
+    logger.info("  python trueface_poller.py --test       Send test WhatsApp")
+    logger.info("  python trueface_poller.py --selenium   Automate Chrome")
+    logger.info("")
+    logger.info("Users loaded:")
+    for pin, u in USERS.items():
+        logger.info(f"  PIN {pin}: {u['name']} -> {u.get('phone', 'N/A')}")
 
 
 if __name__ == "__main__":
