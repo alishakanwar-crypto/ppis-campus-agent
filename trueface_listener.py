@@ -1,17 +1,9 @@
 """
 Standalone TrueFace Push Protocol listener.
 
-The TimeWatch TrueFace 300 uses a ZKTeco binary push protocol (NOT HTTP).
-This listener handles the binary handshake, keeps the connection alive,
-and processes real-time attendance events.
-
-Protocol analysis (from device captures):
-  - Registration packet: 96 bytes
-    - Offset 0x00: command/type (0xb4)
-    - Offset 0x04: data length indicator (0x40 = 64)
-    - Offset 0x08: protocol version (0x07)
-    - Offset 0x20: serial number (16 bytes, null-padded)
-  - After registration, device sends attendance events in same connection
+The TimeWatch TrueFace 300 uses a ZKTeco binary push protocol.
+This listener tries multiple response strategies to establish
+a proper connection with the device.
 
 Run: python trueface_listener.py
 """
@@ -20,6 +12,7 @@ import struct
 import logging
 import json
 import re
+import sys
 from datetime import datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -39,6 +32,14 @@ except Exception:
 
 _notified_today = {}
 _last_dedup_date = ""
+
+# Response strategy (change via command line: python trueface_listener.py 1)
+# 0 = no response (silent)
+# 1 = echo back same packet
+# 2 = 8-byte short ACK
+# 3 = 16-byte header ACK
+# 4 = same 96 bytes with modified command
+STRATEGY = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 
 
 def _clear_daily_dedup():
@@ -71,7 +72,6 @@ async def _send_whatsapp(name: str, phone: str, time_str: str):
 
 
 def _hex_dump(data: bytes, max_bytes: int = 256) -> str:
-    """Create a readable hex dump of binary data."""
     lines = []
     for i in range(0, min(len(data), max_bytes), 16):
         chunk = data[i:i+16]
@@ -84,7 +84,6 @@ def _hex_dump(data: bytes, max_bytes: int = 256) -> str:
 
 
 def _extract_serial(data: bytes) -> str:
-    """Extract the device serial number from binary data."""
     try:
         text = data.decode("ascii", errors="ignore")
         match = re.search(r"(TW\d{13,16})", text)
@@ -96,165 +95,120 @@ def _extract_serial(data: bytes) -> str:
 
 
 def _extract_attendance_data(data: bytes) -> list:
-    """Try to extract attendance records from binary data."""
     records = []
     try:
         text = data.decode("ascii", errors="ignore")
-        # Tab-separated: PIN\tTimestamp\tStatus\tVerify
         for match in re.finditer(r"(\d+)\t(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\t(\d+)\t(\d+)", text):
             records.append({
-                "pin": match.group(1),
-                "timestamp": match.group(2),
-                "status": match.group(3),
-                "verify": match.group(4),
+                "pin": match.group(1), "timestamp": match.group(2),
+                "status": match.group(3), "verify": match.group(4),
             })
-        # Space-separated fallback
         if not records:
             for match in re.finditer(r"(\d+)\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+(\d+)", text):
                 records.append({
-                    "pin": match.group(1),
-                    "timestamp": match.group(2),
-                    "status": "0",
-                    "verify": match.group(3),
+                    "pin": match.group(1), "timestamp": match.group(2),
+                    "status": "0", "verify": match.group(3),
                 })
     except Exception as e:
-        logger.error(f"Error parsing attendance data: {e}")
+        logger.error(f"Error parsing: {e}")
     return records
 
 
 async def _process_attendance(pin: str, timestamp: str):
-    """Process a single attendance event."""
     _clear_daily_dedup()
     user = USERS.get(pin)
     if not user:
         logger.warning(f"[TRUEFACE] Unknown PIN={pin}")
         return
-
     name = user["name"]
     phone = user.get("phone", "")
-    logger.info(f"[TRUEFACE] ATTENDANCE DETECTED: {name} PIN={pin} time={timestamp}")
-
+    logger.info(f"[TRUEFACE] ATTENDANCE: {name} PIN={pin} time={timestamp}")
     today = datetime.now(IST).strftime("%Y-%m-%d")
     if _notified_today.get(pin) == today:
-        logger.info(f"[TRUEFACE] Already notified {name} today, skipping")
+        logger.info(f"[TRUEFACE] Already notified {name} today")
         return
-
     now = datetime.now(IST)
     if now.weekday() in (5, 6):
         logger.info(f"[TRUEFACE] Weekend skip for {name}")
         return
-
     try:
         dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
         time_str = dt.strftime("%I:%M %p")
     except (ValueError, TypeError):
         time_str = now.strftime("%I:%M %p")
-
     if phone:
         _notified_today[pin] = today
         logger.info(f"[TRUEFACE] >>> Sending WhatsApp to {phone} for {name} at {time_str}")
         asyncio.create_task(_send_whatsapp(name, phone, time_str))
 
 
-def _build_registration_ack(serial: str) -> bytes:
-    """Build a registration acknowledgment response.
-    
-    Try multiple response strategies to find what the device accepts.
-    Strategy: mirror the registration packet structure with ACK flag.
-    """
-    # Build a 96-byte response mirroring the registration format
-    resp = bytearray(96)
-    # Set command to 0xb5 (ACK for 0xb4 registration)
-    resp[0] = 0xb5
-    resp[1] = 0x00
-    resp[2] = 0x00
-    resp[3] = 0x00
-    # Data length indicator
-    resp[4] = 0x40
-    resp[5] = 0x00
-    resp[6] = 0x00
-    resp[7] = 0x00
-    # Protocol version
-    resp[8] = 0x07
-    # Place serial number at same offset (0x20)
-    serial_bytes = serial.encode("ascii")[:16]
-    resp[0x20:0x20+len(serial_bytes)] = serial_bytes
-    return bytes(resp)
+def _build_response(raw: bytes, serial: str) -> bytes:
+    """Build response based on current strategy."""
+    if STRATEGY == 0:
+        return b""  # No response
+    elif STRATEGY == 1:
+        return raw  # Echo back same packet
+    elif STRATEGY == 2:
+        # 8-byte short ACK
+        return struct.pack("<BBBBBBBB", 0xb4, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+    elif STRATEGY == 3:
+        # 16-byte header-only ACK
+        resp = bytearray(16)
+        resp[0] = 0xb4
+        resp[4] = 0x01  # Success flag
+        resp[8] = 0x07  # Protocol version
+        return bytes(resp)
+    elif STRATEGY == 4:
+        # Same 96 bytes with command byte changed
+        resp = bytearray(raw)
+        resp[0] = 0xb5  # ACK command
+        return bytes(resp)
+    return b""
 
 
 async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Handle a persistent TCP connection from the TrueFace device."""
     addr = writer.get_extra_info("peername")
-    logger.info(f"[TRUEFACE] === New connection from {addr} ===")
+    logger.info(f"[TRUEFACE] === Connection from {addr} (strategy={STRATEGY}) ===")
 
     serial = ""
     msg_count = 0
-    registered = False
 
     try:
         while True:
             try:
-                # Read data - use a shorter timeout initially, longer after registration
-                timeout = 30.0 if not registered else 300.0
-                raw = await asyncio.wait_for(reader.read(65536), timeout=timeout)
+                raw = await asyncio.wait_for(reader.read(65536), timeout=60.0)
             except asyncio.TimeoutError:
-                logger.info(f"[TRUEFACE] Timeout from {addr} (registered={registered})")
-                # Send a keepalive ping if registered
-                if registered:
-                    try:
-                        writer.write(b"\x00")
-                        await writer.drain()
-                    except Exception:
-                        break
-                continue
+                logger.info(f"[TRUEFACE] 60s timeout from {addr}")
+                break
 
             if not raw:
                 logger.info(f"[TRUEFACE] Connection closed by {addr}")
                 break
 
             msg_count += 1
-            logger.info(f"[TRUEFACE] Message #{msg_count} from {addr} ({len(raw)} bytes)")
-            logger.info(f"[TRUEFACE] Hex dump:\n{_hex_dump(raw)}")
+            logger.info(f"[TRUEFACE] Msg #{msg_count} ({len(raw)} bytes) cmd=0x{raw[0]:02x}")
+            logger.info(f"[TRUEFACE] Hex:\n{_hex_dump(raw)}")
 
-            # Extract serial number
             if not serial:
                 serial = _extract_serial(raw)
                 if serial:
-                    logger.info(f"[TRUEFACE] Device serial: {serial}")
+                    logger.info(f"[TRUEFACE] Serial: {serial}")
 
-            # Check if this is a registration packet (96 bytes, starts with 0xb4)
-            if len(raw) == 96 and raw[0] == 0xb4 and not registered:
-                logger.info(f"[TRUEFACE] Registration packet from {serial}")
-                
-                # Strategy 1: Send ACK response
-                ack = _build_registration_ack(serial)
-                writer.write(ack)
-                await writer.drain()
-                registered = True
-                logger.info(f"[TRUEFACE] Sent registration ACK, connection established")
-                continue
-
-            # Check for attendance data in any subsequent message
+            # Check for attendance data
             records = _extract_attendance_data(raw)
             if records:
-                logger.info(f"[TRUEFACE] Found {len(records)} attendance record(s)!")
+                logger.info(f"[TRUEFACE] FOUND {len(records)} attendance record(s)!")
                 for r in records:
                     await _process_attendance(r["pin"], r["timestamp"])
+
+            # Send response based on strategy
+            resp = _build_response(raw, serial)
+            if resp:
+                writer.write(resp)
+                await writer.drain()
+                logger.info(f"[TRUEFACE] Sent {len(resp)}-byte response")
             else:
-                # Log the command byte for analysis
-                if len(raw) >= 4:
-                    cmd = raw[0]
-                    logger.info(f"[TRUEFACE] Unknown message type: cmd=0x{cmd:02x} "
-                               f"len={len(raw)} registered={registered}")
-                    
-                    # For any message after registration, try sending a simple ACK
-                    if registered:
-                        # Echo the command byte with 0x01 flag as ACK
-                        simple_ack = bytearray(8)
-                        simple_ack[0] = cmd + 1  # ACK = cmd + 1
-                        writer.write(bytes(simple_ack))
-                        await writer.drain()
-                        logger.info(f"[TRUEFACE] Sent simple ACK (0x{cmd+1:02x})")
+                logger.info(f"[TRUEFACE] No response (strategy=0, keeping connection open)")
 
     except ConnectionResetError:
         logger.info(f"[TRUEFACE] Connection reset by {addr}")
@@ -265,16 +219,22 @@ async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.Stream
             writer.close()
         except Exception:
             pass
-        logger.info(f"[TRUEFACE] Connection from {addr} ended "
-                    f"(serial={serial}, msgs={msg_count}, registered={registered})")
+        logger.info(f"[TRUEFACE] Ended {addr} serial={serial} msgs={msg_count}")
 
 
 async def main():
     port = 8898
     server = await asyncio.start_server(handle_connection, "0.0.0.0", port)
-    logger.info(f"[TRUEFACE] Standalone listener started on port {port}")
+    logger.info(f"[TRUEFACE] Listener on port {port}, strategy={STRATEGY}")
+    strategies = {
+        0: "SILENT (no response)",
+        1: "ECHO (same packet back)",
+        2: "SHORT ACK (8 bytes)",
+        3: "HEADER ACK (16 bytes)",
+        4: "MODIFIED (96 bytes, cmd=0xb5)",
+    }
+    logger.info(f"[TRUEFACE] Response: {strategies.get(STRATEGY, 'unknown')}")
     logger.info(f"[TRUEFACE] Users: {json.dumps(USERS, indent=2)}")
-    logger.info(f"[TRUEFACE] Waiting for device connections...")
     async with server:
         await server.serve_forever()
 
