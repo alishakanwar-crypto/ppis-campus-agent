@@ -1,4 +1,5 @@
-"""Discover TrueFace record query API — round 3."""
+"""Discover TrueFace record query API — round 4.
+Focus on AccessOpenDoorRecManager (exists but params wrong) and JS analysis."""
 import httpx, hashlib, json
 
 c = httpx.Client(timeout=10)
@@ -49,92 +50,97 @@ def show(label, resp):
     tag = f'OK (result={ok})' if ok else f'FAIL({err})'
     print(f"  {label} -> {tag}")
     if ok or (ok is not False and ok is not None):
-        print(f"    FULL: {json.dumps(resp)[:600]}")
+        print(f"    FULL: {json.dumps(resp)[:800]}")
 
 
-cond = {
-    'condition': {
-        'StartTime': '2026-05-22 00:00:00',
-        'EndTime': '2026-05-22 23:59:59',
-    }
-}
-
-# Test 1: log.startFind (from JS — different from LogManager.startFind)
-print("\n=== Test 1: log.startFind ===")
-r = rpc('log.startFind', cond)
-show('log.startFind', r)
-if r and r.get('result'):
-    token = r['result'] if isinstance(r['result'], int) else r.get('params', {}).get('Token')
-    print(f"  Token: {token}")
-    if token:
-        r2 = rpc('log.getCount', {'token': token})
-        show('log.getCount', r2)
-        r3 = rpc('log.doFind', {'token': token, 'count': 10})
-        show('log.doFind', r3)
-        rpc('log.stopFind', {'token': token})
-
-# Test 2: log.startFind with Types
-print("\n=== Test 2: log.startFind with Types ===")
-for types in [['All'], ['Access'], ['Alarm'], ['Event']]:
-    cond2 = {'condition': {
-        'StartTime': '2026-05-22 00:00:00',
-        'EndTime': '2026-05-22 23:59:59',
-        'Types': types,
-    }}
-    r = rpc('log.startFind', cond2)
-    show(f'log.startFind Types={types}', r)
+# Test 1: AccessOpenDoorRecManager with many param variations
+# (It returned empty error before = method exists but params wrong)
+print("\n=== Test 1: AccessOpenDoorRecManager.startFind (param variations) ===")
+conditions = [
+    {"condition": {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59", "Doors": [0]}},
+    {"condition": {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59", "Channels": [0]}},
+    {"condition": {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59", "Type": "All"}},
+    {"Condition": {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59"}},
+    {"StartTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59"},
+    {"condition": {"BeginTime": "2026-05-22 00:00:00", "EndTime": "2026-05-22 23:59:59"}},
+]
+for i, cond in enumerate(conditions):
+    r = rpc('AccessOpenDoorRecManager.startFind', cond)
+    show(f'Format {i+1}', r)
     if r and r.get('result'):
-        token = r['result'] if isinstance(r['result'], int) else r.get('params', {}).get('Token')
+        p = r.get('params', {})
+        token = p.get('Token', p.get('token'))
+        if not token:
+            token = r['result'] if isinstance(r['result'], int) else None
+        if token:
+            r2 = rpc('AccessOpenDoorRecManager.doFind', {'Token': token, 'Count': 5})
+            show('  doFind', r2)
+            rpc('AccessOpenDoorRecManager.stopFind', {'Token': token})
+
+# Test 2: log.startFind returning attendance-type records
+# Previous test showed system logs. Try with specific log types
+print("\n=== Test 2: log.startFind with different log types ===")
+log_types = [
+    ['AccessControl'], ['FaceRecognition'], ['DoorOpen'],
+    ['Attendance'], ['AccessDoor'], ['AccessVerify'],
+]
+for lt in log_types:
+    cond = {'condition': {
+        'StartTime': '2026-05-22 00:00:00',
+        'EndTime': '2026-05-22 23:59:59',
+        'Types': lt,
+    }}
+    r = rpc('log.startFind', cond)
+    if r and r.get('result'):
+        token = r.get('params', {}).get('token')
         if token:
             r2 = rpc('log.getCount', {'token': token})
-            show(f'  log.getCount', r2)
-            r3 = rpc('log.doFind', {'token': token, 'count': 5})
-            show(f'  log.doFind', r3)
+            count = r2.get('params', {}).get('count', 0) if r2 else 0
+            print(f"  Types={lt}: count={count}")
+            if count > 0:
+                r3 = rpc('log.doFind', {'token': token, 'count': 3})
+                if r3:
+                    items = r3.get('params', {}).get('items', [])
+                    for item in (items or [])[:2]:
+                        print(f"    {json.dumps(item)[:200]}")
             rpc('log.stopFind', {'token': token})
-        break  # Stop after first success
+        else:
+            print(f"  Types={lt}: no token returned")
+    else:
+        err = r.get('error', {}).get('message', '') if r else 'no response'
+        print(f"  Types={lt}: FAIL({err})")
 
-# Test 3: AccessAttendance.list
-print("\n=== Test 3: AccessAttendance.list ===")
-r = rpc('AccessAttendance.list', None)
-show('AccessAttendance.list (no params)', r)
-r = rpc('AccessAttendance.list', {'count': 10})
-show('AccessAttendance.list (count=10)', r)
-r = rpc('AccessAttendance.list', {'UserID': '1'})
-show('AccessAttendance.list (UserID=1)', r)
+# Test 3: Search vendor.js for more API clues
+print("\n=== Test 3: Searching device JS files ===")
+# Download vendor.js and search for record-related patterns
+try:
+    vjs = c.get('http://192.168.1.112/static/js/vendor.035771e22764c9e10669.js', timeout=15).text
+    print(f"  vendor.js downloaded ({len(vjs)} chars)")
+    import re
+    # Search for RPC method calls related to records/attendance
+    patterns = re.findall(r'"((?:Access|Record|log|Attendance)[A-Za-z]*\.[a-zA-Z]+)"', vjs)
+    unique = sorted(set(patterns))
+    if unique:
+        print(f"  Found {len(unique)} methods in vendor.js:")
+        for m in unique:
+            print(f"    {m}")
+except Exception as e:
+    print(f"  Could not download vendor.js: {e}")
 
-# Test 4: RecordFinder instance pattern from JS
-# JS: this.instance({name:e}).then(...startFind...)
-print("\n=== Test 4: RecordFinder instance pattern ===")
-for name in ['AccessControlCardRec', 'trafficSnapRecord', 'AccessOpenDoorRecord']:
-    # Try creating instance via different method names
-    for factory in ['RecordFinder.factory', 'RecordFinder.create', 'RecordFinder.instance']:
-        r = rpc(factory, {'name': name})
-        if r and r.get('result'):
-            show(f'{factory}({name})', r)
-            obj = r['result']
-            r2 = rpc(f'{obj}.startFind', cond)
-            show(f'  {obj}.startFind', r2)
-            if r2 and r2.get('result'):
-                r3 = rpc(f'{obj}.doFind', {'count': 5})
-                show(f'  {obj}.doFind', r3)
-            rpc(f'{obj}.destroy', None)
-            break
-
-# Test 5: Direct record search via Attendance service
-print("\n=== Test 5: Attendance service methods ===")
-show('Attendance.webStatis', rpc('Attendance.webStatis', cond))
-show('Attendance.getCheckGroup', rpc('Attendance.getCheckGroup', None))
-
-# Test 6: Try the exact JS pattern for Search Records page
-# The JS shows the page uses D.AccessAttendance or similar
-print("\n=== Test 6: Search pattern from JS (instance-based) ===")
-# Maybe AccessAttendance needs instance creation first
-for method in ['AccessAttendance.instance', 'AccessAttendance.create', 'AccessAttendance.factory']:
-    r = rpc(method, {'name': 'default'})
-    show(method, r)
-    if r and r.get('result'):
-        obj = r['result']
-        r2 = rpc(f'{obj}.startFind', cond)
-        show(f'  {obj}.startFind', r2)
+# Also search app.js for the SearchRecord/query page component
+try:
+    with open('trueface_app.js', 'r', errors='ignore') as f:
+        ajs = f.read()
+    # Look for the Search Records page handler
+    import re
+    # Find context around "SearchRecord" or "searchRecord" or "query" near "record"
+    for pat in [r'.{0,100}SearchRecord.{0,100}', r'.{0,100}searchRecord.{0,100}',
+                r'.{0,100}queryRecord.{0,100}', r'.{0,100}RecordQuery.{0,100}',
+                r'.{0,50}startFind.{0,200}condition.{0,100}']:
+        matches = re.findall(pat, ajs, re.IGNORECASE)
+        for m in matches[:3]:
+            print(f"  JS: ...{m[:200]}...")
+except Exception as e:
+    print(f"  Could not search app.js: {e}")
 
 print("\nDone!")
