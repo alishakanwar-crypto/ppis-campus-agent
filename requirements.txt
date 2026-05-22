@@ -1,5 +1,6 @@
 fastapi[standard]==0.115.0
 uvicorn==0.30.6
+httptools>=0.6.0
 httpx==0.28.1
 websockets==13.1
 openpyxl==3.1.5

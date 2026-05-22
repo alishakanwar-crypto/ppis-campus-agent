@@ -2959,7 +2959,8 @@ if __name__ == "__main__":
     for attempt in range(1, max_retries + 1):
         try:
             uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
-                        timeout_keep_alive=30, ws_max_size=16777216)
+                        timeout_keep_alive=30, ws_max_size=16777216,
+                        http="httptools")
             break  # Normal shutdown
         except OSError as e:
             if ("10048" in str(e) or "Address already in use" in str(e)):
