@@ -527,12 +527,12 @@ class AttendanceEngine:
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
         self.confidence_threshold = 0.35  # Student min confidence 35%
-        self.confidence_max = 0.50  # Student max confidence 50%
+        self.confidence_max = 0.75  # Student max confidence 75%
         self.review_threshold = 0.30  # Below 30% gets rejected outright
         self.min_sightings = 2  # Students: require 2 independent sightings
         self.sighting_window = 600  # 10-minute window for sightings to accumulate
         self.teacher_confidence_threshold = 0.35  # Teacher min threshold 35%
-        self.teacher_confidence_max = 0.45  # Teacher max threshold 45%
+        self.teacher_confidence_max = 0.75  # Teacher max threshold 75%
         self.entry_validated: dict[str, str] = {}  # person_id -> date (seen at entry/reception)
         self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
         self.known_faces: dict = {}
