@@ -288,22 +288,45 @@ def _extract_events(driver) -> list[dict]:
     return events
 
 
+# Events that failed to send — retry on next cycle
+_pending_events: list[dict] = []
+
+
 def _send_to_cloud(events: list[dict]) -> dict | None:
-    """Send events to the cloud API."""
-    try:
-        resp = httpx.post(
-            CLOUD_API,
-            json=events,
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            logger.error("Cloud API error: HTTP %d — %s", resp.status_code, resp.text[:200])
+    """Send events to the cloud API with retry logic."""
+    global _pending_events
+
+    # Prepend any previously failed events
+    if _pending_events:
+        logger.info("Retrying %d previously failed event(s)...", len(_pending_events))
+        events = _pending_events + events
+        _pending_events = []
+
+    for attempt in range(3):
+        try:
+            resp = httpx.post(
+                CLOUD_API,
+                json=events,
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                logger.error("Cloud API error: HTTP %d — %s", resp.status_code, resp.text[:200])
+                if attempt < 2:
+                    time.sleep(2)
+                    continue
+                return None
+        except Exception as e:
+            logger.error("Cloud API request failed (attempt %d/3): %s", attempt + 1, e)
+            if attempt < 2:
+                time.sleep(3)
+                continue
+            # Save events for retry on next poll cycle
+            _pending_events.extend(events)
+            logger.warning("Queued %d event(s) for retry on next cycle", len(events))
             return None
-    except Exception as e:
-        logger.error("Cloud API request failed: %s", e)
-        return None
+    return None
 
 
 def _reset_daily():
@@ -338,6 +361,8 @@ def run_poller():
     driver = None
     consecutive_errors = 0
     max_errors = 10
+    poll_count = 0
+    SESSION_REFRESH_EVERY = 300  # Re-login every 300 polls (~15 min) to keep session alive
 
     while running:
         try:
@@ -353,6 +378,18 @@ def run_poller():
                     continue
                 _navigate_to_search_records(driver)
                 consecutive_errors = 0
+                poll_count = 0
+
+            # Periodic session refresh to prevent stale browser
+            poll_count += 1
+            if poll_count >= SESSION_REFRESH_EVERY:
+                logger.info("Session refresh — restarting browser to prevent staleness")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = None
+                continue
 
             # Skip weekends
             if _is_weekend():
@@ -362,7 +399,12 @@ def run_poller():
             _reset_daily()
 
             # Click Query to refresh
-            _click_query(driver)
+            query_ok = _click_query(driver)
+            if not query_ok:
+                logger.warning("Query button not found — refreshing page")
+                _navigate_to_search_records(driver)
+                time.sleep(2)
+                _click_query(driver)
             time.sleep(SCAN_DELAY)
 
             # Extract events
