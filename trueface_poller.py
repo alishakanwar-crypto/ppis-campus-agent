@@ -240,83 +240,6 @@ def _navigate_to_search_records(driver):
     return False
 
 
-def _set_today_date(driver):
-    """Set the date filter on the Search Records page.
-
-    The TrueFace UI has two date inputs: start date and end date.
-    We set start = today 00:00:00, end = tomorrow 00:00:00 so the
-    range covers all of today's events.
-    """
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-
-    now_ist = datetime.now(IST)
-    today_str = now_ist.strftime("%Y-%m-%d")
-    tomorrow_str = (now_ist + timedelta(days=1)).strftime("%Y-%m-%d")
-    today_full = f"{today_str} 00:00:00"
-    tomorrow_full = f"{tomorrow_str} 00:00:00"
-    logger.info("Setting date filter: %s → %s", today_full, tomorrow_full)
-
-    try:
-        # Find text inputs that contain date-like values
-        text_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input:not([type])")
-        date_inputs_found = []
-        for inp in text_inputs:
-            try:
-                val = inp.get_attribute("value") or ""
-                if any(c in val for c in ["-", "/"]) and any(c.isdigit() for c in val) and len(val) >= 8:
-                    date_inputs_found.append((inp, val))
-            except Exception:
-                continue
-
-        if len(date_inputs_found) >= 2:
-            # First = start date, second = end date
-            start_inp, start_val = date_inputs_found[0]
-            end_inp, end_val = date_inputs_found[1]
-
-            start_inp.clear()
-            start_inp.send_keys(today_full)
-            start_inp.send_keys(Keys.TAB)
-            logger.info("Start date: '%s' → '%s'", start_val, today_full)
-
-            end_inp.clear()
-            end_inp.send_keys(tomorrow_full)
-            end_inp.send_keys(Keys.TAB)
-            logger.info("End date: '%s' → '%s'", end_val, tomorrow_full)
-            return True
-
-        elif len(date_inputs_found) == 1:
-            inp, val = date_inputs_found[0]
-            inp.clear()
-            inp.send_keys(today_full)
-            inp.send_keys(Keys.TAB)
-            logger.info("Updated single date input: '%s' → '%s'", val, today_full)
-            return True
-
-        # Fallback: try native date inputs
-        date_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='date']")
-        if date_inputs:
-            for i, inp in enumerate(date_inputs):
-                try:
-                    target = today_str if i == 0 else tomorrow_str
-                    driver.execute_script(
-                        "arguments[0].value = arguments[1]; "
-                        "arguments[0].dispatchEvent(new Event('input', {bubbles:true})); "
-                        "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
-                        inp, target,
-                    )
-                except Exception:
-                    pass
-            logger.info("Set %d native date input(s)", len(date_inputs))
-            return True
-
-        logger.warning("No date inputs found on page")
-        return False
-    except Exception as e:
-        logger.debug("Date filter setting failed: %s", e)
-        return False
-
-
 def _click_query(driver):
     """Click the Query/Search button to refresh records."""
     from selenium.webdriver.common.by import By
@@ -505,8 +428,6 @@ def run_poller():
                     time.sleep(30)
                     continue
                 _navigate_to_search_records(driver)
-                _set_today_date(driver)
-                time.sleep(1)
                 consecutive_errors = 0
                 poll_count = 0
 
@@ -533,7 +454,6 @@ def run_poller():
             if not query_ok:
                 logger.warning("Query button not found — refreshing page")
                 _navigate_to_search_records(driver)
-                _set_today_date(driver)
                 time.sleep(2)
                 _click_query(driver)
             time.sleep(SCAN_DELAY)
