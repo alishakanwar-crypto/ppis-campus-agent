@@ -390,10 +390,6 @@ def _reset_daily():
         logger.info("New day: %s — reset seen events", today)
 
 
-def _is_weekend() -> bool:
-    return datetime.now(IST).weekday() in (5, 6)
-
-
 # ---------------------------------------------------------------------------
 # Main polling loop
 # ---------------------------------------------------------------------------
@@ -440,11 +436,6 @@ def run_poller():
                 except Exception:
                     pass
                 driver = None
-                continue
-
-            # Skip weekends
-            if _is_weekend():
-                time.sleep(60)
                 continue
 
             _reset_daily()
