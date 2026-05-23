@@ -256,33 +256,42 @@ def _click_query(driver):
     return False
 
 
-def _capture_row_photo(driver, row) -> str:
+_photo_debug_done = False
+
+
+def _capture_row_photo(driver, row, debug: bool = False) -> str:
     """Try to capture a face photo from a table row.
 
     Looks for <img> elements in the row, converts to base64 via canvas.
+    Also checks for background-image CSS on cells.
     Returns base64-encoded JPEG string or empty string if no image found.
     """
     from selenium.webdriver.common.by import By
 
     try:
+        # Method 1: <img> tags in the row
         imgs = row.find_elements(By.TAG_NAME, "img")
+        if debug:
+            logger.info("  Photo debug: %d <img> tags in row", len(imgs))
         for img in imgs:
             src = img.get_attribute("src") or ""
-            # Skip tiny icons / placeholders
-            width = img.get_attribute("naturalWidth") or img.get_attribute("width") or "0"
+            nat_w = img.get_attribute("naturalWidth") or "0"
+            nat_h = img.get_attribute("naturalHeight") or "0"
+            if debug:
+                logger.info("  Photo debug: img src=%s (nat=%sx%s)", src[:80], nat_w, nat_h)
+
             try:
-                if int(width) < 20:
+                if int(nat_w) < 20:
                     continue
             except (ValueError, TypeError):
                 pass
 
             if src.startswith("data:image"):
-                # Already a data URL — extract base64 part
                 if "," in src:
                     return src.split(",", 1)[1]
                 continue
 
-            # Convert via canvas to base64
+            # Convert via canvas — use crossOrigin workaround
             b64 = driver.execute_script("""
                 var img = arguments[0];
                 if (!img.complete || img.naturalWidth === 0) return '';
@@ -291,10 +300,85 @@ def _capture_row_photo(driver, row) -> str:
                 c.height = img.naturalHeight;
                 c.getContext('2d').drawImage(img, 0, 0);
                 try { return c.toDataURL('image/jpeg', 0.85).split(',')[1]; }
-                catch(e) { return ''; }
+                catch(e) { return 'CANVAS_ERROR:' + e.message; }
             """, img)
-            if b64:
+            if debug and b64:
+                logger.info("  Photo debug: canvas result=%s", b64[:60] if b64 else "empty")
+            if b64 and not b64.startswith("CANVAS_ERROR"):
                 return b64
+            elif b64 and b64.startswith("CANVAS_ERROR"):
+                # Canvas tainted — try fetching the image directly via JS fetch
+                if src.startswith("http"):
+                    fetch_b64 = driver.execute_script("""
+                        var url = arguments[0];
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('GET', url, false);
+                        xhr.responseType = 'arraybuffer';
+                        try {
+                            xhr.send();
+                            if (xhr.status === 200) {
+                                var bytes = new Uint8Array(xhr.response);
+                                var binary = '';
+                                for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+                                return btoa(binary);
+                            }
+                        } catch(e) {}
+                        return '';
+                    """, src)
+                    if fetch_b64:
+                        return fetch_b64
+
+        # Method 2: Check cells for background-image CSS
+        cells = row.find_elements(By.TAG_NAME, "td")
+        for i, cell in enumerate(cells):
+            bg = driver.execute_script(
+                "return window.getComputedStyle(arguments[0]).backgroundImage;", cell
+            ) or ""
+            if bg and bg != "none" and "url(" in bg:
+                if debug:
+                    logger.info("  Photo debug: cell[%d] has background-image: %s", i, bg[:80])
+                url = bg.split('url("')[1].split('")')[0] if 'url("' in bg else ""
+                if url:
+                    fetch_b64 = driver.execute_script("""
+                        var url = arguments[0];
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('GET', url, false);
+                        xhr.responseType = 'arraybuffer';
+                        try {
+                            xhr.send();
+                            if (xhr.status === 200) {
+                                var bytes = new Uint8Array(xhr.response);
+                                var binary = '';
+                                for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+                                return btoa(binary);
+                            }
+                        } catch(e) {}
+                        return '';
+                    """, url)
+                    if fetch_b64:
+                        return fetch_b64
+
+        # Method 3: Check for any element with src attribute (e.g., <object>, <embed>)
+        src_elems = row.find_elements(By.CSS_SELECTOR, "[src]")
+        for elem in src_elems:
+            tag = elem.tag_name.lower()
+            if tag == "img":
+                continue  # Already handled
+            src = elem.get_attribute("src") or ""
+            if debug:
+                logger.info("  Photo debug: <%s> with src=%s", tag, src[:80])
+
+        if debug and not imgs:
+            # Log raw HTML of the last cell to understand structure
+            last_html = driver.execute_script(
+                "return arguments[0].innerHTML;", cells[-1]
+            ) if cells else ""
+            second_last_html = driver.execute_script(
+                "return arguments[0].innerHTML;", cells[-2]
+            ) if len(cells) > 1 else ""
+            logger.info("  Photo debug: last cell HTML=%s", last_html[:200])
+            logger.info("  Photo debug: 2nd-last cell HTML=%s", second_last_html[:200])
+
     except Exception as e:
         logger.debug("Photo capture failed for row: %s", e)
     return ""
@@ -330,7 +414,14 @@ def _extract_events(driver) -> list[dict]:
         }
 
         # Try to capture the face photo from this row
-        photo_b64 = _capture_row_photo(driver, row)
+        global _photo_debug_done
+        do_debug = not _photo_debug_done
+        photo_b64 = _capture_row_photo(driver, row, debug=do_debug)
+        if do_debug:
+            _photo_debug_done = True
+            logger.info("Photo capture for %s: %s (%d bytes)",
+                        name, "OK" if photo_b64 else "NONE",
+                        len(photo_b64) if photo_b64 else 0)
         if photo_b64:
             evt["photo"] = photo_b64
 
