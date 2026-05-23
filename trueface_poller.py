@@ -257,15 +257,10 @@ def _click_query(driver):
 
 
 _photo_debug_done = False
-_snapshot_diag_done = False
 
 
 def _deep_diag_vue(driver) -> dict:
-    """One-time deep diagnostic: dump ALL Vue data arrays on the page.
-
-    This runs once on first poll and logs everything it finds so we can
-    discover the exact field names the TrueFace device uses.
-    """
+    """One-time diagnostic: check Vue data structure (runs once per session)."""
     try:
         return driver.execute_script("""
             var out = {};
@@ -577,19 +572,10 @@ def _extract_events(driver) -> list[dict]:
 def _attach_photos(driver, new_events: list[dict]) -> None:
     """Fetch live snapshots from the TrueFace device for new events.
 
-    Phase 1 (this PR): Deep diagnostic — discovers the Vue data structure.
-    Phase 2: Once field names are known, fetches actual snapshot images.
+    Reads snapshot paths from Vue.js component data, then fetches images.
     Backend falls back to database photos if no snapshot is found.
     """
-    global _photo_debug_done, _snapshot_diag_done
-
-    # Run deep diagnostic ONCE to discover data structure
-    if not _snapshot_diag_done:
-        _snapshot_diag_done = True
-        diag = _deep_diag_vue(driver)
-        if diag:
-            for k in sorted(diag.keys()):
-                logger.info("DIAG %s: %s", k, str(diag[k])[:200])
+    global _photo_debug_done
 
     # Try to extract snapshot URLs from discovered data
     snap_map = _try_extract_snapshots(driver)
@@ -818,24 +804,10 @@ def run_poller():
             # Extract events
             events = _extract_events(driver)
 
-            # Verbose logging for first 5 polls and every 100th poll
-            if poll_count <= 5 or (not events and poll_count % 100 == 0):
-                from selenium.webdriver.common.by import By as _By
-                rows = driver.find_elements(_By.CSS_SELECTOR, "table tr")
-                # Sample first row's cell count and text for debugging
-                sample = ""
-                if rows:
-                    cells = rows[0].find_elements(_By.TAG_NAME, "td")
-                    th_cells = rows[0].find_elements(_By.TAG_NAME, "th")
-                    sample = f", first_row: {len(cells)} td + {len(th_cells)} th"
-                    if len(rows) > 1:
-                        cells2 = rows[1].find_elements(_By.TAG_NAME, "td")
-                        if cells2:
-                            cell_texts = [c.text.strip()[:20] for c in cells2[:9]]
-                            sample += f", row2_cells({len(cells2)}): {cell_texts}"
+            # Log first poll and then only periodically
+            if poll_count == 1:
                 logger.info(
-                    "Poll #%d: %d events extracted, %d table rows, URL=%s%s",
-                    poll_count, len(events), len(rows), driver.current_url, sample,
+                    "Poll #1: %d events found on page", len(events),
                 )
 
             # Filter to only new events
