@@ -256,45 +256,87 @@ def _click_query(driver):
     return False
 
 
-def _fetch_device_photo(pin: str) -> str:
-    """Fetch a user's photo from the TrueFace device via HTTP API.
+def _fetch_snapshot(driver, pin: str, row_cell) -> str:
+    """Fetch the live snapshot from the TrueFace device for one event.
 
-    Tries multiple common ZKTeco API endpoints. Returns base64-encoded
-    image data or empty string. Uses a short timeout to stay fast.
+    Clicks the download icon in the row, intercepts the snapshot URL
+    (e.g. /RPC2_Loadfile/mnt/appdata1/userpic/SnapShot/.../{PIN}_XX_100_{ts}.jpg),
+    and fetches the image — all in a single async JS call (~1 second).
     """
     import base64
 
-    base = DEVICE_URL.rstrip("/")
-    auth = httpx.BasicAuth(DEVICE_USER, DEVICE_PASS)
+    try:
+        photo_b64 = driver.execute_async_script("""
+            var cell = arguments[0];
+            var done = arguments[arguments.length - 1];
 
-    endpoints = [
-        f"{base}/csl/user?action=GetPhoto&PIN={pin}",
-        f"{base}/csl/user/photo?pin={pin}",
-        f"{base}/api/user/photo/{pin}",
-        f"{base}/ISAPI/AccessControl/UserInfo/photo/{pin}",
-    ]
+            var capturedUrl = '';
 
-    for url in endpoints:
-        try:
-            resp = httpx.get(url, auth=auth, timeout=2, verify=False)
-            if resp.status_code == 200 and len(resp.content) > 500:
-                ct = resp.headers.get("content-type", "")
-                if "image" in ct or resp.content[:4] in (
-                    b"\xff\xd8\xff\xe0",  # JPEG
-                    b"\xff\xd8\xff\xe1",  # JPEG EXIF
-                    b"\x89PNG",           # PNG
-                ):
-                    return base64.b64encode(resp.content).decode()
-        except Exception:
-            continue
+            // Hook window.open
+            var _open = window.open;
+            window.open = function(u) { capturedUrl = u; return null; };
+
+            // Hook fetch
+            var _fetch = window.fetch;
+            window.fetch = function(u) {
+                if (typeof u === 'string' && (u.indexOf('SnapShot') > -1 || u.indexOf('RPC2') > -1))
+                    capturedUrl = u;
+                return _fetch.apply(window, arguments);
+            };
+
+            // Hook XHR.open
+            var _xhrOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(m, u) {
+                if (u && (u.indexOf('SnapShot') > -1 || u.indexOf('RPC2') > -1))
+                    capturedUrl = u;
+                return _xhrOpen.apply(this, arguments);
+            };
+
+            // Click the download icon
+            var icon = cell.querySelector('i.ui-pic, i.el-icon-download');
+            if (icon) icon.click();
+
+            setTimeout(function() {
+                // Restore hooks
+                window.open = _open;
+                window.fetch = _fetch;
+                XMLHttpRequest.prototype.open = _xhrOpen;
+
+                if (!capturedUrl) { done(''); return; }
+
+                // Fetch the snapshot image
+                var xhr = new XMLHttpRequest();
+                xhr.open('GET', capturedUrl, true);
+                xhr.responseType = 'arraybuffer';
+                xhr.onload = function() {
+                    if (xhr.status === 200 && xhr.response.byteLength > 500) {
+                        var b = new Uint8Array(xhr.response), s = '';
+                        for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+                        done(btoa(s));
+                    } else { done(''); }
+                };
+                xhr.onerror = function() { done(''); };
+                xhr.send();
+            }, 600);
+        """, row_cell)
+
+        if photo_b64 and len(photo_b64) > 100:
+            return photo_b64
+    except Exception as e:
+        logger.debug("Snapshot fetch failed for PIN=%s: %s", pin, e)
+
     return ""
 
 
-_photo_api_debug_done = False
+_photo_debug_done = False
 
 
 def _extract_events(driver) -> list[dict]:
-    """Extract face recognition events from the records table."""
+    """Extract face recognition events from the records table.
+
+    Keeps a reference to each row's last cell (download icon) so we can
+    click it later to fetch the live snapshot — only for NEW events.
+    """
     from selenium.webdriver.common.by import By
 
     events = []
@@ -320,28 +362,31 @@ def _extract_events(driver) -> list[dict]:
             "pin": uid,
             "name": name,
             "timestamp": timestamp,
+            "_dl_cell": cells[-1],  # last cell with download icon
         })
 
     return events
 
 
-def _attach_photos(new_events: list[dict]) -> None:
-    """Try to fetch live photos from the TrueFace device API for new events.
+def _attach_photos(driver, new_events: list[dict]) -> None:
+    """Fetch live snapshots from the TrueFace device for new events only.
 
-    This uses direct HTTP requests (not Selenium), so it's fast (~0.5s per
-    teacher). Falls back to backend database photos if device API fails.
+    Clicks the download icon in each row to intercept the snapshot URL,
+    fetches the image (~1s per teacher). Only runs for newly detected events.
+    Backend falls back to database photos if no snapshot is found.
     """
-    global _photo_api_debug_done
+    global _photo_debug_done
 
     for evt in new_events:
         pin = evt.get("pin", "")
-        if not pin:
+        dl_cell = evt.pop("_dl_cell", None)
+        if not pin or not dl_cell:
             continue
-        photo_b64 = _fetch_device_photo(pin)
-        if not _photo_api_debug_done:
-            _photo_api_debug_done = True
+        photo_b64 = _fetch_snapshot(driver, pin, dl_cell)
+        if not _photo_debug_done:
+            _photo_debug_done = True
             logger.info(
-                "Device photo API for %s (PIN=%s): %s (%d bytes)",
+                "Live snapshot for %s (PIN=%s): %s (%d bytes)",
                 evt.get("name", "?"), pin,
                 "OK" if photo_b64 else "NONE (backend will use DB photo)",
                 len(photo_b64) if photo_b64 else 0,
@@ -494,7 +539,7 @@ def run_poller():
                     new_events.append(evt)
 
             if new_events:
-                _attach_photos(new_events)
+                _attach_photos(driver, new_events)
                 logger.info("Sending %d new event(s) to cloud...", len(new_events))
                 result = _send_to_cloud(new_events)
                 if result:
