@@ -256,87 +256,208 @@ def _click_query(driver):
     return False
 
 
-def _fetch_snapshot(driver, pin: str, row_cell) -> str:
-    """Fetch the live snapshot from the TrueFace device for one event.
+_photo_debug_done = False
 
-    Clicks the download icon in the row, intercepts the snapshot URL
-    (e.g. /RPC2_Loadfile/mnt/appdata1/userpic/SnapShot/.../{PIN}_XX_100_{ts}.jpg),
-    and fetches the image — all in a single async JS call (~1 second).
+
+def _extract_snapshot_urls(driver) -> dict[str, str]:
+    """Extract snapshot URLs from the Vue component data on all table rows.
+
+    The TrueFace UI is a Vue.js app. Each table row's data includes a
+    snapshot path like:
+      /mnt/appdata1/userpic/SnapShot/2026-05-23/07/54/1660_99_100_20260523075434823.jpg
+
+    We read this from Vue's internal data, then construct the full download URL.
+    Returns a dict mapping "PIN-timestamp" keys to snapshot URLs.
+    """
+    try:
+        url_map = driver.execute_script("""
+            var result = {};
+            // Try to get the Vue component that holds the table data
+            var table = document.querySelector('.el-table');
+            if (!table) return result;
+
+            // Method 1: Access Vue component's data via __vue__
+            var vue = table.__vue__;
+            if (vue) {
+                // Walk up to find the component with the data array
+                var comp = vue;
+                for (var i = 0; i < 10; i++) {
+                    if (comp && comp.tableData) break;
+                    if (comp && comp.$parent) comp = comp.$parent;
+                    else break;
+                }
+                if (comp && comp.tableData) {
+                    var data = comp.tableData;
+                    for (var j = 0; j < data.length; j++) {
+                        var row = data[j];
+                        var pin = row.pin || row.PIN || row.userId || row.user_id || '';
+                        var ts = row.time || row.timestamp || row.accessTime || '';
+                        var pic = row.picturePath || row.picture || row.snapPath ||
+                                  row.snap || row.photo || row.pic || row.filePath || '';
+                        if (pin && pic) {
+                            result[pin + '-' + ts] = pic;
+                        }
+                    }
+                    return result;
+                }
+            }
+
+            // Method 2: Try to find data in Vue 3 style (__vueParentComponent)
+            var el = table.__vueParentComponent;
+            if (el && el.proxy) {
+                var proxy = el.proxy;
+                var d = proxy.tableData || proxy.data || proxy.list || [];
+                for (var k = 0; k < d.length; k++) {
+                    var r = d[k];
+                    var p = r.pin || r.PIN || r.userId || r.user_id || '';
+                    var t = r.time || r.timestamp || r.accessTime || '';
+                    var pic2 = r.picturePath || r.picture || r.snapPath ||
+                               r.snap || r.photo || r.pic || r.filePath || '';
+                    if (p && pic2) {
+                        result[p + '-' + t] = pic2;
+                    }
+                }
+                return result;
+            }
+
+            // Method 3: Scan all Vue instances on the page
+            var allEls = document.querySelectorAll('*');
+            for (var m = 0; m < allEls.length; m++) {
+                var v = allEls[m].__vue__;
+                if (!v) continue;
+                var candidates = [v.tableData, v.data, v.list, v.records];
+                for (var n = 0; n < candidates.length; n++) {
+                    var arr = candidates[n];
+                    if (!Array.isArray(arr) || arr.length === 0) continue;
+                    var sample = arr[0];
+                    if (!sample || typeof sample !== 'object') continue;
+                    // Check if this looks like access log data
+                    var keys = Object.keys(sample);
+                    var hasPin = keys.some(function(k) { return k.toLowerCase().indexOf('pin') > -1 || k.toLowerCase().indexOf('userid') > -1; });
+                    var hasPic = keys.some(function(k) { return k.toLowerCase().indexOf('pic') > -1 || k.toLowerCase().indexOf('snap') > -1 || k.toLowerCase().indexOf('photo') > -1 || k.toLowerCase().indexOf('path') > -1; });
+                    if (hasPin && hasPic) {
+                        for (var q = 0; q < arr.length; q++) {
+                            var item = arr[q];
+                            // Dump all keys for debug on first item
+                            if (q === 0) {
+                                result['__debug_keys__'] = Object.keys(item).join(',');
+                                result['__debug_sample__'] = JSON.stringify(item).substring(0, 500);
+                            }
+                            var itemPin = item.pin || item.PIN || item.userId || item.user_id || '';
+                            var itemTs = item.time || item.timestamp || item.accessTime || '';
+                            var itemPic = '';
+                            for (var r2 = 0; r2 < keys.length; r2++) {
+                                var kk = keys[r2].toLowerCase();
+                                if ((kk.indexOf('pic') > -1 || kk.indexOf('snap') > -1 || kk.indexOf('photo') > -1 || kk.indexOf('path') > -1 || kk.indexOf('file') > -1) && item[keys[r2]]) {
+                                    itemPic = item[keys[r2]];
+                                    break;
+                                }
+                            }
+                            if (itemPin && itemPic) {
+                                result[itemPin + '-' + itemTs] = itemPic;
+                            }
+                        }
+                        return result;
+                    }
+                }
+            }
+
+            // Method 4: Just dump the first Vue component's data keys for debugging
+            for (var z = 0; z < allEls.length; z++) {
+                var vv = allEls[z].__vue__;
+                if (!vv || !vv.$data) continue;
+                var dkeys = Object.keys(vv.$data);
+                if (dkeys.length > 0) {
+                    result['__debug_vue_data_keys__'] = dkeys.join(',');
+                    // Check each data key for arrays
+                    for (var zz = 0; zz < dkeys.length; zz++) {
+                        var val = vv.$data[dkeys[zz]];
+                        if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object') {
+                            result['__debug_array_' + dkeys[zz] + '_keys__'] = Object.keys(val[0]).join(',');
+                            result['__debug_array_' + dkeys[zz] + '_sample__'] = JSON.stringify(val[0]).substring(0, 500);
+                        }
+                    }
+                    break;
+                }
+            }
+
+            return result;
+        """)
+
+        if url_map:
+            # Log debug info on first call
+            debug_keys = {k: v for k, v in url_map.items() if k.startswith("__debug")}
+            if debug_keys:
+                for k, v in debug_keys.items():
+                    logger.info("Vue data %s: %s", k, v)
+
+            # Filter to actual snapshot URLs
+            return {k: v for k, v in url_map.items() if not k.startswith("__debug")}
+    except Exception as e:
+        logger.info("Vue data extraction failed: %s", e)
+
+    return {}
+
+
+def _fetch_snapshot_image(driver, snap_path: str) -> str:
+    """Fetch the snapshot image from the device given its path.
+
+    The path from Vue data might be relative like:
+      /mnt/appdata1/userpic/SnapShot/2026-05-23/07/54/1660_99_100_20260523075434823.jpg
+    We prepend the device URL and /RPC2_Loadfile prefix.
     """
     import base64
 
-    try:
-        photo_b64 = driver.execute_async_script("""
-            var cell = arguments[0];
-            var done = arguments[arguments.length - 1];
+    base = DEVICE_URL.rstrip("/")
 
-            var capturedUrl = '';
+    # Build candidate URLs
+    urls = []
+    if snap_path.startswith("http"):
+        urls.append(snap_path)
+    else:
+        # The device serves files via /RPC2_Loadfile prefix
+        if snap_path.startswith("/mnt/"):
+            urls.append(f"{base}/RPC2_Loadfile{snap_path}")
+        elif snap_path.startswith("RPC2_Loadfile"):
+            urls.append(f"{base}/{snap_path}")
+        else:
+            urls.append(f"{base}/RPC2_Loadfile/mnt/appdata1/userpic/{snap_path}")
+            urls.append(f"{base}/RPC2_Loadfile/{snap_path}")
+            urls.append(f"{base}/{snap_path}")
 
-            // Hook window.open
-            var _open = window.open;
-            window.open = function(u) { capturedUrl = u; return null; };
+    for url in urls:
+        try:
+            resp = httpx.get(url, timeout=3, verify=False)
+            if resp.status_code == 200 and len(resp.content) > 500:
+                return base64.b64encode(resp.content).decode()
+        except Exception:
+            continue
 
-            // Hook fetch
-            var _fetch = window.fetch;
-            window.fetch = function(u) {
-                if (typeof u === 'string' && (u.indexOf('SnapShot') > -1 || u.indexOf('RPC2') > -1))
-                    capturedUrl = u;
-                return _fetch.apply(window, arguments);
-            };
-
-            // Hook XHR.open
-            var _xhrOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(m, u) {
-                if (u && (u.indexOf('SnapShot') > -1 || u.indexOf('RPC2') > -1))
-                    capturedUrl = u;
-                return _xhrOpen.apply(this, arguments);
-            };
-
-            // Click the download icon
-            var icon = cell.querySelector('i.ui-pic, i.el-icon-download');
-            if (icon) icon.click();
-
-            setTimeout(function() {
-                // Restore hooks
-                window.open = _open;
-                window.fetch = _fetch;
-                XMLHttpRequest.prototype.open = _xhrOpen;
-
-                if (!capturedUrl) { done(''); return; }
-
-                // Fetch the snapshot image
+    # Fallback: fetch via Selenium's authenticated session
+    for url in urls:
+        try:
+            b64 = driver.execute_script("""
                 var xhr = new XMLHttpRequest();
-                xhr.open('GET', capturedUrl, true);
+                xhr.open('GET', arguments[0], false);
                 xhr.responseType = 'arraybuffer';
-                xhr.onload = function() {
-                    if (xhr.status === 200 && xhr.response.byteLength > 500) {
-                        var b = new Uint8Array(xhr.response), s = '';
-                        for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
-                        done(btoa(s));
-                    } else { done(''); }
-                };
-                xhr.onerror = function() { done(''); };
                 xhr.send();
-            }, 600);
-        """, row_cell)
-
-        if photo_b64 and len(photo_b64) > 100:
-            return photo_b64
-    except Exception as e:
-        logger.debug("Snapshot fetch failed for PIN=%s: %s", pin, e)
+                if (xhr.status === 200 && xhr.response.byteLength > 500) {
+                    var b = new Uint8Array(xhr.response), s = '';
+                    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+                    return btoa(s);
+                }
+                return '';
+            """, url)
+            if b64 and len(b64) > 100:
+                return b64
+        except Exception:
+            continue
 
     return ""
 
 
-_photo_debug_done = False
-
-
 def _extract_events(driver) -> list[dict]:
-    """Extract face recognition events from the records table.
-
-    Keeps a reference to each row's last cell (download icon) so we can
-    click it later to fetch the live snapshot — only for NEW events.
-    """
+    """Extract face recognition events from the records table."""
     from selenium.webdriver.common.by import By
 
     events = []
@@ -362,37 +483,67 @@ def _extract_events(driver) -> list[dict]:
             "pin": uid,
             "name": name,
             "timestamp": timestamp,
-            "_dl_cell": cells[-1],  # last cell with download icon
         })
 
     return events
 
 
 def _attach_photos(driver, new_events: list[dict]) -> None:
-    """Fetch live snapshots from the TrueFace device for new events only.
+    """Fetch live snapshots from the TrueFace device for new events.
 
-    Clicks the download icon in each row to intercept the snapshot URL,
-    fetches the image (~1s per teacher). Only runs for newly detected events.
+    Reads the snapshot URL from the Vue.js component data (instant),
+    then fetches the image via HTTP (~0.3s per teacher).
     Backend falls back to database photos if no snapshot is found.
     """
     global _photo_debug_done
 
+    # Extract all snapshot URLs from Vue data in one JS call
+    snap_urls = _extract_snapshot_urls(driver)
+
+    if not _photo_debug_done and snap_urls:
+        logger.info("Vue snapshot URLs found: %d entries", len(snap_urls))
+        # Log first entry as sample
+        for k, v in snap_urls.items():
+            logger.info("  Sample: key=%s url=%s", k, str(v)[:120])
+            break
+
     for evt in new_events:
         pin = evt.get("pin", "")
-        dl_cell = evt.pop("_dl_cell", None)
-        if not pin or not dl_cell:
+        ts = evt.get("timestamp", "")
+        if not pin:
             continue
-        photo_b64 = _fetch_snapshot(driver, pin, dl_cell)
+
+        # Try to match by PIN-timestamp key
+        snap_path = snap_urls.get(f"{pin}-{ts}", "")
+
+        # Also try just PIN match if exact key not found
+        if not snap_path:
+            for k, v in snap_urls.items():
+                if k.startswith(f"{pin}-"):
+                    snap_path = v
+                    break
+
+        if snap_path:
+            photo_b64 = _fetch_snapshot_image(driver, snap_path)
+            if not _photo_debug_done:
+                _photo_debug_done = True
+                logger.info(
+                    "Live snapshot for %s (PIN=%s): %s (%d bytes) path=%s",
+                    evt.get("name", "?"), pin,
+                    "OK" if photo_b64 else "FETCH FAILED",
+                    len(photo_b64) if photo_b64 else 0,
+                    str(snap_path)[:100],
+                )
+            if photo_b64:
+                evt["photo"] = photo_b64
+                continue
+
         if not _photo_debug_done:
             _photo_debug_done = True
             logger.info(
-                "Live snapshot for %s (PIN=%s): %s (%d bytes)",
+                "Live snapshot for %s (PIN=%s): NO URL FOUND (backend will use DB photo)",
                 evt.get("name", "?"), pin,
-                "OK" if photo_b64 else "NONE (backend will use DB photo)",
-                len(photo_b64) if photo_b64 else 0,
             )
-        if photo_b64:
-            evt["photo"] = photo_b64
 
 
 # Events that failed to send — retry on next cycle
