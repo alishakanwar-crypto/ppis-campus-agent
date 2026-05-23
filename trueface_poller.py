@@ -406,41 +406,138 @@ def _deep_diag_vue(driver) -> dict:
 
 
 def _fetch_snapshot_image(driver, snap_url: str) -> str:
-    """Fetch a snapshot image given its full or partial URL."""
+    """Fetch a snapshot image given its full or partial URL.
+
+    Tries multiple methods: async fetch API, async XHR, canvas, and
+    direct httpx with digest auth. The path from Vue data is like:
+      SnapShot/2026-05-23/07/54/1660_99_100_20260523075434823.jpg
+    The device serves it at:
+      /RPC2_Loadfile/mnt/appdata1/userpic/SnapShot/...
+    """
     import base64
 
-    base = DEVICE_URL.rstrip("/")
-
-    urls = []
+    # Build the relative URL path (for same-origin fetch in browser)
     if snap_url.startswith("http"):
-        urls.append(snap_url)
+        rel_path = snap_url
     elif snap_url.startswith("/RPC2"):
-        urls.append(f"{base}{snap_url}")
+        rel_path = snap_url
     elif snap_url.startswith("/mnt/"):
-        urls.append(f"{base}/RPC2_Loadfile{snap_url}")
+        rel_path = f"/RPC2_Loadfile{snap_url}"
+    elif snap_url.startswith("SnapShot") or snap_url.startswith("mnt/"):
+        rel_path = f"/RPC2_Loadfile/mnt/appdata1/userpic/{snap_url}"
     else:
-        urls.append(f"{base}/RPC2_Loadfile/mnt/appdata1/userpic/{snap_url}")
-        urls.append(f"{base}/{snap_url}")
+        rel_path = f"/RPC2_Loadfile/{snap_url}"
 
-    # Try direct HTTP first (uses digest auth from device cookies)
-    for url in urls:
-        try:
-            b64 = driver.execute_script("""
-                var xhr = new XMLHttpRequest();
-                xhr.open('GET', arguments[0], false);
-                xhr.responseType = 'arraybuffer';
-                xhr.send();
-                if (xhr.status === 200 && xhr.response.byteLength > 500) {
-                    var b = new Uint8Array(xhr.response), s = '';
-                    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
-                    return btoa(s);
+    # Method 1: fetch() API with blob — handles auth cookies automatically
+    try:
+        b64 = driver.execute_async_script("""
+            var url = arguments[0];
+            var done = arguments[arguments.length - 1];
+            fetch(url, {credentials: 'include'})
+                .then(function(r) {
+                    if (!r.ok) { done('FETCH_ERR_' + r.status); return; }
+                    return r.blob();
+                })
+                .then(function(blob) {
+                    if (!blob || blob.size < 500) { done('BLOB_SMALL_' + (blob ? blob.size : 0)); return; }
+                    var reader = new FileReader();
+                    reader.onloadend = function() {
+                        var dataUrl = reader.result || '';
+                        var b64part = dataUrl.split(',')[1] || '';
+                        done(b64part);
+                    };
+                    reader.readAsDataURL(blob);
+                })
+                .catch(function(e) { done('FETCH_EXC_' + e.message); });
+        """, rel_path)
+        if b64 and len(b64) > 100 and not b64.startswith(("FETCH_", "BLOB_")):
+            logger.info("Snapshot fetched via fetch() API: %d bytes", len(b64))
+            return b64
+        logger.info("fetch() result: %s", str(b64)[:80] if b64 else "empty")
+    except Exception as e:
+        logger.info("fetch() failed: %s", e)
+
+    # Method 2: async XHR with arraybuffer (sync XHR can't use arraybuffer)
+    try:
+        b64 = driver.execute_async_script("""
+            var url = arguments[0];
+            var done = arguments[arguments.length - 1];
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', url, true);
+            xhr.responseType = 'arraybuffer';
+            xhr.withCredentials = true;
+            xhr.onload = function() {
+                if (xhr.status === 200 && xhr.response && xhr.response.byteLength > 500) {
+                    var bytes = new Uint8Array(xhr.response);
+                    var binary = '';
+                    var chunk = 8192;
+                    for (var i = 0; i < bytes.length; i += chunk) {
+                        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+                    }
+                    done(btoa(binary));
+                } else {
+                    done('XHR_ERR_' + xhr.status + '_' + (xhr.response ? xhr.response.byteLength : 0));
                 }
-                return '';
-            """, url)
-            if b64 and len(b64) > 100:
-                return b64
-        except Exception:
-            continue
+            };
+            xhr.onerror = function() { done('XHR_NETWORK_ERR'); };
+            xhr.send();
+        """, rel_path)
+        if b64 and len(b64) > 100 and not b64.startswith("XHR_"):
+            logger.info("Snapshot fetched via async XHR: %d bytes", len(b64))
+            return b64
+        logger.info("async XHR result: %s", str(b64)[:80] if b64 else "empty")
+    except Exception as e:
+        logger.info("async XHR failed: %s", e)
+
+    # Method 3: Create an <img>, draw to canvas, extract base64
+    try:
+        b64 = driver.execute_async_script("""
+            var url = arguments[0];
+            var done = arguments[arguments.length - 1];
+            var img = new Image();
+            img.crossOrigin = 'use-credentials';
+            img.onload = function() {
+                try {
+                    var c = document.createElement('canvas');
+                    c.width = img.naturalWidth;
+                    c.height = img.naturalHeight;
+                    c.getContext('2d').drawImage(img, 0, 0);
+                    var dataUrl = c.toDataURL('image/jpeg', 0.92);
+                    done(dataUrl.split(',')[1] || '');
+                } catch(e) { done('CANVAS_ERR_' + e.message); }
+            };
+            img.onerror = function() { done('IMG_LOAD_ERR'); };
+            img.src = url;
+        """, rel_path)
+        if b64 and len(b64) > 100 and not b64.startswith(("CANVAS_", "IMG_")):
+            logger.info("Snapshot fetched via canvas: %d bytes", len(b64))
+            return b64
+        logger.info("canvas result: %s", str(b64)[:80] if b64 else "empty")
+    except Exception as e:
+        logger.info("canvas failed: %s", e)
+
+    # Method 4: Direct httpx with digest auth
+    base = DEVICE_URL.rstrip("/")
+    full_url = f"{base}{rel_path}" if rel_path.startswith("/") else f"{base}/{rel_path}"
+    try:
+        auth = httpx.DigestAuth("admin", "tipl9910")
+        resp = httpx.get(full_url, timeout=5, verify=False, auth=auth)
+        if resp.status_code == 200 and len(resp.content) > 500:
+            logger.info("Snapshot fetched via httpx digest auth: %d bytes", len(resp.content))
+            return base64.b64encode(resp.content).decode()
+        logger.info("httpx result: status=%d size=%d", resp.status_code, len(resp.content))
+    except Exception as e:
+        logger.info("httpx failed: %s", e)
+
+    # Method 5: Direct httpx without auth (device might allow after login)
+    try:
+        resp = httpx.get(full_url, timeout=5, verify=False)
+        if resp.status_code == 200 and len(resp.content) > 500:
+            logger.info("Snapshot fetched via httpx no-auth: %d bytes", len(resp.content))
+            return base64.b64encode(resp.content).decode()
+        logger.info("httpx no-auth: status=%d size=%d", resp.status_code, len(resp.content))
+    except Exception as e:
+        logger.info("httpx no-auth failed: %s", e)
 
     return ""
 
