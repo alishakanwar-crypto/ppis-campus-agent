@@ -38,7 +38,7 @@ echo [%DATE% %TIME%] Pulling latest code...
 echo ============================================
 REM Force-sync to latest remote code (nuclear but reliable)
 git fetch origin 2>nul
-git reset --hard origin/devin/1777002178-cloud-config-fetch 2>nul
+git reset --hard origin/main 2>nul
 
 REM Clean up old snapshot files (older than 1 day) to prevent disk fill
 echo [%DATE% %TIME%] Cleaning old snapshots...
