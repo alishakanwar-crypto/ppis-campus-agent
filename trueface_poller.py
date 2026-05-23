@@ -451,6 +451,8 @@ def run_poller():
 
             # Click Query to refresh
             query_ok = _click_query(driver)
+            if poll_count <= 3:
+                logger.info("Poll #%d: Query click %s", poll_count, "OK" if query_ok else "FAILED")
             if not query_ok:
                 logger.warning("Query button not found — refreshing page")
                 _navigate_to_search_records(driver)
@@ -461,13 +463,24 @@ def run_poller():
             # Extract events
             events = _extract_events(driver)
 
-            # Log periodically even when no events found (every 100 polls)
-            if not events and poll_count % 100 == 0:
+            # Verbose logging for first 5 polls and every 100th poll
+            if poll_count <= 5 or (not events and poll_count % 100 == 0):
                 from selenium.webdriver.common.by import By as _By
                 rows = driver.find_elements(_By.CSS_SELECTOR, "table tr")
+                # Sample first row's cell count and text for debugging
+                sample = ""
+                if rows:
+                    cells = rows[0].find_elements(_By.TAG_NAME, "td")
+                    th_cells = rows[0].find_elements(_By.TAG_NAME, "th")
+                    sample = f", first_row: {len(cells)} td + {len(th_cells)} th"
+                    if len(rows) > 1:
+                        cells2 = rows[1].find_elements(_By.TAG_NAME, "td")
+                        if cells2:
+                            cell_texts = [c.text.strip()[:20] for c in cells2[:9]]
+                            sample += f", row2_cells({len(cells2)}): {cell_texts}"
                 logger.info(
-                    "Poll #%d: 0 events extracted, %d table rows on page, URL=%s",
-                    poll_count, len(rows), driver.current_url,
+                    "Poll #%d: %d events extracted, %d table rows, URL=%s%s",
+                    poll_count, len(events), len(rows), driver.current_url, sample,
                 )
 
             # Filter to only new events
