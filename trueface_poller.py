@@ -257,183 +257,172 @@ def _click_query(driver):
 
 
 _photo_debug_done = False
+_snapshot_diag_done = False
 
 
-def _extract_snapshot_urls(driver) -> dict[str, str]:
-    """Extract snapshot URLs from the Vue component data on all table rows.
+def _deep_diag_vue(driver) -> dict:
+    """One-time deep diagnostic: dump ALL Vue data arrays on the page.
 
-    The TrueFace UI is a Vue.js app. Each table row's data includes a
-    snapshot path like:
-      /mnt/appdata1/userpic/SnapShot/2026-05-23/07/54/1660_99_100_20260523075434823.jpg
-
-    We read this from Vue's internal data, then construct the full download URL.
-    Returns a dict mapping "PIN-timestamp" keys to snapshot URLs.
+    This runs once on first poll and logs everything it finds so we can
+    discover the exact field names the TrueFace device uses.
     """
     try:
-        url_map = driver.execute_script("""
-            var result = {};
-            // Try to get the Vue component that holds the table data
-            var table = document.querySelector('.el-table');
-            if (!table) return result;
+        return driver.execute_script("""
+            var out = {};
+            var count = 0;
 
-            // Method 1: Access Vue component's data via __vue__
-            var vue = table.__vue__;
-            if (vue) {
-                // Walk up to find the component with the data array
-                var comp = vue;
-                for (var i = 0; i < 10; i++) {
-                    if (comp && comp.tableData) break;
-                    if (comp && comp.$parent) comp = comp.$parent;
-                    else break;
-                }
-                if (comp && comp.tableData) {
-                    var data = comp.tableData;
-                    for (var j = 0; j < data.length; j++) {
-                        var row = data[j];
-                        var pin = row.pin || row.PIN || row.userId || row.user_id || '';
-                        var ts = row.time || row.timestamp || row.accessTime || '';
-                        var pic = row.picturePath || row.picture || row.snapPath ||
-                                  row.snap || row.photo || row.pic || row.filePath || '';
-                        if (pin && pic) {
-                            result[pin + '-' + ts] = pic;
+            // 1. Walk ALL elements looking for __vue__
+            var allEls = document.querySelectorAll('*');
+            var vueCount = 0;
+            for (var i = 0; i < allEls.length && count < 5; i++) {
+                var v = allEls[i].__vue__;
+                if (!v) continue;
+                vueCount++;
+
+                // Check $data
+                if (v.$data) {
+                    var dkeys = Object.keys(v.$data);
+                    for (var j = 0; j < dkeys.length; j++) {
+                        var val = v.$data[dkeys[j]];
+                        if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object') {
+                            out['__vue_array_' + count + '_name'] = dkeys[j];
+                            out['__vue_array_' + count + '_keys'] = Object.keys(val[0]).join(',');
+                            out['__vue_array_' + count + '_sample'] = JSON.stringify(val[0]).substring(0, 800);
+                            out['__vue_array_' + count + '_len'] = String(val.length);
+                            count++;
                         }
                     }
-                    return result;
                 }
-            }
 
-            // Method 2: Try to find data in Vue 3 style (__vueParentComponent)
-            var el = table.__vueParentComponent;
-            if (el && el.proxy) {
-                var proxy = el.proxy;
-                var d = proxy.tableData || proxy.data || proxy.list || [];
-                for (var k = 0; k < d.length; k++) {
-                    var r = d[k];
-                    var p = r.pin || r.PIN || r.userId || r.user_id || '';
-                    var t = r.time || r.timestamp || r.accessTime || '';
-                    var pic2 = r.picturePath || r.picture || r.snapPath ||
-                               r.snap || r.photo || r.pic || r.filePath || '';
-                    if (p && pic2) {
-                        result[p + '-' + t] = pic2;
-                    }
-                }
-                return result;
-            }
-
-            // Method 3: Scan all Vue instances on the page
-            var allEls = document.querySelectorAll('*');
-            for (var m = 0; m < allEls.length; m++) {
-                var v = allEls[m].__vue__;
-                if (!v) continue;
-                var candidates = [v.tableData, v.data, v.list, v.records];
-                for (var n = 0; n < candidates.length; n++) {
-                    var arr = candidates[n];
-                    if (!Array.isArray(arr) || arr.length === 0) continue;
-                    var sample = arr[0];
-                    if (!sample || typeof sample !== 'object') continue;
-                    // Check if this looks like access log data
-                    var keys = Object.keys(sample);
-                    var hasPin = keys.some(function(k) { return k.toLowerCase().indexOf('pin') > -1 || k.toLowerCase().indexOf('userid') > -1; });
-                    var hasPic = keys.some(function(k) { return k.toLowerCase().indexOf('pic') > -1 || k.toLowerCase().indexOf('snap') > -1 || k.toLowerCase().indexOf('photo') > -1 || k.toLowerCase().indexOf('path') > -1; });
-                    if (hasPin && hasPic) {
-                        for (var q = 0; q < arr.length; q++) {
-                            var item = arr[q];
-                            // Dump all keys for debug on first item
-                            if (q === 0) {
-                                result['__debug_keys__'] = Object.keys(item).join(',');
-                                result['__debug_sample__'] = JSON.stringify(item).substring(0, 500);
-                            }
-                            var itemPin = item.pin || item.PIN || item.userId || item.user_id || '';
-                            var itemTs = item.time || item.timestamp || item.accessTime || '';
-                            var itemPic = '';
-                            for (var r2 = 0; r2 < keys.length; r2++) {
-                                var kk = keys[r2].toLowerCase();
-                                if ((kk.indexOf('pic') > -1 || kk.indexOf('snap') > -1 || kk.indexOf('photo') > -1 || kk.indexOf('path') > -1 || kk.indexOf('file') > -1) && item[keys[r2]]) {
-                                    itemPic = item[keys[r2]];
-                                    break;
+                // Check direct properties (store, $store, etc.)
+                var props = ['store', '$store', 'tableData', 'data', 'list', 'records', 'logData', 'accessData'];
+                for (var p = 0; p < props.length; p++) {
+                    var pval = v[props[p]];
+                    if (pval && typeof pval === 'object') {
+                        // If it's a store, check state
+                        if (pval.state) {
+                            var skeys = Object.keys(pval.state);
+                            out['__vuex_state_keys'] = skeys.join(',');
+                            for (var s = 0; s < skeys.length; s++) {
+                                var sv = pval.state[skeys[s]];
+                                if (Array.isArray(sv) && sv.length > 0 && typeof sv[0] === 'object') {
+                                    out['__vuex_array_' + skeys[s] + '_keys'] = Object.keys(sv[0]).join(',');
+                                    out['__vuex_array_' + skeys[s] + '_sample'] = JSON.stringify(sv[0]).substring(0, 800);
                                 }
                             }
-                            if (itemPin && itemPic) {
-                                result[itemPin + '-' + itemTs] = itemPic;
+                        }
+                        if (Array.isArray(pval) && pval.length > 0 && typeof pval[0] === 'object') {
+                            out['__vue_prop_' + props[p] + '_keys'] = Object.keys(pval[0]).join(',');
+                            out['__vue_prop_' + props[p] + '_sample'] = JSON.stringify(pval[0]).substring(0, 800);
+                        }
+                    }
+                }
+            }
+            out['__vue_instances_found'] = String(vueCount);
+
+            // 2. Check the download icon's click handler
+            var dlIcon = document.querySelector('i.el-icon-download, i.ui-pic');
+            if (dlIcon) {
+                // Try to get the Vue component for this icon's row
+                var el = dlIcon.closest('tr') || dlIcon.closest('.el-table__row') || dlIcon.parentElement;
+                if (el && el.__vue__) {
+                    out['__dl_row_vue_keys'] = Object.keys(el.__vue__.$data || {}).join(',');
+                    out['__dl_row_vue_props'] = Object.keys(el.__vue__.$props || {}).join(',');
+                }
+                // Walk up to find row data
+                var walker = dlIcon;
+                for (var w = 0; w < 10; w++) {
+                    if (!walker) break;
+                    if (walker.__vue__ && walker.__vue__.row) {
+                        out['__dl_row_data_keys'] = Object.keys(walker.__vue__.row).join(',');
+                        out['__dl_row_data_sample'] = JSON.stringify(walker.__vue__.row).substring(0, 800);
+                        break;
+                    }
+                    walker = walker.parentElement;
+                }
+
+                // Get the onclick handler source
+                var handlers = [];
+                var evts = dlIcon._events || {};
+                for (var ek in evts) handlers.push(ek);
+                out['__dl_icon_events'] = handlers.join(',') || 'none';
+
+                // Check if there's a @click Vue binding
+                if (dlIcon.__vue__) {
+                    out['__dl_icon_vue'] = JSON.stringify(Object.keys(dlIcon.__vue__)).substring(0, 300);
+                }
+            }
+
+            // 3. Check el-table's store for data
+            var table = document.querySelector('.el-table');
+            if (table && table.__vue__) {
+                var tv = table.__vue__;
+                // el-table internally has store.states.data
+                if (tv.store && tv.store.states) {
+                    var states = tv.store.states;
+                    var stateKeys = Object.keys(states);
+                    out['__eltable_state_keys'] = stateKeys.join(',');
+                    if (states.data && Array.isArray(states.data) && states.data.length > 0) {
+                        out['__eltable_data_keys'] = Object.keys(states.data[0]).join(',');
+                        out['__eltable_data_sample'] = JSON.stringify(states.data[0]).substring(0, 800);
+                        out['__eltable_data_len'] = String(states.data.length);
+                    }
+                    // Try _data (Vue 2 reactive)
+                    if (states._data && states._data.data && Array.isArray(states._data.data)) {
+                        var dd = states._data.data;
+                        if (dd.length > 0 && typeof dd[0] === 'object') {
+                            out['__eltable_rdata_keys'] = Object.keys(dd[0]).join(',');
+                            out['__eltable_rdata_sample'] = JSON.stringify(dd[0]).substring(0, 800);
+                        }
+                    }
+                }
+                // Also check $props.data
+                if (tv.$props && tv.$props.data && Array.isArray(tv.$props.data) && tv.$props.data.length > 0) {
+                    out['__eltable_props_data_keys'] = Object.keys(tv.$props.data[0]).join(',');
+                    out['__eltable_props_data_sample'] = JSON.stringify(tv.$props.data[0]).substring(0, 800);
+                }
+                // Walk parents
+                var parent = tv.$parent;
+                for (var pp = 0; pp < 5 && parent; pp++) {
+                    if (parent.$data) {
+                        var pdkeys = Object.keys(parent.$data);
+                        for (var pd = 0; pd < pdkeys.length; pd++) {
+                            var pdv = parent.$data[pdkeys[pd]];
+                            if (Array.isArray(pdv) && pdv.length > 0 && typeof pdv[0] === 'object') {
+                                out['__parent' + pp + '_' + pdkeys[pd] + '_keys'] = Object.keys(pdv[0]).join(',');
+                                out['__parent' + pp + '_' + pdkeys[pd] + '_sample'] = JSON.stringify(pdv[0]).substring(0, 800);
+                                out['__parent' + pp + '_' + pdkeys[pd] + '_len'] = String(pdv.length);
                             }
                         }
-                        return result;
                     }
+                    parent = parent.$parent;
                 }
             }
 
-            // Method 4: Just dump the first Vue component's data keys for debugging
-            for (var z = 0; z < allEls.length; z++) {
-                var vv = allEls[z].__vue__;
-                if (!vv || !vv.$data) continue;
-                var dkeys = Object.keys(vv.$data);
-                if (dkeys.length > 0) {
-                    result['__debug_vue_data_keys__'] = dkeys.join(',');
-                    // Check each data key for arrays
-                    for (var zz = 0; zz < dkeys.length; zz++) {
-                        var val = vv.$data[dkeys[zz]];
-                        if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object') {
-                            result['__debug_array_' + dkeys[zz] + '_keys__'] = Object.keys(val[0]).join(',');
-                            result['__debug_array_' + dkeys[zz] + '_sample__'] = JSON.stringify(val[0]).substring(0, 500);
-                        }
-                    }
-                    break;
-                }
-            }
-
-            return result;
+            return out;
         """)
-
-        if url_map:
-            # Log debug info on first call
-            debug_keys = {k: v for k, v in url_map.items() if k.startswith("__debug")}
-            if debug_keys:
-                for k, v in debug_keys.items():
-                    logger.info("Vue data %s: %s", k, v)
-
-            # Filter to actual snapshot URLs
-            return {k: v for k, v in url_map.items() if not k.startswith("__debug")}
     except Exception as e:
-        logger.info("Vue data extraction failed: %s", e)
-
-    return {}
+        return {"__error": str(e)}
 
 
-def _fetch_snapshot_image(driver, snap_path: str) -> str:
-    """Fetch the snapshot image from the device given its path.
-
-    The path from Vue data might be relative like:
-      /mnt/appdata1/userpic/SnapShot/2026-05-23/07/54/1660_99_100_20260523075434823.jpg
-    We prepend the device URL and /RPC2_Loadfile prefix.
-    """
+def _fetch_snapshot_image(driver, snap_url: str) -> str:
+    """Fetch a snapshot image given its full or partial URL."""
     import base64
 
     base = DEVICE_URL.rstrip("/")
 
-    # Build candidate URLs
     urls = []
-    if snap_path.startswith("http"):
-        urls.append(snap_path)
+    if snap_url.startswith("http"):
+        urls.append(snap_url)
+    elif snap_url.startswith("/RPC2"):
+        urls.append(f"{base}{snap_url}")
+    elif snap_url.startswith("/mnt/"):
+        urls.append(f"{base}/RPC2_Loadfile{snap_url}")
     else:
-        # The device serves files via /RPC2_Loadfile prefix
-        if snap_path.startswith("/mnt/"):
-            urls.append(f"{base}/RPC2_Loadfile{snap_path}")
-        elif snap_path.startswith("RPC2_Loadfile"):
-            urls.append(f"{base}/{snap_path}")
-        else:
-            urls.append(f"{base}/RPC2_Loadfile/mnt/appdata1/userpic/{snap_path}")
-            urls.append(f"{base}/RPC2_Loadfile/{snap_path}")
-            urls.append(f"{base}/{snap_path}")
+        urls.append(f"{base}/RPC2_Loadfile/mnt/appdata1/userpic/{snap_url}")
+        urls.append(f"{base}/{snap_url}")
 
-    for url in urls:
-        try:
-            resp = httpx.get(url, timeout=3, verify=False)
-            if resp.status_code == 200 and len(resp.content) > 500:
-                return base64.b64encode(resp.content).decode()
-        except Exception:
-            continue
-
-    # Fallback: fetch via Selenium's authenticated session
+    # Try direct HTTP first (uses digest auth from device cookies)
     for url in urls:
         try:
             b64 = driver.execute_script("""
@@ -491,21 +480,22 @@ def _extract_events(driver) -> list[dict]:
 def _attach_photos(driver, new_events: list[dict]) -> None:
     """Fetch live snapshots from the TrueFace device for new events.
 
-    Reads the snapshot URL from the Vue.js component data (instant),
-    then fetches the image via HTTP (~0.3s per teacher).
+    Phase 1 (this PR): Deep diagnostic — discovers the Vue data structure.
+    Phase 2: Once field names are known, fetches actual snapshot images.
     Backend falls back to database photos if no snapshot is found.
     """
-    global _photo_debug_done
+    global _photo_debug_done, _snapshot_diag_done
 
-    # Extract all snapshot URLs from Vue data in one JS call
-    snap_urls = _extract_snapshot_urls(driver)
+    # Run deep diagnostic ONCE to discover data structure
+    if not _snapshot_diag_done:
+        _snapshot_diag_done = True
+        diag = _deep_diag_vue(driver)
+        if diag:
+            for k in sorted(diag.keys()):
+                logger.info("DIAG %s: %s", k, str(diag[k])[:200])
 
-    if not _photo_debug_done and snap_urls:
-        logger.info("Vue snapshot URLs found: %d entries", len(snap_urls))
-        # Log first entry as sample
-        for k, v in snap_urls.items():
-            logger.info("  Sample: key=%s url=%s", k, str(v)[:120])
-            break
+    # Try to extract snapshot URLs from discovered data
+    snap_map = _try_extract_snapshots(driver)
 
     for evt in new_events:
         pin = evt.get("pin", "")
@@ -513,12 +503,9 @@ def _attach_photos(driver, new_events: list[dict]) -> None:
         if not pin:
             continue
 
-        # Try to match by PIN-timestamp key
-        snap_path = snap_urls.get(f"{pin}-{ts}", "")
-
-        # Also try just PIN match if exact key not found
+        snap_path = snap_map.get(f"{pin}-{ts}", "")
         if not snap_path:
-            for k, v in snap_urls.items():
+            for k, v in snap_map.items():
                 if k.startswith(f"{pin}-"):
                     snap_path = v
                     break
@@ -532,7 +519,7 @@ def _attach_photos(driver, new_events: list[dict]) -> None:
                     evt.get("name", "?"), pin,
                     "OK" if photo_b64 else "FETCH FAILED",
                     len(photo_b64) if photo_b64 else 0,
-                    str(snap_path)[:100],
+                    str(snap_path)[:120],
                 )
             if photo_b64:
                 evt["photo"] = photo_b64
@@ -541,9 +528,82 @@ def _attach_photos(driver, new_events: list[dict]) -> None:
         if not _photo_debug_done:
             _photo_debug_done = True
             logger.info(
-                "Live snapshot for %s (PIN=%s): NO URL FOUND (backend will use DB photo)",
+                "Live snapshot for %s (PIN=%s): NO URL IN VUE DATA (backend will use DB photo)",
                 evt.get("name", "?"), pin,
             )
+
+
+def _try_extract_snapshots(driver) -> dict[str, str]:
+    """Try to read snapshot URLs from el-table internal store or parent data."""
+    try:
+        return driver.execute_script("""
+            var result = {};
+            var table = document.querySelector('.el-table');
+            if (!table || !table.__vue__) return result;
+
+            var tv = table.__vue__;
+
+            // Strategy 1: el-table store.states.data
+            var data = null;
+            if (tv.store && tv.store.states && tv.store.states.data)
+                data = tv.store.states.data;
+            if (!data && tv.$props && tv.$props.data)
+                data = tv.$props.data;
+
+            // Strategy 2: Walk parents
+            if (!data) {
+                var p = tv.$parent;
+                for (var i = 0; i < 5 && p; i++) {
+                    if (p.$data) {
+                        var keys = Object.keys(p.$data);
+                        for (var j = 0; j < keys.length; j++) {
+                            var v = p.$data[keys[j]];
+                            if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') {
+                                data = v;
+                                break;
+                            }
+                        }
+                    }
+                    if (data) break;
+                    p = p.$parent;
+                }
+            }
+
+            if (!data || !Array.isArray(data)) return result;
+
+            for (var r = 0; r < data.length; r++) {
+                var row = data[r];
+                var keys2 = Object.keys(row);
+                // Find any value containing 'SnapShot' or 'userpic' or '.jpg'
+                var pin = '';
+                var ts = '';
+                var pic = '';
+                for (var k = 0; k < keys2.length; k++) {
+                    var val = row[keys2[k]];
+                    if (typeof val !== 'string') continue;
+                    var vl = val.toLowerCase();
+                    if (vl.indexOf('snapshot') > -1 || vl.indexOf('userpic') > -1 || vl.indexOf('.jpg') > -1 || vl.indexOf('.png') > -1) {
+                        pic = val;
+                    }
+                }
+                // Find PIN-like field
+                for (var k2 = 0; k2 < keys2.length; k2++) {
+                    var kl = keys2[k2].toLowerCase();
+                    if (kl === 'pin' || kl === 'userid' || kl === 'user_id' || kl === 'employeeid') {
+                        pin = String(row[keys2[k2]]);
+                    }
+                    if (kl === 'time' || kl === 'timestamp' || kl === 'accesstime' || kl === 'checktime') {
+                        ts = String(row[keys2[k2]]);
+                    }
+                }
+                if (pin && pic) {
+                    result[pin + '-' + ts] = pic;
+                }
+            }
+            return result;
+        """) or {}
+    except Exception:
+        return {}
 
 
 # Events that failed to send — retry on next cycle
