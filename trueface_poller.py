@@ -260,132 +260,180 @@ _photo_debug_done = False
 
 
 def _capture_row_photo(driver, row, debug: bool = False) -> str:
-    """Try to capture a face photo from a table row.
+    """Capture a face photo from a TrueFace table row.
 
-    Looks for <img> elements in the row, converts to base64 via canvas.
-    Also checks for background-image CSS on cells.
-    Returns base64-encoded JPEG string or empty string if no image found.
+    The TrueFace UI stores photos behind an el-popover trigger in the
+    second-to-last cell. We click to open the popover, capture the image,
+    then close it. Also tries the download icon (last cell) as fallback.
     """
     from selenium.webdriver.common.by import By
 
     try:
-        # Method 1: <img> tags in the row
-        imgs = row.find_elements(By.TAG_NAME, "img")
-        if debug:
-            logger.info("  Photo debug: %d <img> tags in row", len(imgs))
-        for img in imgs:
-            src = img.get_attribute("src") or ""
-            nat_w = img.get_attribute("naturalWidth") or "0"
-            nat_h = img.get_attribute("naturalHeight") or "0"
-            if debug:
-                logger.info("  Photo debug: img src=%s (nat=%sx%s)", src[:80], nat_w, nat_h)
-
-            try:
-                if int(nat_w) < 20:
-                    continue
-            except (ValueError, TypeError):
-                pass
-
-            if src.startswith("data:image"):
-                if "," in src:
-                    return src.split(",", 1)[1]
-                continue
-
-            # Convert via canvas — use crossOrigin workaround
-            b64 = driver.execute_script("""
-                var img = arguments[0];
-                if (!img.complete || img.naturalWidth === 0) return '';
-                var c = document.createElement('canvas');
-                c.width = img.naturalWidth;
-                c.height = img.naturalHeight;
-                c.getContext('2d').drawImage(img, 0, 0);
-                try { return c.toDataURL('image/jpeg', 0.85).split(',')[1]; }
-                catch(e) { return 'CANVAS_ERROR:' + e.message; }
-            """, img)
-            if debug and b64:
-                logger.info("  Photo debug: canvas result=%s", b64[:60] if b64 else "empty")
-            if b64 and not b64.startswith("CANVAS_ERROR"):
-                return b64
-            elif b64 and b64.startswith("CANVAS_ERROR"):
-                # Canvas tainted — try fetching the image directly via JS fetch
-                if src.startswith("http"):
-                    fetch_b64 = driver.execute_script("""
-                        var url = arguments[0];
-                        var xhr = new XMLHttpRequest();
-                        xhr.open('GET', url, false);
-                        xhr.responseType = 'arraybuffer';
-                        try {
-                            xhr.send();
-                            if (xhr.status === 200) {
-                                var bytes = new Uint8Array(xhr.response);
-                                var binary = '';
-                                for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-                                return btoa(binary);
-                            }
-                        } catch(e) {}
-                        return '';
-                    """, src)
-                    if fetch_b64:
-                        return fetch_b64
-
-        # Method 2: Check cells for background-image CSS
         cells = row.find_elements(By.TAG_NAME, "td")
-        for i, cell in enumerate(cells):
-            bg = driver.execute_script(
-                "return window.getComputedStyle(arguments[0]).backgroundImage;", cell
-            ) or ""
-            if bg and bg != "none" and "url(" in bg:
+        if len(cells) < 2:
+            return ""
+
+        # Method 1: Click the popover trigger (2nd-to-last cell) to reveal photo
+        popover_cell = cells[-2] if len(cells) >= 2 else None
+        if popover_cell:
+            try:
+                # Find the clickable element inside the popover cell
+                triggers = popover_cell.find_elements(By.CSS_SELECTOR, "i, span, div.cell")
+                target = triggers[0] if triggers else popover_cell
+                target.click()
+                time.sleep(0.5)
+
+                # Look for visible popovers on the page with images
+                popovers = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    ".el-popover[aria-hidden='false'] img, "
+                    ".el-popover:not([style*='display: none']) img"
+                )
                 if debug:
-                    logger.info("  Photo debug: cell[%d] has background-image: %s", i, bg[:80])
-                url = bg.split('url("')[1].split('")')[0] if 'url("' in bg else ""
-                if url:
+                    logger.info("  Photo: popover click → %d visible popover imgs", len(popovers))
+
+                for img in popovers:
+                    b64 = driver.execute_script("""
+                        var img = arguments[0];
+                        if (!img.complete || img.naturalWidth === 0) return '';
+                        var c = document.createElement('canvas');
+                        c.width = img.naturalWidth;
+                        c.height = img.naturalHeight;
+                        c.getContext('2d').drawImage(img, 0, 0);
+                        try { return c.toDataURL('image/jpeg', 0.85).split(',')[1]; }
+                        catch(e) { return ''; }
+                    """, img)
+                    if b64:
+                        # Close popover by clicking elsewhere
+                        driver.execute_script("document.body.click();")
+                        time.sleep(0.2)
+                        return b64
+
+                # Also check for any new <img> tags that appeared on the page
+                all_imgs = driver.find_elements(By.CSS_SELECTOR, ".el-popover img")
+                for img in all_imgs:
+                    src = img.get_attribute("src") or ""
+                    if debug:
+                        logger.info("  Photo: popover img src=%s", src[:100])
+                    if src.startswith("data:image") and "," in src:
+                        driver.execute_script("document.body.click();")
+                        time.sleep(0.2)
+                        return src.split(",", 1)[1]
+                    elif src and not src.startswith("data:"):
+                        # Fetch via XHR
+                        fetch_b64 = driver.execute_script("""
+                            var xhr = new XMLHttpRequest();
+                            xhr.open('GET', arguments[0], false);
+                            xhr.responseType = 'arraybuffer';
+                            try {
+                                xhr.send();
+                                if (xhr.status === 200) {
+                                    var bytes = new Uint8Array(xhr.response);
+                                    var bin = '';
+                                    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                                    return btoa(bin);
+                                }
+                            } catch(e) {}
+                            return '';
+                        """, src)
+                        if fetch_b64:
+                            driver.execute_script("document.body.click();")
+                            time.sleep(0.2)
+                            return fetch_b64
+
+                # Close popover
+                driver.execute_script("document.body.click();")
+                time.sleep(0.2)
+            except Exception as e:
+                if debug:
+                    logger.info("  Photo: popover method failed: %s", e)
+                driver.execute_script("document.body.click();")
+
+        # Method 2: Use the download icon (last cell) — fetch the download URL via XHR
+        last_cell = cells[-1]
+        download_icon = last_cell.find_elements(By.CSS_SELECTOR, "i.ui-pic, i.el-icon-download")
+        if download_icon:
+            try:
+                # Intercept the download by checking the href or triggering the API call
+                download_url = driver.execute_script("""
+                    var icon = arguments[0];
+                    var link = icon.closest('a') || icon.parentElement.closest('a');
+                    if (link) return link.href || link.getAttribute('href') || '';
+                    // Check onclick handler
+                    var onclick = icon.getAttribute('onclick') || '';
+                    if (onclick) return onclick;
+                    return '';
+                """, download_icon[0])
+                if debug:
+                    logger.info("  Photo: download icon url=%s", download_url[:100] if download_url else "none")
+                if download_url and download_url.startswith("http"):
                     fetch_b64 = driver.execute_script("""
-                        var url = arguments[0];
                         var xhr = new XMLHttpRequest();
-                        xhr.open('GET', url, false);
+                        xhr.open('GET', arguments[0], false);
                         xhr.responseType = 'arraybuffer';
                         try {
                             xhr.send();
                             if (xhr.status === 200) {
                                 var bytes = new Uint8Array(xhr.response);
-                                var binary = '';
-                                for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-                                return btoa(binary);
+                                var bin = '';
+                                for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                                return btoa(bin);
                             }
                         } catch(e) {}
                         return '';
-                    """, url)
+                    """, download_url)
                     if fetch_b64:
                         return fetch_b64
+            except Exception as e:
+                if debug:
+                    logger.info("  Photo: download method failed: %s", e)
 
-        # Method 3: Check for any element with src attribute (e.g., <object>, <embed>)
-        src_elems = row.find_elements(By.CSS_SELECTOR, "[src]")
-        for elem in src_elems:
-            tag = elem.tag_name.lower()
-            if tag == "img":
-                continue  # Already handled
-            src = elem.get_attribute("src") or ""
+        # Method 3: Try to find the photo API URL from the page's Vue/Axios instance
+        pin = cells[1].text.strip() if len(cells) > 1 else ""
+        if pin:
+            photo_b64 = driver.execute_script("""
+                var pin = arguments[0];
+                var baseUrl = window.location.origin;
+                var urls = [
+                    baseUrl + '/csl/user?action=GetPhoto&PIN=' + pin,
+                    baseUrl + '/api/user/photo/' + pin,
+                    baseUrl + '/user/photo?pin=' + pin
+                ];
+                for (var j = 0; j < urls.length; j++) {
+                    try {
+                        var xhr = new XMLHttpRequest();
+                        xhr.open('GET', urls[j], false);
+                        xhr.responseType = 'arraybuffer';
+                        xhr.send();
+                        if (xhr.status === 200 && xhr.response.byteLength > 100) {
+                            var bytes = new Uint8Array(xhr.response);
+                            var bin = '';
+                            for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+                            return btoa(bin);
+                        }
+                    } catch(e) {}
+                }
+                return '';
+            """, pin)
             if debug:
-                logger.info("  Photo debug: <%s> with src=%s", tag, src[:80])
-
-        if debug and not imgs:
-            # Log raw HTML of the last cell to understand structure
-            last_html = driver.execute_script(
-                "return arguments[0].innerHTML;", cells[-1]
-            ) if cells else ""
-            second_last_html = driver.execute_script(
-                "return arguments[0].innerHTML;", cells[-2]
-            ) if len(cells) > 1 else ""
-            logger.info("  Photo debug: last cell HTML=%s", last_html[:200])
-            logger.info("  Photo debug: 2nd-last cell HTML=%s", second_last_html[:200])
+                logger.info("  Photo: API fetch for PIN=%s → %s (%d bytes)",
+                            pin, "OK" if photo_b64 else "NONE",
+                            len(photo_b64) if photo_b64 else 0)
+            if photo_b64:
+                return photo_b64
 
     except Exception as e:
-        logger.debug("Photo capture failed for row: %s", e)
+        if debug:
+            logger.info("  Photo: capture failed: %s", e)
     return ""
 
 
 def _extract_events(driver) -> list[dict]:
-    """Extract face recognition events from the records table."""
+    """Extract face recognition events from the records table.
+
+    Returns list of dicts with pin, name, timestamp, and the Selenium row
+    element (for deferred photo capture on new events only).
+    """
     from selenium.webdriver.common.by import By
 
     events = []
@@ -407,27 +455,35 @@ def _extract_events(driver) -> list[dict]:
         if method not in ("Face", "Fingerprint"):
             continue
 
-        evt = {
+        events.append({
             "pin": uid,
             "name": name,
             "timestamp": timestamp,
-        }
+            "_row": row,  # kept for photo capture; removed before sending
+        })
 
-        # Try to capture the face photo from this row
-        global _photo_debug_done
+    return events
+
+
+def _capture_photos_for_new(driver, events: list[dict]) -> None:
+    """Capture face photos only for new (unseen) events to avoid slow popover
+    clicking on every poll cycle."""
+    global _photo_debug_done
+
+    for evt in events:
+        row = evt.pop("_row", None)
+        if not row:
+            continue
         do_debug = not _photo_debug_done
         photo_b64 = _capture_row_photo(driver, row, debug=do_debug)
         if do_debug:
             _photo_debug_done = True
             logger.info("Photo capture for %s: %s (%d bytes)",
-                        name, "OK" if photo_b64 else "NONE",
+                        evt.get("name", "?"),
+                        "OK" if photo_b64 else "NONE",
                         len(photo_b64) if photo_b64 else 0)
         if photo_b64:
             evt["photo"] = photo_b64
-
-        events.append(evt)
-
-    return events
 
 
 # Events that failed to send — retry on next cycle
@@ -572,8 +628,12 @@ def run_poller():
                 if key not in seen_keys:
                     seen_keys.add(key)
                     new_events.append(evt)
+                else:
+                    evt.pop("_row", None)  # Clean up row ref for seen events
 
             if new_events:
+                # Capture photos only for new events (avoids clicking popovers every cycle)
+                _capture_photos_for_new(driver, new_events)
                 logger.info("Sending %d new event(s) to cloud...", len(new_events))
                 result = _send_to_cloud(new_events)
                 if result:
