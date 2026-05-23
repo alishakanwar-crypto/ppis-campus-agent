@@ -127,36 +127,39 @@ def _login(driver):
 
     logger.info("Logging in to %s ...", DEVICE_URL)
     driver.get(DEVICE_URL)
-    time.sleep(3)
+    time.sleep(5)  # Allow page to fully render before interacting
 
     try:
-        # Find username and password fields
-        user_input = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text'], input[name='username'], input[placeholder*='user' i]"))
+        # Wait for username field to be clickable (not just present)
+        user_input = WebDriverWait(driver, 15).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='text'], input[name='username'], input[placeholder*='user' i]"))
         )
-        pass_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
-        if not pass_inputs:
-            logger.error("Could not find password field")
-            return False
+        # Wait for password field to be clickable
+        pass_input = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='password']"))
+        )
 
         user_input.clear()
         user_input.send_keys(DEVICE_USER)
-        pass_inputs[0].clear()
-        pass_inputs[0].send_keys(DEVICE_PASS)
+        pass_input.clear()
+        pass_input.send_keys(DEVICE_PASS)
+        time.sleep(1)  # Brief pause after typing credentials
 
-        # Click login button
+        # Click login button — wait for it to be clickable
         login_btns = driver.find_elements(By.CSS_SELECTOR, "button[type='submit'], button.login-btn, .login-btn, button")
         for btn in login_btns:
             text = btn.text.strip().lower()
             if text in ("login", "log in", "sign in", "ok", "submit", "\u767b\u5f55"):
+                WebDriverWait(driver, 5).until(EC.element_to_be_clickable(btn))
                 btn.click()
                 break
         else:
             # Click the first button
             if login_btns:
+                WebDriverWait(driver, 5).until(EC.element_to_be_clickable(login_btns[0]))
                 login_btns[0].click()
 
-        time.sleep(3)
+        time.sleep(4)  # Allow login to complete
 
         # Check if login succeeded by looking for the page content
         if "login" in driver.current_url.lower() or "error" in driver.page_source.lower()[:500]:
