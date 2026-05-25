@@ -436,25 +436,47 @@ def send_gate_event(events: list[dict]) -> bool:
 # DVR Password Loader
 # ---------------------------------------------------------------------------
 
+def _load_from_dvr_list(dvrs: list[dict]) -> bool:
+    """Try to find DVR_IP in a list of DVR dicts and set credentials."""
+    global DVR_PASS, DVR_USER
+    for dvr in dvrs:
+        if dvr.get("ip") == DVR_IP:
+            DVR_PASS = dvr.get("password", "")
+            usr = dvr.get("username", "")
+            if usr:
+                DVR_USER = usr
+            return bool(DVR_PASS)
+    return False
+
+
 def load_dvr_password() -> str:
-    """Load DVR password from config.json (same config used by main.py)."""
+    """Load DVR password — tries cloud config first, then local config.json."""
     global DVR_PASS
+
+    # 1. Try cloud config (same endpoint main.py uses)
+    cloud_url = "https://ppis-whatsapp-bot.fly.dev/api/agent-config/full"
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(cloud_url)
+            if resp.status_code == 200:
+                data = resp.json()
+                dvrs = data.get("dvrs", [])
+                if _load_from_dvr_list(dvrs):
+                    logger.info("DVR password loaded from cloud config for %s", DVR_IP)
+                    return DVR_PASS
+    except Exception as e:
+        logger.warning("Could not fetch cloud config: %s", e)
+
+    # 2. Fall back to local config.json
     config_path = Path(__file__).parent / "config.json"
     if config_path.exists():
         with open(config_path) as f:
             cfg = json.load(f)
-        dvrs = cfg.get("dvrs", [])
-        # Find DVR 3 (192.168.0.14)
-        for dvr in dvrs:
-            if dvr.get("ip") == DVR_IP:
-                DVR_PASS = dvr.get("password", "")
-                DVR_USER_cfg = dvr.get("username", "")
-                if DVR_USER_cfg:
-                    global DVR_USER
-                    DVR_USER = DVR_USER_cfg
-                logger.info("DVR password loaded from config.json for %s", DVR_IP)
-                return DVR_PASS
-    logger.warning("No DVR password found in config.json for %s", DVR_IP)
+        if _load_from_dvr_list(cfg.get("dvrs", [])):
+            logger.info("DVR password loaded from config.json for %s", DVR_IP)
+            return DVR_PASS
+
+    logger.warning("No DVR password found for %s", DVR_IP)
     return DVR_PASS
 
 
