@@ -498,11 +498,13 @@ def run_mood_monitor():
                 temperament, intensity,
             )
 
-        # Send pending events to cloud
+        # Send pending events to cloud (retry failed ones next cycle)
         if pending_events:
+            failed = []
             for evt in pending_events:
-                send_mood_event(evt)
-            pending_events = []
+                if not send_mood_event(evt):
+                    failed.append(evt)
+            pending_events = failed
 
         # Periodic status log
         if poll_count % 100 == 0:
