@@ -1,9 +1,9 @@
 """
-Chairman Mood & Temperament Monitor
-====================================
-Captures frames from reception cameras, identifies the chairman
-via face recognition, analyzes facial expressions, and tracks
-mood/temperament throughout the day.
+Mood & Temperament Monitor (Multi-Person)
+==========================================
+Captures frames from reception, administration and admission cameras,
+identifies tracked persons via face recognition, analyzes facial
+expressions, and tracks mood/temperament throughout the day.
 
 Sends mood data to the cloud backend for daily report generation.
 
@@ -11,11 +11,17 @@ Usage:
     python chairman_mood.py          # Run in foreground
     python chairman_mood.py --test   # Quick connectivity + face match test
 
+Tracked persons:
+    Chairman  — chairman_ref.jpg
+    Alisha    — alisha_ref.jpg, alisha_ref2.jpg
+
 Cameras:
-    Reception C1: DVR 2 (192.168.0.12) Channel 54
-    Reception C2: DVR 2 (192.168.0.12) Channel 55
-    Reception C3: DVR 2 (192.168.0.12) Channel 53
-    Reception C4: DVR 2 (192.168.0.12) Channel 52
+    Reception C1:      DVR 2 (192.168.0.12) Channel 54
+    Reception C2:      DVR 2 (192.168.0.12) Channel 55
+    Reception C3:      DVR 2 (192.168.0.12) Channel 53
+    Reception C4:      DVR 2 (192.168.0.12) Channel 52
+    Administration:    DVR 3 (192.168.0.14) Channel 23
+    Admission Room C1: DVR 2 (192.168.0.12) Channel 57
 
 All timestamps use IST (Asia/Kolkata, UTC+05:30).
 """
@@ -42,16 +48,17 @@ import numpy as np
 # Configuration
 # ---------------------------------------------------------------------------
 
-DVR_IP = "192.168.0.12"  # DVR 2 — Reception cameras
 DVR_PORT = int(os.environ.get("MOOD_DVR_PORT", "80"))
 DVR_DEFAULT_USER = "admin"
 DVR_CREDS: dict[str, dict[str, str]] = {}
 
-RECEPTION_CAMERAS = [
-    {"channel": 54, "name": "Reception C1", "dvr_ip": "192.168.0.12"},
-    {"channel": 55, "name": "Reception C2", "dvr_ip": "192.168.0.12"},
-    {"channel": 53, "name": "Reception C3", "dvr_ip": "192.168.0.12"},
-    {"channel": 52, "name": "Reception C4", "dvr_ip": "192.168.0.12"},
+MOOD_CAMERAS = [
+    {"channel": 54, "name": "Reception C1",      "dvr_ip": "192.168.0.12"},
+    {"channel": 55, "name": "Reception C2",      "dvr_ip": "192.168.0.12"},
+    {"channel": 53, "name": "Reception C3",      "dvr_ip": "192.168.0.12"},
+    {"channel": 52, "name": "Reception C4",      "dvr_ip": "192.168.0.12"},
+    {"channel": 23, "name": "Administration",    "dvr_ip": "192.168.0.14"},
+    {"channel": 57, "name": "Admission Room C1", "dvr_ip": "192.168.0.12"},
 ]
 
 CLOUD_API = os.environ.get(
@@ -59,7 +66,6 @@ CLOUD_API = os.environ.get(
     "https://ppis-whatsapp-bot.fly.dev/api/chairman/mood",
 )
 
-# Capture every N seconds (fast enough to catch brief appearances)
 POLL_INTERVAL = int(os.environ.get("MOOD_POLL_SECONDS", "3"))
 
 # School hours for monitoring (IST)
@@ -70,11 +76,23 @@ MONITOR_END_MIN = 0
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Face matching threshold (lower = stricter)
 FACE_MATCH_TOLERANCE = float(os.environ.get("MOOD_FACE_TOLERANCE", "0.5"))
 
-# Reference photo path
-REF_PHOTO = Path(__file__).parent / "chairman_ref.jpg"
+# Tracked persons: list of {name, ref_photos: [Path, ...]}
+BASE_DIR = Path(__file__).parent
+TRACKED_PERSONS = [
+    {
+        "name": "Chairman",
+        "ref_photos": [BASE_DIR / "chairman_ref.jpg"],
+    },
+    {
+        "name": "Alisha",
+        "ref_photos": [
+            BASE_DIR / "alisha_ref.jpg",
+            BASE_DIR / "alisha_ref2.jpg",
+        ],
+    },
+]
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -148,7 +166,7 @@ def capture_frame(channel: int, dvr_ip: str = "192.168.0.12") -> np.ndarray | No
 # ---------------------------------------------------------------------------
 
 def _load_creds_from_dvr_list(dvrs: list[dict]) -> int:
-    needed_ips = {cam["dvr_ip"] for cam in RECEPTION_CAMERAS}
+    needed_ips = {cam["dvr_ip"] for cam in MOOD_CAMERAS}
     loaded = 0
     for dvr in dvrs:
         ip = dvr.get("ip", "")
@@ -176,7 +194,7 @@ def load_dvr_passwords() -> None:
     except Exception as e:
         logger.warning("Could not fetch cloud config: %s", e)
 
-    missing = {cam["dvr_ip"] for cam in RECEPTION_CAMERAS} - set(DVR_CREDS.keys())
+    missing = {cam["dvr_ip"] for cam in MOOD_CAMERAS} - set(DVR_CREDS.keys())
     if missing:
         config_path = Path(__file__).parent / "config.json"
         if config_path.exists():
@@ -186,7 +204,7 @@ def load_dvr_passwords() -> None:
             if n:
                 logger.info("Loaded %d DVR credential(s) from config.json", n)
 
-    for ip in {cam["dvr_ip"] for cam in RECEPTION_CAMERAS}:
+    for ip in {cam["dvr_ip"] for cam in MOOD_CAMERAS}:
         if ip in DVR_CREDS:
             logger.info("DVR %s: credentials OK", ip)
         else:
@@ -194,42 +212,52 @@ def load_dvr_passwords() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Chairman Face Recognition
+# Multi-Person Face Recognition
 # ---------------------------------------------------------------------------
 
-class ChairmanDetector:
-    """Detects and identifies the chairman using face_recognition (dlib)."""
+class PersonDetector:
+    """Detects and identifies tracked persons using face_recognition (dlib)."""
 
-    def __init__(self, ref_photo_path: Path, tolerance: float = 0.5):
-        self.ref_path = ref_photo_path
+    def __init__(self, persons: list[dict], tolerance: float = 0.5):
+        self.persons = persons
         self.tolerance = tolerance
-        self.ref_encoding: np.ndarray | None = None
+        self.ref_encodings: dict[str, list[np.ndarray]] = {}
 
     def load(self) -> bool:
         import face_recognition
 
-        if not self.ref_path.exists():
-            logger.error("Chairman reference photo not found: %s", self.ref_path)
-            return False
+        loaded_any = False
+        for person in self.persons:
+            name = person["name"]
+            encodings = []
+            for ref_path in person["ref_photos"]:
+                if not ref_path.exists():
+                    logger.warning("Reference photo not found for %s: %s", name, ref_path)
+                    continue
+                img = face_recognition.load_image_file(str(ref_path))
+                encs = face_recognition.face_encodings(img)
+                if encs:
+                    encodings.append(encs[0])
+                    logger.info("Loaded reference face for %s: %s", name, ref_path.name)
+                else:
+                    logger.warning("No face found in %s for %s", ref_path.name, name)
 
-        img = face_recognition.load_image_file(str(self.ref_path))
-        encodings = face_recognition.face_encodings(img)
-        if not encodings:
-            logger.error("No face found in chairman reference photo")
-            return False
+            if encodings:
+                self.ref_encodings[name] = encodings
+                loaded_any = True
+            else:
+                logger.error("No valid reference faces for %s", name)
 
-        self.ref_encoding = encodings[0]
-        logger.info("Chairman reference face loaded (128-d encoding)")
-        return True
+        return loaded_any
 
-    def find_chairman(self, frame: np.ndarray) -> list[dict]:
-        """Find the chairman's face(s) in a frame.
+    def find_persons(self, frame: np.ndarray) -> list[dict]:
+        """Find tracked persons in a frame.
 
-        Returns list of dicts with keys: location, encoding, distance.
+        Returns list of dicts: {person, location, bbox, distance}
         """
         import face_recognition
 
-        if self.ref_encoding is None:
+        if not self.ref_encodings:
             return []
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -240,13 +268,23 @@ class ChairmanDetector:
         encodings = face_recognition.face_encodings(rgb, locations)
         matches = []
         for loc, enc in zip(locations, encodings):
-            dist = face_recognition.face_distance([self.ref_encoding], enc)[0]
-            if dist <= self.tolerance:
+            best_person = None
+            best_dist = float("inf")
+
+            for person_name, ref_encs in self.ref_encodings.items():
+                distances = face_recognition.face_distance(ref_encs, enc)
+                min_dist = float(min(distances))
+                if min_dist <= self.tolerance and min_dist < best_dist:
+                    best_person = person_name
+                    best_dist = min_dist
+
+            if best_person is not None:
                 top, right, bottom, left = loc
                 matches.append({
-                    "location": loc,  # (top, right, bottom, left)
-                    "bbox": (left, top, right - left, bottom - top),  # (x, y, w, h)
-                    "distance": float(dist),
+                    "person": best_person,
+                    "location": loc,
+                    "bbox": (left, top, right - left, bottom - top),
+                    "distance": best_dist,
                 })
 
         return matches
@@ -281,7 +319,6 @@ class ExpressionAnalyzer:
         self._ensure_init()
 
         x, y, w, h = face_bbox
-        # Add padding for better analysis
         pad = int(max(w, h) * 0.3)
         fh, fw = frame.shape[:2]
         x1 = max(0, x - pad)
@@ -330,16 +367,13 @@ TEMPERAMENT_MAP = {
 
 
 def classify_temperament(emotions: dict) -> str:
-    """Classify temperament from emotion scores."""
     if not emotions:
         return "unknown"
-
     dominant = max(emotions, key=emotions.get)
     return TEMPERAMENT_MAP.get(dominant, "neutral")
 
 
 def compute_expression_intensity(emotions: dict) -> float:
-    """How intensely non-neutral the expression is (0-100)."""
     neutral = emotions.get("neutral", 100.0)
     return max(0.0, 100.0 - neutral)
 
@@ -349,7 +383,6 @@ def compute_expression_intensity(emotions: dict) -> float:
 # ---------------------------------------------------------------------------
 
 def crop_face_jpeg(frame: np.ndarray, bbox: tuple, quality: int = 80) -> str:
-    """Crop the face region and return as base64 JPEG."""
     x, y, w, h = bbox
     pad = int(max(w, h) * 0.4)
     fh, fw = frame.shape[:2]
@@ -371,7 +404,6 @@ def crop_face_jpeg(frame: np.ndarray, bbox: tuple, quality: int = 80) -> str:
 # ---------------------------------------------------------------------------
 
 def send_mood_event(event: dict) -> bool:
-    """Send a mood observation to the cloud backend."""
     try:
         with httpx.Client(timeout=15.0) as client:
             resp = client.post(CLOUD_API, json=event)
@@ -396,35 +428,32 @@ def is_monitoring_time() -> bool:
 
 
 def run_mood_monitor():
-    """Main mood monitoring loop."""
     logger.info("=" * 60)
-    logger.info("Chairman Mood & Temperament Monitor starting")
-    logger.info("Cameras: %s", ", ".join(c["name"] for c in RECEPTION_CAMERAS))
+    logger.info("Mood & Temperament Monitor starting (multi-person)")
+    logger.info("Tracked persons: %s", ", ".join(p["name"] for p in TRACKED_PERSONS))
+    logger.info("Cameras: %s", ", ".join(c["name"] for c in MOOD_CAMERAS))
     logger.info("Poll interval: %d seconds", POLL_INTERVAL)
     logger.info("Monitoring: %02d:%02d - %02d:%02d IST",
                 MONITOR_START_HOUR, MONITOR_START_MIN,
                 MONITOR_END_HOUR, MONITOR_END_MIN)
     logger.info("=" * 60)
 
-    # Load DVR passwords
     load_dvr_passwords()
-    needed_ips = {c["dvr_ip"] for c in RECEPTION_CAMERAS}
+    needed_ips = {c["dvr_ip"] for c in MOOD_CAMERAS}
     missing = needed_ips - set(DVR_CREDS.keys())
     if missing:
         logger.error("Missing DVR credentials for: %s", ", ".join(missing))
         sys.exit(1)
 
-    # Load chairman reference face
-    detector = ChairmanDetector(REF_PHOTO, tolerance=FACE_MATCH_TOLERANCE)
+    detector = PersonDetector(TRACKED_PERSONS, tolerance=FACE_MATCH_TOLERANCE)
     if not detector.load():
-        logger.error("Cannot start without chairman reference photo")
+        logger.error("Cannot start without at least one reference face")
         sys.exit(1)
 
-    # Initialize expression analyzer (lazy-loaded)
     analyzer = ExpressionAnalyzer()
 
     poll_count = 0
-    daily_detections = 0
+    daily_detections: dict[str, int] = {p["name"]: 0 for p in TRACKED_PERSONS}
     current_date = datetime.now(IST).strftime("%Y-%m-%d")
     pending_events: list[dict] = []
 
@@ -432,71 +461,71 @@ def run_mood_monitor():
         now = datetime.now(IST)
         today = now.strftime("%Y-%m-%d")
 
-        # Reset daily counters on date change
         if today != current_date:
-            logger.info("Date changed: %s -> %s. Detections yesterday: %d",
+            logger.info("Date changed: %s -> %s. Detections yesterday: %s",
                         current_date, today, daily_detections)
             current_date = today
-            daily_detections = 0
+            daily_detections = {p["name"]: 0 for p in TRACKED_PERSONS}
 
-        # Only monitor during school hours
         if not is_monitoring_time():
             if poll_count > 0:
-                logger.info("Outside monitoring hours. Today's detections: %d", daily_detections)
+                logger.info("Outside monitoring hours. Today's detections: %s", daily_detections)
                 poll_count = 0
             time.sleep(30)
             continue
 
         poll_count += 1
 
-        for cam in RECEPTION_CAMERAS:
+        for cam in MOOD_CAMERAS:
             frame = capture_frame(cam["channel"], cam["dvr_ip"])
             if frame is None:
                 continue
 
-            # Find chairman in frame
-            matches = detector.find_chairman(frame)
+            matches = detector.find_persons(frame)
             if not matches:
                 continue
 
-            # Process the best match (closest distance)
-            best = min(matches, key=lambda m: m["distance"])
-            bbox = best["bbox"]
+            # Group by person — take best match per person
+            person_best: dict[str, dict] = {}
+            for m in matches:
+                pname = m["person"]
+                if pname not in person_best or m["distance"] < person_best[pname]["distance"]:
+                    person_best[pname] = m
 
-            # Analyze expression
-            expr = analyzer.analyze(frame, bbox)
-            if expr["dominant_emotion"] == "unknown":
-                continue
+            for person_name, best in person_best.items():
+                bbox = best["bbox"]
 
-            # Classify temperament
-            temperament = classify_temperament(expr["emotions"])
-            intensity = compute_expression_intensity(expr["emotions"])
+                expr = analyzer.analyze(frame, bbox)
+                if expr["dominant_emotion"] == "unknown":
+                    continue
 
-            # Crop face for report
-            face_crop = crop_face_jpeg(frame, bbox)
+                temperament = classify_temperament(expr["emotions"])
+                intensity = compute_expression_intensity(expr["emotions"])
+                face_crop = crop_face_jpeg(frame, bbox)
 
-            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+                timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
-            event = {
-                "timestamp": timestamp,
-                "camera": cam["name"],
-                "dominant_emotion": expr["dominant_emotion"],
-                "emotions": expr["emotions"],
-                "temperament": temperament,
-                "intensity": round(intensity, 1),
-                "face_distance": round(best["distance"], 3),
-                "face_confidence": round(expr["confidence"], 2),
-                "face_crop": face_crop,
-            }
-            pending_events.append(event)
-            daily_detections += 1
+                event = {
+                    "person": person_name,
+                    "timestamp": timestamp,
+                    "camera": cam["name"],
+                    "dominant_emotion": expr["dominant_emotion"],
+                    "emotions": expr["emotions"],
+                    "temperament": temperament,
+                    "intensity": round(intensity, 1),
+                    "face_distance": round(best["distance"], 3),
+                    "face_confidence": round(expr["confidence"], 2),
+                    "face_crop": face_crop,
+                }
+                pending_events.append(event)
+                daily_detections[person_name] = daily_detections.get(person_name, 0) + 1
 
-            logger.info(
-                "Chairman detected on %s — Mood: %s (%.1f%%) | Temperament: %s | Intensity: %.1f",
-                cam["name"], expr["dominant_emotion"],
-                expr["emotions"].get(expr["dominant_emotion"], 0),
-                temperament, intensity,
-            )
+                logger.info(
+                    "%s detected on %s — Mood: %s (%.1f%%) | Temperament: %s | Intensity: %.1f",
+                    person_name, cam["name"], expr["dominant_emotion"],
+                    expr["emotions"].get(expr["dominant_emotion"], 0),
+                    temperament, intensity,
+                )
 
         # Send pending events to cloud (retry failed ones next cycle)
         if pending_events:
@@ -506,13 +535,12 @@ def run_mood_monitor():
                     failed.append(evt)
             pending_events = failed
 
-        # Periodic status log
         if poll_count % 100 == 0:
-            logger.info("Poll #%d — Today's detections: %d", poll_count, daily_detections)
+            logger.info("Poll #%d — Today's detections: %s", poll_count, daily_detections)
 
         time.sleep(POLL_INTERVAL)
 
-    logger.info("Mood monitor stopped. Total detections today: %d", daily_detections)
+    logger.info("Mood monitor stopped. Total detections today: %s", daily_detections)
 
 
 # ---------------------------------------------------------------------------
@@ -520,12 +548,10 @@ def run_mood_monitor():
 # ---------------------------------------------------------------------------
 
 def test_connectivity():
-    """Test camera access and face detection on reference photo."""
-    logger.info("Testing chairman mood monitor...")
+    logger.info("Testing mood monitor (multi-person)...")
     load_dvr_passwords()
 
-    # Test camera access
-    for cam in RECEPTION_CAMERAS:
+    for cam in MOOD_CAMERAS:
         dvr_ip = cam["dvr_ip"]
         if dvr_ip not in DVR_CREDS:
             logger.error("%s: SKIPPED — no credentials for DVR %s", cam["name"], dvr_ip)
@@ -537,20 +563,24 @@ def test_connectivity():
         else:
             logger.error("%s (DVR %s): FAILED — Could not capture frame", cam["name"], dvr_ip)
 
-    # Test face recognition
-    logger.info("Testing chairman face recognition...")
-    detector = ChairmanDetector(REF_PHOTO, tolerance=FACE_MATCH_TOLERANCE)
+    logger.info("Testing face recognition for tracked persons...")
+    detector = PersonDetector(TRACKED_PERSONS, tolerance=FACE_MATCH_TOLERANCE)
     if detector.load():
-        logger.info("Chairman reference face: OK")
+        for name, encs in detector.ref_encodings.items():
+            logger.info("%s: OK — %d reference encoding(s)", name, len(encs))
     else:
-        logger.error("Chairman reference face: FAILED")
+        logger.error("Face recognition: FAILED — no reference faces loaded")
         return
 
-    # Test expression analysis on reference photo
     logger.info("Testing expression analysis...")
-    ref_img = cv2.imread(str(REF_PHOTO))
-    if ref_img is not None:
-        analyzer = ExpressionAnalyzer()
+    analyzer = ExpressionAnalyzer()
+    for person in TRACKED_PERSONS:
+        ref_path = person["ref_photos"][0]
+        if not ref_path.exists():
+            continue
+        ref_img = cv2.imread(str(ref_path))
+        if ref_img is None:
+            continue
         import face_recognition
         rgb = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
         locs = face_recognition.face_locations(rgb)
@@ -558,11 +588,9 @@ def test_connectivity():
             top, right, bottom, left = locs[0]
             bbox = (left, top, right - left, bottom - top)
             expr = analyzer.analyze(ref_img, bbox)
-            logger.info("Expression analysis OK — Dominant: %s", expr["dominant_emotion"])
+            logger.info("%s expression test — Dominant: %s", person["name"], expr["dominant_emotion"])
             for emo, score in sorted(expr["emotions"].items(), key=lambda x: -x[1]):
                 logger.info("  %s: %.1f%%", emo, score)
-        else:
-            logger.warning("No face found in reference photo for expression test")
 
     logger.info("Cloud API: %s", CLOUD_API)
     logger.info("Test complete.")
@@ -573,7 +601,7 @@ def test_connectivity():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Chairman Mood & Temperament Monitor")
+    parser = argparse.ArgumentParser(description="Mood & Temperament Monitor (Multi-Person)")
     parser.add_argument("--test", action="store_true", help="Quick connectivity + detection test")
     args = parser.parse_args()
 
