@@ -10,6 +10,16 @@ REM   - Cleans up old snapshot files to prevent disk fill
 title PPIS Campus Agent (24/7)
 cd /d "%~dp0"
 
+REM Prevent multiple instances of run_forever.bat
+set "LOCKFILE=%~dp0.agent_lock"
+if exist "%LOCKFILE%" (
+    echo Another run_forever.bat is already running! Exiting this instance.
+    echo If that's wrong, delete %LOCKFILE% and retry.
+    timeout /t 5
+    exit /b 1
+)
+echo %DATE% %TIME% > "%LOCKFILE%"
+
 REM Suppress Windows Error Reporting dialogs
 reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f >nul 2>&1
 reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v Disabled /t REG_DWORD /d 1 /f >nul 2>&1
@@ -24,14 +34,12 @@ echo.
 echo ============================================
 echo [%DATE% %TIME%] Killing any existing agent on port 8897...
 echo ============================================
-REM Kill ALL python.exe first to avoid duplicate instances
-taskkill /F /IM python.exe >nul 2>&1
-REM Also kill any process holding port 8897
+REM Kill any process holding port 8897 (main.py also does this early)
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8897 ^| findstr LISTENING') do (
     echo Killing PID %%a on port 8897...
     taskkill /F /PID %%a >nul 2>&1
 )
-timeout /t 3 /nobreak >nul
+timeout /t 2 /nobreak >nul
 
 echo ============================================
 echo [%DATE% %TIME%] Pulling latest code...
@@ -39,6 +47,9 @@ echo ============================================
 REM Force-sync to latest remote code (nuclear but reliable)
 git fetch origin 2>nul
 git reset --hard origin/main 2>nul
+
+REM Clear bytecode cache to avoid stale .pyc files after code updates
+if exist "%~dp0__pycache__" rmdir /s /q "%~dp0__pycache__" 2>nul
 
 REM Clean up old snapshot files (older than 1 day) to prevent disk fill
 echo [%DATE% %TIME%] Cleaning old snapshots...
@@ -48,8 +59,12 @@ forfiles /p "%~dp0attendance_snapshots" /d -1 /c "cmd /c del @path" 2>nul
 echo.
 echo [%DATE% %TIME%] Starting PPIS Campus Agent...
 echo ============================================
-py -3.12 main.py
+py -3.12 -B main.py
 echo.
 echo [%DATE% %TIME%] Agent stopped (exit code: %ERRORLEVEL%). Restarting in 10 seconds...
 timeout /t 10 /nobreak
 goto loop
+
+:cleanup
+REM Clean up lock file on exit
+if exist "%LOCKFILE%" del "%LOCKFILE%" 2>nul

@@ -389,6 +389,19 @@ def save_face_encoding(person_id: str, name: str, role: str, phone: str,
         conn.close()
 
 
+def update_face_phone(person_id: str, phone: str):
+    """Update the phone number for all face entries of a given person."""
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE registered_faces SET phone = ? WHERE person_id = ?",
+            (phone, person_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_all_face_encodings(encoding_type: str | None = None) -> list[dict]:
     conn = get_conn()
     try:

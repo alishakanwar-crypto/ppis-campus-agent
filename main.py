@@ -20,10 +20,11 @@ import io
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 # Suppress Windows crash dialogs so the process exits silently on errors
@@ -36,14 +37,77 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# --- Kill stale process on port 8897 BEFORE loading heavy DLLs ---
+# Must happen before face_recognition/dlib/cv2 imports because
+# subprocess.run(shell=True) crashes when those DLLs are loaded.
+def _kill_port_holder_early(port: int = 8897) -> None:
+    if sys.platform != "win32":
+        return
+    # CREATE_NO_WINDOW prevents cmd.exe from flashing a black window
+    _no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    try:
+        result = subprocess.run(
+            f'netstat -ano | findstr :{port} | findstr LISTENING',
+            capture_output=True, text=True, shell=True,
+            creationflags=_no_win,
+        )
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if parts:
+                pid = parts[-1]
+                if pid != str(os.getpid()):
+                    subprocess.run(f"taskkill /F /PID {pid}",
+                                   shell=True, capture_output=True,
+                                   creationflags=_no_win)
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    _kill_port_holder_early()
+
 import httpx
 import websockets
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
+# --- dlib/numpy ABI compatibility check ---
+# dlib compiled against numpy 1.x rejects numpy 2.x arrays with
+# "Unsupported image type, must be 8bit gray or RGB image."
+# Auto-fix: downgrade numpy to last 1.x release.
+def _ensure_dlib_compat():
+    try:
+        import numpy as _np
+        import dlib as _dlib
+        _det = _dlib.get_frontal_face_detector()
+        _test = _np.zeros((100, 100, 3), dtype=_np.uint8)
+        _det(_test, 0)  # should not raise
+    except ImportError:
+        pass  # dlib not installed — nothing to check
+    except Exception as e:
+        if "Unsupported image type" in str(e):
+            print(f"[AUTOFIX] dlib/numpy ABI mismatch: {e}")
+            print("[AUTOFIX] Installing compatible numpy (1.26.4)...")
+            import subprocess
+            _nw = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "numpy==1.26.4"],
+                capture_output=True, text=True,
+                creationflags=_nw if sys.platform == "win32" else 0,
+            )
+            print(result.stdout[-500:] if result.stdout else "")
+            if result.returncode == 0:
+                print("[AUTOFIX] numpy fixed. Restarting...")
+                sys.exit(42)  # run_forever.bat will auto-restart
+            else:
+                print(f"[AUTOFIX] pip failed: {result.stderr[-300:]}")
+
+_ensure_dlib_compat()
+
 from attendance_engine import engine as attendance_engine
 import face_db
+from mood_detector import MoodDetector
+from teacher_sighting import TeacherSightingTracker
 
 try:
     from PIL import Image
@@ -60,6 +124,10 @@ logger = logging.getLogger("ppis-agent")
 # Configuration
 # ---------------------------------------------------------------------------
 CLOUD_API_BASE = "https://ppis-whatsapp-bot.fly.dev"
+
+# Mood detection and teacher sighting trackers
+mood_detector = MoodDetector(cloud_url=CLOUD_API_BASE)
+sighting_tracker = TeacherSightingTracker(cloud_url=CLOUD_API_BASE)
 CONFIG_FILE = Path(__file__).parent / "config.json"
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 SNAPSHOT_DIR.mkdir(exist_ok=True)
@@ -107,6 +175,33 @@ def save_config(cfg: dict):
         json.dump(cfg, f, indent=2)
 
 
+def cleanup_junk_face_entries():
+    """Remove known junk/duplicate face entries from local DB on startup.
+
+    These entries were registered with incorrect names and cause
+    false-positive matches and duplicate notifications.
+    """
+    import database as db_mod
+
+    junk_person_ids = [
+        "TEACHER_ALISHA",              # Incomplete name — duplicate of TEACHER_ALISHA_AHUJA
+        "TEACHER_RECOGNITION",         # Junk — someone registered with just "recognition"
+        "TEACHER_PRITY_SHARMA_TREACHER",  # Typo — "Treacher" instead of "Teacher"
+        "TEACHER_HARDIK_RAWAT_GRADE_4A",  # Has "Grade 4A" in name — registration error
+    ]
+
+    total_deleted = 0
+    for pid in junk_person_ids:
+        deleted = db_mod.delete_person_faces(pid)
+        if deleted:
+            total_deleted += deleted
+            logger.info(f"Cleanup: removed {deleted} junk entry(s) for {pid}")
+
+    if total_deleted:
+        logger.info(f"Cleanup: removed {total_deleted} total junk face entry(s)")
+    return total_deleted
+
+
 async def sync_faces_from_cloud() -> int:
     """Download registered face images from cloud and register locally.
 
@@ -147,9 +242,32 @@ async def sync_faces_from_cloud() -> int:
                 f for f in manifest
                 if (f["person_id"], f["angle"]) not in existing_keys
             ]
+
+            # Step 2b: Update phone numbers for existing faces
+            # Build lookup of local person_id -> phone
+            local_phones = {}
+            for r in existing:
+                pid = r["person_id"]
+                ph = r.get("phone", "") or ""
+                if pid not in local_phones or len(ph) > len(local_phones[pid]):
+                    local_phones[pid] = ph
+            # Check cloud manifest for updated phones
+            phones_updated = 0
+            for face_meta in manifest:
+                pid = face_meta["person_id"]
+                cloud_phone = face_meta.get("phone", "") or ""
+                local_phone = local_phones.get(pid, "")
+                if pid in local_phones and cloud_phone and cloud_phone != local_phone:
+                    # Cloud has a newer/different phone — update locally
+                    db_mod.update_face_phone(pid, cloud_phone)
+                    local_phones[pid] = cloud_phone
+                    phones_updated += 1
+            if phones_updated:
+                logger.info(f"Cloud face sync: updated phone numbers for {phones_updated} person(s)")
+
             if not missing:
                 logger.info(f"Cloud face sync: all {len(manifest)} faces already local")
-                return 0
+                return phones_updated
 
             logger.info(f"Cloud face sync: {len(missing)} new face(s) to download")
 
@@ -317,11 +435,23 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
 
     # Hikvision uses channelNo * 100 + 1 for main stream snapshot
     stream_channel = channel * 100 + 1
-    # Request highest quality JPEG via ISAPI params
-    url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
-           f"?snapShotImageType=JPEG&videoResolutionWidth=1920&videoResolutionHeight=1080")
 
-    logger.info(f"Capturing snapshot from {ip} channel {channel} (stream {stream_channel})")
+    # Probe native resolution for highest quality capture
+    from attendance_engine import _probe_channel_resolution, _channel_resolution_cache
+    try:
+        async with httpx.AsyncClient(timeout=15.0,
+                                     auth=httpx.DigestAuth(user, pwd)) as probe_client:
+            native_res = await _probe_channel_resolution(
+                probe_client, ip, port, channel)
+        req_w = native_res[0] if native_res else 1920
+        req_h = native_res[1] if native_res else 1080
+    except Exception:
+        req_w, req_h = 1920, 1080
+
+    url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+           f"?snapShotImageType=JPEG&videoResolutionWidth={req_w}&videoResolutionHeight={req_h}")
+
+    logger.info(f"Capturing snapshot from {ip} channel {channel} (stream {stream_channel}) at {req_w}x{req_h}")
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -804,6 +934,28 @@ async def _auto_start_classwise():
         logger.error(f"AUTO-START FAILED: {e}", exc_info=True)
 
 
+async def _auto_start_mood_and_sighting():
+    """Auto-start mood detection and teacher sighting tracker after delay."""
+    try:
+        await asyncio.sleep(15)  # Let face sync and classwise start first
+
+        dvrs = config.get("dvrs", [])
+        camera_mapping = config.get("camera_mapping", {})
+        if not dvrs or not camera_mapping:
+            logger.warning("Mood/Sighting auto-start skipped: no DVRs or camera mapping")
+            return
+
+        agent_secret = config.get("agent_secret", os.environ.get("AGENT_SECRET", ""))
+        mood_detector.agent_secret = agent_secret
+        sighting_tracker.agent_secret = agent_secret
+
+        mood_detector.start(dvrs, camera_mapping)
+        sighting_tracker.start(dvrs, camera_mapping)
+        logger.info("AUTO-START: Mood detection + teacher sighting tracker started")
+    except Exception as e:
+        logger.error(f"Mood/Sighting auto-start failed: {e}", exc_info=True)
+
+
 async def _health_watchdog():
     """Background watchdog that monitors system health and auto-recovers.
 
@@ -946,6 +1098,9 @@ async def lifespan(app: FastAPI):
         f"Config loaded: {len(config.get('dvrs', []))} DVRs, "
         f"{len(config.get('camera_mapping', {}))} camera mappings"
     )
+    # Clean up known junk/duplicate face entries before syncing
+    cleanup_junk_face_entries()
+
     # Sync face registrations from cloud DB (downloads images, computes encodings)
     try:
         await sync_faces_from_cloud()
@@ -958,6 +1113,8 @@ async def lifespan(app: FastAPI):
     ws_task = asyncio.create_task(websocket_client())
     # Auto-start classwise monitoring after brief delay (24/7 always-on)
     asyncio.create_task(_auto_start_classwise())
+    # Auto-start mood detection and teacher sighting after delay
+    asyncio.create_task(_auto_start_mood_and_sighting())
     # Start health watchdog after 60 seconds (auto-recovery, face sync)
     async def _delayed_watchdog():
         try:
@@ -975,12 +1132,18 @@ async def lifespan(app: FastAPI):
     finally:
         # Shutdown
         attendance_engine.stop()
+        mood_detector.stop()
+        sighting_tracker.stop()
         if ws_task:
             ws_task.cancel()
     logger.info("PPIS Campus Agent stopped")
 
 
 app = FastAPI(title="PPIS Campus Agent", lifespan=lifespan)
+
+# --- TrueFace 3000 ADMS integration ---
+from trueface_adms import router as trueface_router
+app.include_router(trueface_router)
 
 # Ensure static directories exist
 (Path(__file__).parent / "static").mkdir(exist_ok=True)
@@ -1595,6 +1758,36 @@ async def stop_attendance_monitoring():
     return {"status": "stopped", "auto_start_enabled": False}
 
 
+# ---------------------------------------------------------------------------
+# Mood Detection & Teacher Sighting Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/mood/status")
+async def mood_status():
+    """Get mood detection status."""
+    return {
+        "running": mood_detector.running,
+        "tracked_persons": list(mood_detector._tracked_encodings.keys()),
+        "cooldown_seconds": mood_detector._cooldown,
+        "last_observations": {
+            k: datetime.fromtimestamp(v).isoformat()
+            for k, v in mood_detector._last_observation.items()
+        } if mood_detector._last_observation else {},
+    }
+
+
+@app.get("/api/sighting/status")
+async def sighting_status():
+    """Get teacher sighting tracker status."""
+    return {
+        "running": sighting_tracker.running,
+        "teachers_loaded": len(sighting_tracker._teacher_encodings),
+        "today": sighting_tracker._today,
+        "sightings_today": len(sighting_tracker._daily_sightings),
+        "recent_sightings": sighting_tracker._daily_sightings[-10:],
+    }
+
+
 @app.post("/api/attendance/resend-notification")
 async def resend_notification(person_id: str):
     """Clear notification dedup for a student so their next detection re-sends."""
@@ -1749,6 +1942,38 @@ async def camera_alerts_status():
         "failure_threshold": attendance_engine._camera_alert_threshold,
         "cameras_with_errors": errors,
         "total_alerted": len(attendance_engine._admin_alerted),
+    }
+
+
+@app.get("/api/camera-resolutions")
+async def get_camera_resolutions():
+    """Probe and report native resolution for all mapped cameras.
+
+    Shows which cameras support HD (1080p), 2MP, 4MP, etc.
+    This helps identify which cameras could benefit from replacement.
+    """
+    dvrs = config.get("dvrs", [])
+    mapping = config.get("camera_mapping", {})
+    if not dvrs or not mapping:
+        return {"status": "error", "message": "No DVRs or camera mapping configured"}
+
+    results = await attendance_engine.probe_all_camera_resolutions(dvrs, mapping)
+
+    # Summarize
+    total = len(results)
+    hd_count = sum(1 for r in results.values() if r["width"] >= 1920)
+    above_hd = sum(1 for r in results.values() if r["width"] > 1920)
+    probed = sum(1 for r in results.values() if r["native_probed"])
+
+    return {
+        "status": "ok",
+        "summary": {
+            "total_cameras": total,
+            "probed_successfully": probed,
+            "hd_1080p_or_above": hd_count,
+            "above_1080p": above_hd,
+        },
+        "cameras": results,
     }
 
 
@@ -2772,26 +2997,6 @@ setInterval(async () => {
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def _kill_port_holder(port: int) -> None:
-    """Kill any process currently listening on the given port (Windows only)."""
-    if sys.platform != "win32":
-        return
-    import subprocess
-    try:
-        result = subprocess.run(
-            f'netstat -ano | findstr :{port} | findstr LISTENING',
-            capture_output=True, text=True, shell=True,
-        )
-        for line in result.stdout.strip().splitlines():
-            parts = line.split()
-            if parts:
-                pid = parts[-1]
-                subprocess.run(f"taskkill /F /PID {pid}", shell=True,
-                               capture_output=True)
-                logger.info(f"Killed stale process PID {pid} on port {port}")
-        time.sleep(3)
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":
@@ -2808,22 +3013,31 @@ if __name__ == "__main__":
 
     port = config.get("local_port", 8897)
 
-    # Kill any lingering process on our port before binding
-    _kill_port_holder(port)
-
     logger.info(f"Starting PPIS Campus Agent on http://localhost:{port}")
-    try:
-        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
-                    timeout_keep_alive=30, ws_max_size=16777216)
-    except OSError as e:
-        if "10048" in str(e) or "Address already in use" in str(e):
-            logger.warning(f"Port {port} still busy, retrying after kill...")
-            _kill_port_holder(port)
-            time.sleep(5)
-            uvicorn.run(app, host="0.0.0.0", port=port)
-        else:
-            logger.critical(f"FATAL OS ERROR: {e}", exc_info=True)
+
+    # Retry binding up to 5 times with delays — handles port still in
+    # TIME_WAIT or a stale process that hasn't released the socket yet.
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            uvicorn.run(app, host="0.0.0.0", port=port, log_level="info",
+                        timeout_keep_alive=30, ws_max_size=16777216,
+                        http="httptools")
+            break  # Normal shutdown
+        except OSError as e:
+            if ("10048" in str(e) or "Address already in use" in str(e)):
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Port {port} busy (attempt {attempt}/{max_retries})."
+                        f" Retrying in {attempt * 3}s..."
+                    )
+                    time.sleep(attempt * 3)
+                else:
+                    logger.error(f"Port {port} still busy after {max_retries} attempts. Exiting.")
+                    sys.exit(1)
+            else:
+                logger.critical(f"FATAL OS ERROR: {e}", exc_info=True)
+                raise
+        except Exception as e:
+            logger.critical(f"FATAL CRASH: {e}", exc_info=True)
             raise
-    except Exception as e:
-        logger.critical(f"FATAL CRASH: {e}", exc_info=True)
-        raise

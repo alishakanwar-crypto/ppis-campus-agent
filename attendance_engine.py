@@ -26,6 +26,13 @@ from pathlib import Path
 import httpx
 import numpy as np
 
+# Import order matters on Windows: face_recognition must be imported BEFORE
+# cv2 to avoid a silent C-level DLL conflict crash.
+try:
+    import face_recognition
+except ImportError:
+    face_recognition = None
+
 try:
     import dlib
 except ImportError:
@@ -37,23 +44,29 @@ except ImportError:
     cv2 = None
 
 try:
-    import face_recognition
-except ImportError:
-    face_recognition = None
-
-try:
     from PIL import Image, ImageEnhance, ImageFilter
 except ImportError:
     Image = None
     ImageEnhance = None
     ImageFilter = None
 
-try:
-    from insightface.app import FaceAnalysis
-    _INSIGHTFACE_AVAILABLE = True
-except ImportError:
-    FaceAnalysis = None
-    _INSIGHTFACE_AVAILABLE = False
+# InsightFace imported lazily to avoid DLL conflict with dlib on Windows.
+# Importing both face_recognition (dlib) and insightface (onnxruntime) at
+# module level causes a silent C-level crash on some Windows configurations.
+FaceAnalysis = None
+_INSIGHTFACE_AVAILABLE = False
+
+def _check_insightface_available():
+    global FaceAnalysis, _INSIGHTFACE_AVAILABLE
+    if _INSIGHTFACE_AVAILABLE:
+        return True
+    try:
+        from insightface.app import FaceAnalysis as _FA
+        FaceAnalysis = _FA
+        _INSIGHTFACE_AVAILABLE = True
+        return True
+    except Exception:
+        return False
 
 import database as db
 import face_db
@@ -143,6 +156,18 @@ OPEN_HOUSE_MODE = False  # Computed dynamically via _is_open_house_today()
 # Minimum face pixel dimensions for quality filtering
 MIN_FACE_WIDTH = 25
 MIN_FACE_HEIGHT = 25
+
+# ---------------------------------------------------------------------------
+# HD FACE RECOGNITION — DVR OPTIMIZATION
+# ---------------------------------------------------------------------------
+# Cache of each camera channel's max supported resolution.
+# Populated on first capture via ISAPI capabilities probe.
+# Key: "ip:channel", Value: (width, height) or None if unknown.
+_channel_resolution_cache: dict[str, tuple[int, int] | None] = {}
+
+# Face crop padding: expand the detected face bounding box by this fraction
+# to include forehead, chin, and ears for better encoding accuracy.
+FACE_CROP_PADDING = 0.35  # 35% padding around the detected face box
 
 # Image quality thresholds (Laplacian variance for sharpness)
 MIN_SHARPNESS_SCORE = 30.0  # Reject blurry faces below this
@@ -305,6 +330,105 @@ def _grade_from_person_id(person_id: str) -> str | None:
     return grade
 
 
+async def _probe_channel_resolution(client: httpx.AsyncClient,
+                                     ip: str, port: int,
+                                     channel: int) -> tuple[int, int] | None:
+    """Query Hikvision ISAPI for a channel's native (max) resolution.
+
+    Probes /ISAPI/Streaming/channels/{stream}/capabilities to discover
+    the camera's actual resolution. Caches the result so we only probe once
+    per channel per session.
+
+    Returns (width, height) or None if the probe fails.
+    """
+    cam_key = f"{ip}:{channel}"
+    if cam_key in _channel_resolution_cache:
+        return _channel_resolution_cache[cam_key]
+
+    stream_channel = channel * 100 + 1
+    url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/"
+           f"{stream_channel}/capabilities")
+    try:
+        resp = await client.get(url)
+        if resp.status_code == 200:
+            body = resp.text
+            # Parse max resolution from XML: look for videoResolutionWidth/Height
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(body)
+            ns = ""
+            # Hikvision uses a namespace; detect it from the root tag
+            if root.tag.startswith("{"):
+                ns = root.tag.split("}")[0] + "}"
+            w_el = root.find(f".//{ns}videoResolutionWidth")
+            h_el = root.find(f".//{ns}videoResolutionHeight")
+            if w_el is not None and h_el is not None:
+                # The capabilities may have max attribute or text value
+                w_text = w_el.get("max") or w_el.text
+                h_text = h_el.get("max") or h_el.text
+                if w_text and h_text:
+                    w, h = int(w_text), int(h_text)
+                    _channel_resolution_cache[cam_key] = (w, h)
+                    logger.info(f"Camera {cam_key} native resolution: {w}x{h}")
+                    return (w, h)
+    except Exception as e:
+        logger.debug(f"Resolution probe failed for {cam_key}: {e}")
+
+    # Fallback: try /ISAPI/System/Video/inputs/channels/{channel}
+    try:
+        alt_url = f"http://{ip}:{port}/ISAPI/System/Video/inputs/channels/{channel}"
+        resp2 = await client.get(alt_url)
+        if resp2.status_code == 200:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(resp2.text)
+            ns = ""
+            if root.tag.startswith("{"):
+                ns = root.tag.split("}")[0] + "}"
+            res_w = root.find(f".//{ns}resolutionWidth")
+            res_h = root.find(f".//{ns}resolutionHeight")
+            if res_w is not None and res_h is not None:
+                w = int(res_w.text)
+                h = int(res_h.text)
+                _channel_resolution_cache[cam_key] = (w, h)
+                logger.info(f"Camera {cam_key} native resolution (alt): {w}x{h}")
+                return (w, h)
+    except Exception:
+        pass
+
+    _channel_resolution_cache[cam_key] = None
+    return None
+
+
+def _extract_padded_face_crop(image_bytes: bytes,
+                              top: int, right: int,
+                              bottom: int, left: int,
+                              padding: float = FACE_CROP_PADDING) -> bytes:
+    """Extract a face crop with extra padding for better recognition.
+
+    Expands the detected face bounding box by the padding fraction
+    to include forehead, chin, and ears. This gives the face encoder
+    more context and produces better embeddings.
+    """
+    if Image is None:
+        return image_bytes
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        w, h = img.size
+        face_w = right - left
+        face_h = bottom - top
+        pad_x = int(face_w * padding)
+        pad_y = int(face_h * padding)
+        crop_left = max(0, left - pad_x)
+        crop_top = max(0, top - pad_y)
+        crop_right = min(w, right + pad_x)
+        crop_bottom = min(h, bottom + pad_y)
+        crop = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=95)
+        return buf.getvalue()
+    except Exception:
+        return image_bytes
+
+
 def _preprocess_image(image_bytes: bytes) -> bytes:
     """Enhance image quality for better face recognition.
 
@@ -403,12 +527,12 @@ class AttendanceEngine:
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
         self.confidence_threshold = 0.35  # Student min confidence 35%
-        self.confidence_max = 0.50  # Student max confidence 50%
+        self.confidence_max = 0.75  # Student max confidence 75%
         self.review_threshold = 0.30  # Below 30% gets rejected outright
         self.min_sightings = 2  # Students: require 2 independent sightings
         self.sighting_window = 600  # 10-minute window for sightings to accumulate
         self.teacher_confidence_threshold = 0.35  # Teacher min threshold 35%
-        self.teacher_confidence_max = 0.45  # Teacher max threshold 45%
+        self.teacher_confidence_max = 0.75  # Teacher max threshold 75%
         self.entry_validated: dict[str, str] = {}  # person_id -> date (seen at entry/reception)
         self._sightings: dict[str, list[dict]] = {}  # person_id -> [{time, camera, confidence, embedding, face_size}, ...]
         self.known_faces: dict = {}
@@ -462,7 +586,7 @@ class AttendanceEngine:
             "uptime_start": datetime.now().isoformat(),
             "total_recoveries": 0,
             "auto_start_enabled": True,
-            "face_engine": "insightface" if _INSIGHTFACE_AVAILABLE else "face_recognition",
+            "face_engine": "face_recognition",  # insightface loaded lazily if needed
         }
         self._admin_alerted: set = set()  # Track which issues already alerted
         self._camera_alert_threshold = 5  # consecutive failures before alert
@@ -480,6 +604,8 @@ class AttendanceEngine:
         self._failsafe_recovery_count = 0  # consecutive successful cycles during failsafe
         self._last_dvrs: list[dict] = []
         self._last_camera_mapping: dict = {}
+        # HD resolution probe results: camera_label -> {width, height, probed}
+        self._camera_resolutions: dict[str, dict] = {}
 
         # Initialize InsightFace if available
         if self.use_insightface:
@@ -487,7 +613,7 @@ class AttendanceEngine:
 
     def _init_insightface(self):
         """Initialize the InsightFace face analysis engine."""
-        if not _INSIGHTFACE_AVAILABLE:
+        if not _check_insightface_available():
             return
         try:
             self._insightface_app = FaceAnalysis(
@@ -506,6 +632,38 @@ class AttendanceEngine:
             self._insightface_app = None
             self.use_insightface = False
             self._health["face_engine"] = "face_recognition"
+
+    async def probe_all_camera_resolutions(self, dvrs: list[dict],
+                                           camera_mapping: dict) -> dict:
+        """Probe native resolution for every mapped camera.
+
+        Returns a summary dict of camera_label -> {ip, channel, width, height}.
+        Useful for diagnostics: shows which cameras can deliver HD+ stills.
+        """
+        results: dict[str, dict] = {}
+        for label, cam_info in camera_mapping.items():
+            all_cams = cam_info.get("all_cameras", [cam_info])
+            for cam in all_cams:
+                dvr_idx = cam.get("dvr_index", 0)
+                if dvr_idx < 1 or dvr_idx > len(dvrs):
+                    continue
+                dvr = dvrs[dvr_idx - 1]
+                ch = cam.get("channel", 0)
+                desc = cam.get("description", label)
+                ip = dvr["ip"]
+                port = dvr.get("port", 80)
+                client = self._get_dvr_client(dvr)
+                res = await _probe_channel_resolution(client, ip, port, ch)
+                entry = {
+                    "ip": ip,
+                    "channel": ch,
+                    "width": res[0] if res else 1920,
+                    "height": res[1] if res else 1080,
+                    "native_probed": res is not None,
+                }
+                results[desc] = entry
+                self._camera_resolutions[desc] = entry
+        return results
 
     def _check_failsafe(self, cycle_errors: int, scanned: int) -> bool:
         """Check if failsafe mode should be activated.
@@ -771,17 +929,25 @@ class AttendanceEngine:
         faces_to_check = faces_subset if faces_subset is not None else self.known_faces
 
         # Load image: force to RGB uint8 numpy array
+        # Prefer cv2 decoder — it always produces dlib-compatible arrays.
+        # PIL + np.asarray can create arrays that dlib rejects on some
+        # numpy/dlib version combinations ("Unsupported image type").
+        img_array = None
         try:
-            pil_img = Image.open(io.BytesIO(image_bytes))
-            pil_img = pil_img.convert("RGB")
-            clean_buf = io.BytesIO()  # kept for del below
-            # Convert PIL image to numpy array directly (avoids dlib loader
-            # compatibility issues with numpy 2.x)
-            img_array = np.asarray(pil_img, dtype=np.uint8)
+            if cv2 is not None:
+                nparr = np.frombuffer(image_bytes, dtype=np.uint8)
+                bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if bgr is not None:
+                    img_array = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    img_array = np.ascontiguousarray(img_array, dtype=np.uint8)
+            # Fallback to PIL if cv2 unavailable or decode failed
+            if img_array is None:
+                pil_img = Image.open(io.BytesIO(image_bytes))
+                pil_img = pil_img.convert("RGB")
+                img_array = np.array(pil_img, dtype=np.uint8).copy()
+                del pil_img
             if img_array.ndim != 3 or img_array.shape[2] != 3:
                 raise ValueError(f"Bad image shape: {img_array.shape}")
-            # Ensure array is contiguous and writable (dlib requirement)
-            img_array = np.ascontiguousarray(img_array)
         except Exception as e:
             self.add_debug_log("error", f"Failed to load image: {e}")
             return []
@@ -796,9 +962,22 @@ class AttendanceEngine:
                 (d.top(), d.right(), d.bottom(), d.left()) for d in dlib_dets
             ]
         except Exception as e:
-            self.add_debug_log("error",
-                               f"Legacy face detection failed for {camera_source}: {e}")
-            return []
+            # Retry with grayscale — dlib also accepts 8-bit gray
+            try:
+                if cv2 is not None:
+                    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+                else:
+                    gray = np.mean(img_array, axis=2).astype(np.uint8)
+                gray = np.ascontiguousarray(gray)
+                dlib_dets = _detector(gray, 2)
+                face_locations = [
+                    (d.top(), d.right(), d.bottom(), d.left()) for d in dlib_dets
+                ]
+                logger.info("dlib face detection succeeded with grayscale fallback")
+            except Exception as e2:
+                self.add_debug_log("error",
+                                   f"Legacy face detection failed for {camera_source}: {e2}")
+                return []
 
         if not face_locations:
             if not self.classwise_running:
@@ -813,8 +992,6 @@ class AttendanceEngine:
 
         # Release the large image array to free memory
         del img_array
-        del pil_img
-        del clean_buf
 
         results = []
 
@@ -831,16 +1008,9 @@ class AttendanceEngine:
                 continue
 
             # Assess face crop quality (sharpness, brightness)
-            face_crop = image_bytes  # Use full image for quality check
-            try:
-                if Image is not None:
-                    pil_crop = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                    crop_region = pil_crop.crop((left, top, right, bottom))
-                    buf = io.BytesIO()
-                    crop_region.save(buf, format="JPEG", quality=95)
-                    face_crop = buf.getvalue()
-            except Exception:
-                pass
+            # Use padded crop for better quality assessment and encoding
+            face_crop = _extract_padded_face_crop(
+                image_bytes, top, right, bottom, left)
             quality = _assess_face_quality(face_crop)
             if not quality["is_acceptable"]:
                 self.add_debug_log("face_quality_rejected",
@@ -1203,35 +1373,21 @@ class AttendanceEngine:
     def _is_off_day(dt: datetime) -> bool:
         """Check if the given datetime falls on a school off-day.
 
-        Off-days: every Sunday + only the 2nd Saturday of each month.
-        All other Saturdays are working days.
+        Off-days: ALL Saturdays and Sundays (full weekends).
         """
-        if dt.weekday() == 6:  # Sunday
-            return True
-        if dt.weekday() == 5:  # Saturday
-            saturday_number = (dt.day - 1) // 7 + 1
-            return saturday_number == 2  # Only 2nd Saturday is off
-        return False
+        return dt.weekday() >= 5  # 5=Saturday, 6=Sunday
 
     def _is_within_attendance_window(self, person_id: str = "") -> bool:
         """Check if the current IST time is within the attendance window.
 
         Uses a shorter window (7:00-8:00) for teachers vs students (7:00-9:30).
-        Returns False on off-days (Sundays, 2nd Saturday) and holidays.
-        Students are blocked on ALL Saturdays and Sundays.
-        Teachers are only blocked on Sundays and 2nd Saturday.
+        Returns False on weekends (all Saturdays and Sundays) and holidays.
         """
         from datetime import timezone, timedelta as _td
         _ist = timezone(_td(hours=5, minutes=30))
         now = datetime.now(_ist)
 
-        is_student = not person_id.startswith(("TEACHER_", "PRINCIPAL_"))
-
-        # Students: block on ALL Saturdays and Sundays
-        if is_student and now.weekday() >= 5:  # 5=Saturday, 6=Sunday
-            return False
-
-        # Teachers: block on Sundays and 2nd Saturday only
+        # Block ALL attendance on weekends (Saturday + Sunday)
         if self._is_off_day(now):
             return False
 
@@ -2275,15 +2431,26 @@ class AttendanceEngine:
         """Capture a single frame from a Hikvision DVR via ISAPI snapshot.
 
         Uses persistent HTTP client with connection pooling for speed.
+        Probes the camera's native resolution on first call and requests
+        the highest available quality (up to 4MP if the camera supports it).
         """
         ip = dvr["ip"]
         port = dvr.get("port", 80)
 
+        client = self._get_dvr_client(dvr)
+
+        # Probe native resolution on first capture (cached per channel)
+        native_res = await _probe_channel_resolution(client, ip, port, channel)
+        if native_res:
+            req_w, req_h = native_res
+        else:
+            req_w, req_h = 1920, 1080  # default fallback
+
         stream_channel = channel * 100 + 1
         url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
-               f"?snapShotImageType=JPEG&videoResolutionWidth=1920&videoResolutionHeight=1080")
+               f"?snapShotImageType=JPEG"
+               f"&videoResolutionWidth={req_w}&videoResolutionHeight={req_h}")
 
-        client = self._get_dvr_client(dvr)
         for attempt in range(max_retries):
             try:
                 resp = await client.get(url)

@@ -17,27 +17,47 @@ from pathlib import Path
 
 import numpy as np
 
-try:
-    import dlib
-except ImportError:
-    dlib = None
-
+# Import order matters on Windows: face_recognition must be imported BEFORE
+# cv2 to avoid a silent C-level DLL conflict crash (exit code 1, zero output).
+# face_recognition internally loads dlib; loading cv2 first can corrupt the
+# dlib DLL state and cause face_recognition's import to segfault.
 try:
     import face_recognition
 except ImportError:
     face_recognition = None
 
 try:
+    import dlib
+except ImportError:
+    dlib = None
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
     from PIL import Image
 except ImportError:
     Image = None
 
-try:
-    from insightface.app import FaceAnalysis
-    _INSIGHTFACE_AVAILABLE = True
-except ImportError:
-    FaceAnalysis = None
-    _INSIGHTFACE_AVAILABLE = False
+# InsightFace imported lazily to avoid DLL conflict with dlib on Windows.
+# Importing both face_recognition (dlib) and insightface (onnxruntime) at
+# module level causes a silent C-level crash on some Windows configurations.
+FaceAnalysis = None
+_INSIGHTFACE_AVAILABLE = False
+
+def _check_insightface_available():
+    global FaceAnalysis, _INSIGHTFACE_AVAILABLE
+    if _INSIGHTFACE_AVAILABLE:
+        return True
+    try:
+        from insightface.app import FaceAnalysis as _FA
+        FaceAnalysis = _FA
+        _INSIGHTFACE_AVAILABLE = True
+        return True
+    except Exception:
+        return False
 
 import database as db
 
@@ -56,15 +76,30 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
         logger.error("face_recognition library not installed")
         return None
 
-    # Load image via PIL -> numpy (avoids dlib numpy ABI issues on Windows)
+    # Load image via cv2 (preferred — always dlib-compatible) or PIL fallback.
+    # PIL + np.asarray can create read-only arrays that dlib rejects on
+    # numpy 2.x ("Unsupported image type").
     try:
-        if Image is not None:
+        img_array = None
+        if cv2 is not None:
+            nparr = np.frombuffer(image_bytes, dtype=np.uint8)
+            bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if bgr is not None:
+                img_array = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                # Resize if too large
+                max_dim = 480
+                h, w = img_array.shape[:2]
+                if max(h, w) > max_dim:
+                    scale = max_dim / max(h, w)
+                    img_array = cv2.resize(img_array, (int(w * scale), int(h * scale)))
+                img_array = np.ascontiguousarray(img_array, dtype=np.uint8)
+        if img_array is None and Image is not None:
             pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             max_dim = 480
             if max(pil_img.size) > max_dim:
                 pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
-            img_array = np.asarray(pil_img, dtype=np.uint8)
-        else:
+            img_array = np.array(pil_img, dtype=np.uint8).copy()
+        if img_array is None:
             tmp_path = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
@@ -124,7 +159,7 @@ def _crop_face_jpeg(img_array: np.ndarray, location: tuple) -> bytes:
 
 def _get_insightface_app():
     """Lazily initialize and return a shared InsightFace FaceAnalysis instance."""
-    if not _INSIGHTFACE_AVAILABLE:
+    if not _check_insightface_available():
         return None
     if not hasattr(_get_insightface_app, "_app"):
         try:
@@ -149,10 +184,18 @@ def encode_face_insightface(image_bytes: bytes) -> tuple[np.ndarray, bytes] | No
         return None
 
     try:
-        pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        img_array = np.asarray(pil_img, dtype=np.uint8)
-        if img_array.ndim != 3 or img_array.shape[2] != 3:
-            logger.error(f"Bad image shape for InsightFace: {img_array.shape}")
+        img_array = None
+        if cv2 is not None:
+            nparr = np.frombuffer(image_bytes, dtype=np.uint8)
+            bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if bgr is not None:
+                img_array = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                img_array = np.ascontiguousarray(img_array, dtype=np.uint8)
+        if img_array is None and Image is not None:
+            pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            img_array = np.array(pil_img, dtype=np.uint8).copy()
+        if img_array is None or img_array.ndim != 3 or img_array.shape[2] != 3:
+            logger.error(f"Bad image shape for InsightFace: {getattr(img_array, 'shape', 'None')}")
             return None
         img_bgr = img_array[:, :, ::-1].copy()
     except Exception as e:
@@ -214,7 +257,7 @@ def register_face(person_id: str, name: str, role: str, phone: str,
     """
     # Always try legacy encoding (for backward compatibility)
     legacy_result = encode_face_from_image(image_bytes)
-    if legacy_result is None and not _INSIGHTFACE_AVAILABLE:
+    if legacy_result is None and not _check_insightface_available():
         return {"success": False, "error": "No face detected in image"}
 
     # Save cropped face image to disk
@@ -320,7 +363,7 @@ def migrate_to_insightface() -> dict:
 
     Returns summary dict.
     """
-    if not _INSIGHTFACE_AVAILABLE:
+    if not _check_insightface_available():
         return {"success": False, "error": "InsightFace not installed"}
 
     rows = db.get_all_face_encodings(encoding_type="face_recognition_128d")
