@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 # Suppress Windows crash dialogs so the process exits silently on errors
@@ -106,6 +106,8 @@ _ensure_dlib_compat()
 
 from attendance_engine import engine as attendance_engine
 import face_db
+from mood_detector import MoodDetector
+from teacher_sighting import TeacherSightingTracker
 
 try:
     from PIL import Image
@@ -122,6 +124,10 @@ logger = logging.getLogger("ppis-agent")
 # Configuration
 # ---------------------------------------------------------------------------
 CLOUD_API_BASE = "https://ppis-whatsapp-bot.fly.dev"
+
+# Mood detection and teacher sighting trackers
+mood_detector = MoodDetector(cloud_url=CLOUD_API_BASE)
+sighting_tracker = TeacherSightingTracker(cloud_url=CLOUD_API_BASE)
 CONFIG_FILE = Path(__file__).parent / "config.json"
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 SNAPSHOT_DIR.mkdir(exist_ok=True)
@@ -928,6 +934,28 @@ async def _auto_start_classwise():
         logger.error(f"AUTO-START FAILED: {e}", exc_info=True)
 
 
+async def _auto_start_mood_and_sighting():
+    """Auto-start mood detection and teacher sighting tracker after delay."""
+    try:
+        await asyncio.sleep(15)  # Let face sync and classwise start first
+
+        dvrs = config.get("dvrs", [])
+        camera_mapping = config.get("camera_mapping", {})
+        if not dvrs or not camera_mapping:
+            logger.warning("Mood/Sighting auto-start skipped: no DVRs or camera mapping")
+            return
+
+        agent_secret = config.get("agent_secret", os.environ.get("AGENT_SECRET", ""))
+        mood_detector.agent_secret = agent_secret
+        sighting_tracker.agent_secret = agent_secret
+
+        mood_detector.start(dvrs, camera_mapping)
+        sighting_tracker.start(dvrs, camera_mapping)
+        logger.info("AUTO-START: Mood detection + teacher sighting tracker started")
+    except Exception as e:
+        logger.error(f"Mood/Sighting auto-start failed: {e}", exc_info=True)
+
+
 async def _health_watchdog():
     """Background watchdog that monitors system health and auto-recovers.
 
@@ -1085,6 +1113,8 @@ async def lifespan(app: FastAPI):
     ws_task = asyncio.create_task(websocket_client())
     # Auto-start classwise monitoring after brief delay (24/7 always-on)
     asyncio.create_task(_auto_start_classwise())
+    # Auto-start mood detection and teacher sighting after delay
+    asyncio.create_task(_auto_start_mood_and_sighting())
     # Start health watchdog after 60 seconds (auto-recovery, face sync)
     async def _delayed_watchdog():
         try:
@@ -1102,6 +1132,8 @@ async def lifespan(app: FastAPI):
     finally:
         # Shutdown
         attendance_engine.stop()
+        mood_detector.stop()
+        sighting_tracker.stop()
         if ws_task:
             ws_task.cancel()
     logger.info("PPIS Campus Agent stopped")
@@ -1724,6 +1756,36 @@ async def stop_attendance_monitoring():
     """Stop attendance monitoring and disable auto-restart by the watchdog."""
     attendance_engine.stop()
     return {"status": "stopped", "auto_start_enabled": False}
+
+
+# ---------------------------------------------------------------------------
+# Mood Detection & Teacher Sighting Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/mood/status")
+async def mood_status():
+    """Get mood detection status."""
+    return {
+        "running": mood_detector.running,
+        "tracked_persons": list(mood_detector._tracked_encodings.keys()),
+        "cooldown_seconds": mood_detector._cooldown,
+        "last_observations": {
+            k: datetime.fromtimestamp(v).isoformat()
+            for k, v in mood_detector._last_observation.items()
+        } if mood_detector._last_observation else {},
+    }
+
+
+@app.get("/api/sighting/status")
+async def sighting_status():
+    """Get teacher sighting tracker status."""
+    return {
+        "running": sighting_tracker.running,
+        "teachers_loaded": len(sighting_tracker._teacher_encodings),
+        "today": sighting_tracker._today,
+        "sightings_today": len(sighting_tracker._daily_sightings),
+        "recent_sightings": sighting_tracker._daily_sightings[-10:],
+    }
 
 
 @app.post("/api/attendance/resend-notification")
