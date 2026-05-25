@@ -18,3 +18,4 @@ psutil>=5.9.0
 selenium>=4.15.0
 chromedriver-autoinstaller>=0.6.0
 ultralytics>=8.0.0
+deepface>=0.0.90
