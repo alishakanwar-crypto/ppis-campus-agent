@@ -54,12 +54,15 @@ DVR_DEFAULT_USER = "admin"
 DVR_CREDS: dict[str, dict[str, str]] = {}
 
 GATE_CAMERAS = [
-    {"channel": 20, "name": "ENTRY GATE-1", "dvr_ip": "192.168.0.14"},
-    {"channel": 16, "name": "ENTRY GATE-2", "dvr_ip": "192.168.0.14"},
-    {"channel": 54, "name": "Reception C1",  "dvr_ip": "192.168.0.12"},
-    {"channel": 55, "name": "Reception C2",  "dvr_ip": "192.168.0.12"},
-    {"channel": 53, "name": "Reception C3",  "dvr_ip": "192.168.0.12"},
-    {"channel": 52, "name": "Reception C4",  "dvr_ip": "192.168.0.12"},
+    {"channel": 20, "name": "ENTRY GATE-1",    "dvr_ip": "192.168.0.14"},
+    {"channel": 16, "name": "ENTRY GATE-2",    "dvr_ip": "192.168.0.14"},
+    {"channel": 54, "name": "Reception C1",    "dvr_ip": "192.168.0.12"},
+    {"channel": 55, "name": "Reception C2",    "dvr_ip": "192.168.0.12"},
+    {"channel": 53, "name": "Reception C3",    "dvr_ip": "192.168.0.12"},
+    {"channel": 52, "name": "Reception C4",    "dvr_ip": "192.168.0.12"},
+    {"channel": 35, "name": "Teacher Staff 1", "dvr_ip": "192.168.0.11"},
+    {"channel": 38, "name": "Teacher Staff 2", "dvr_ip": "192.168.0.11"},
+    {"channel": 23, "name": "Administration",  "dvr_ip": "192.168.0.14"},
 ]
 
 CLOUD_API = os.environ.get(
