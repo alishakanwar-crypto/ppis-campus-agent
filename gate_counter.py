@@ -1,7 +1,7 @@
 """
 Gate Head Count Counter
 =======================
-Captures frames from ENTRY GATE cameras on the school DVR,
+Captures frames from ENTRY GATE and RECEPTION cameras on school DVRs,
 detects people using YOLOv8-nano, tracks them across frames,
 and counts entries with attire color.
 
@@ -15,6 +15,10 @@ Usage:
 Cameras:
     ENTRY GATE-1: DVR 3 (192.168.0.14) Channel 20
     ENTRY GATE-2: DVR 3 (192.168.0.14) Channel 16
+    Reception C1: DVR 2 (192.168.0.12) Channel 54
+    Reception C2: DVR 2 (192.168.0.12) Channel 55
+    Reception C3: DVR 2 (192.168.0.12) Channel 53
+    Reception C4: DVR 2 (192.168.0.12) Channel 52
 
 All timestamps use IST (Asia/Kolkata, UTC+05:30).
 """
@@ -43,14 +47,19 @@ import numpy as np
 # Configuration
 # ---------------------------------------------------------------------------
 
-DVR_IP = os.environ.get("GATE_DVR_IP", "192.168.0.14")
 DVR_PORT = int(os.environ.get("GATE_DVR_PORT", "80"))
-DVR_USER = os.environ.get("GATE_DVR_USER", "admin")
-DVR_PASS = os.environ.get("GATE_DVR_PASS", "")
+DVR_DEFAULT_USER = "admin"
+
+# Per-DVR credentials: {ip: {"user": ..., "pass": ...}}
+DVR_CREDS: dict[str, dict[str, str]] = {}
 
 GATE_CAMERAS = [
-    {"channel": 20, "name": "ENTRY GATE-1"},
-    {"channel": 16, "name": "ENTRY GATE-2"},
+    {"channel": 20, "name": "ENTRY GATE-1", "dvr_ip": "192.168.0.14"},
+    {"channel": 16, "name": "ENTRY GATE-2", "dvr_ip": "192.168.0.14"},
+    {"channel": 54, "name": "Reception C1",  "dvr_ip": "192.168.0.12"},
+    {"channel": 55, "name": "Reception C2",  "dvr_ip": "192.168.0.12"},
+    {"channel": 53, "name": "Reception C3",  "dvr_ip": "192.168.0.12"},
+    {"channel": 52, "name": "Reception C4",  "dvr_ip": "192.168.0.12"},
 ]
 
 CLOUD_API = os.environ.get(
@@ -119,19 +128,23 @@ signal.signal(signal.SIGTERM, _handle_signal)
 # DVR Snapshot Capture (Hikvision ISAPI)
 # ---------------------------------------------------------------------------
 
-def capture_gate_frame(channel: int) -> np.ndarray | None:
-    """Capture a JPEG frame from the DVR gate camera and return as numpy array."""
+def capture_gate_frame(channel: int, dvr_ip: str = "192.168.0.14") -> np.ndarray | None:
+    """Capture a JPEG frame from a DVR camera and return as numpy array."""
     stream_channel = channel * 100 + 1
     url = (
-        f"http://{DVR_IP}:{DVR_PORT}/ISAPI/Streaming/channels/"
+        f"http://{dvr_ip}:{DVR_PORT}/ISAPI/Streaming/channels/"
         f"{stream_channel}/picture?snapShotImageType=JPEG"
     )
 
+    creds = DVR_CREDS.get(dvr_ip, {})
+    dvr_user = creds.get("user", DVR_DEFAULT_USER)
+    dvr_pass = creds.get("pass", "")
+
     try:
         with httpx.Client(timeout=10.0) as client:
-            resp = client.get(url, auth=httpx.DigestAuth(DVR_USER, DVR_PASS))
+            resp = client.get(url, auth=httpx.DigestAuth(dvr_user, dvr_pass))
             if resp.status_code == 401:
-                resp = client.get(url, auth=httpx.BasicAuth(DVR_USER, DVR_PASS))
+                resp = client.get(url, auth=httpx.BasicAuth(dvr_user, dvr_pass))
 
             if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
                 img_array = np.frombuffer(resp.content, dtype=np.uint8)
@@ -436,48 +449,57 @@ def send_gate_event(events: list[dict]) -> bool:
 # DVR Password Loader
 # ---------------------------------------------------------------------------
 
-def _load_from_dvr_list(dvrs: list[dict]) -> bool:
-    """Try to find DVR_IP in a list of DVR dicts and set credentials."""
-    global DVR_PASS, DVR_USER
+def _load_creds_from_dvr_list(dvrs: list[dict]) -> int:
+    """Load credentials for all monitored DVR IPs into DVR_CREDS. Returns count loaded."""
+    needed_ips = {cam["dvr_ip"] for cam in GATE_CAMERAS}
+    loaded = 0
     for dvr in dvrs:
-        if dvr.get("ip") == DVR_IP:
-            DVR_PASS = dvr.get("password", "")
-            usr = dvr.get("username", "")
-            if usr:
-                DVR_USER = usr
-            return bool(DVR_PASS)
-    return False
+        ip = dvr.get("ip", "")
+        if ip in needed_ips and ip not in DVR_CREDS:
+            pw = dvr.get("password", "")
+            if pw:
+                DVR_CREDS[ip] = {
+                    "user": dvr.get("username", DVR_DEFAULT_USER),
+                    "pass": pw,
+                }
+                loaded += 1
+    return loaded
 
 
-def load_dvr_password() -> str:
-    """Load DVR password — tries cloud config first, then local config.json."""
-    global DVR_PASS
+def load_dvr_passwords() -> None:
+    """Load DVR passwords for all monitored cameras — cloud first, then local."""
+    needed_ips = {cam["dvr_ip"] for cam in GATE_CAMERAS}
 
-    # 1. Try cloud config (same endpoint main.py uses)
+    # 1. Try cloud config
     cloud_url = "https://ppis-whatsapp-bot.fly.dev/api/agent-config/full"
     try:
         with httpx.Client(timeout=10.0) as client:
             resp = client.get(cloud_url)
             if resp.status_code == 200:
                 data = resp.json()
-                dvrs = data.get("dvrs", [])
-                if _load_from_dvr_list(dvrs):
-                    logger.info("DVR password loaded from cloud config for %s", DVR_IP)
-                    return DVR_PASS
+                n = _load_creds_from_dvr_list(data.get("dvrs", []))
+                if n:
+                    logger.info("Loaded %d DVR credential(s) from cloud config", n)
     except Exception as e:
         logger.warning("Could not fetch cloud config: %s", e)
 
-    # 2. Fall back to local config.json
-    config_path = Path(__file__).parent / "config.json"
-    if config_path.exists():
-        with open(config_path) as f:
-            cfg = json.load(f)
-        if _load_from_dvr_list(cfg.get("dvrs", [])):
-            logger.info("DVR password loaded from config.json for %s", DVR_IP)
-            return DVR_PASS
+    # 2. Fall back to local config.json for any missing
+    missing = needed_ips - set(DVR_CREDS.keys())
+    if missing:
+        config_path = Path(__file__).parent / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                cfg = json.load(f)
+            n = _load_creds_from_dvr_list(cfg.get("dvrs", []))
+            if n:
+                logger.info("Loaded %d DVR credential(s) from config.json", n)
 
-    logger.warning("No DVR password found for %s", DVR_IP)
-    return DVR_PASS
+    # Report status
+    for ip in needed_ips:
+        if ip in DVR_CREDS:
+            logger.info("DVR %s: credentials OK", ip)
+        else:
+            logger.warning("DVR %s: NO PASSWORD FOUND", ip)
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +518,8 @@ def run_gate_counter():
     """Main gate counting loop."""
     logger.info("=" * 60)
     logger.info("Gate Head Count Counter starting")
-    logger.info("DVR: %s:%d", DVR_IP, DVR_PORT)
+    dvr_ips = sorted({c["dvr_ip"] for c in GATE_CAMERAS})
+    logger.info("DVRs: %s", ", ".join(dvr_ips))
     logger.info("Cameras: %s", ", ".join(c["name"] for c in GATE_CAMERAS))
     logger.info("Poll interval: %d seconds", POLL_INTERVAL)
     logger.info("Monitoring: %02d:%02d - %02d:%02d IST",
@@ -504,11 +527,13 @@ def run_gate_counter():
                 MONITOR_END_HOUR, MONITOR_END_MIN)
     logger.info("=" * 60)
 
-    # Load DVR password from shared config
-    load_dvr_password()
+    # Load DVR passwords from shared config
+    load_dvr_passwords()
 
-    if not DVR_PASS:
-        logger.error("No DVR password configured. Set GATE_DVR_PASS or check config.json")
+    needed_ips = {c["dvr_ip"] for c in GATE_CAMERAS}
+    missing = needed_ips - set(DVR_CREDS.keys())
+    if missing:
+        logger.error("Missing DVR credentials for: %s", ", ".join(missing))
         sys.exit(1)
 
     # Initialize detector
@@ -566,7 +591,9 @@ def run_gate_counter():
             cam_name = cam["name"]
             channel = cam["channel"]
 
-            frame = capture_gate_frame(channel)
+            dvr_ip = cam["dvr_ip"]
+
+            frame = capture_gate_frame(channel, dvr_ip)
             if frame is None:
                 continue
 
@@ -646,18 +673,23 @@ def run_gate_counter():
 # ---------------------------------------------------------------------------
 
 def test_connectivity():
-    """Quick test: capture one frame from each gate camera."""
-    logger.info("Testing gate camera connectivity...")
-    load_dvr_password()
+    """Quick test: capture one frame from each camera."""
+    logger.info("Testing camera connectivity...")
+    load_dvr_passwords()
 
     for cam in GATE_CAMERAS:
-        frame = capture_gate_frame(cam["channel"])
+        dvr_ip = cam["dvr_ip"]
+        if dvr_ip not in DVR_CREDS:
+            logger.error("%s: SKIPPED — no credentials for DVR %s", cam["name"], dvr_ip)
+            continue
+        frame = capture_gate_frame(cam["channel"], dvr_ip)
         if frame is not None:
             logger.info(
-                "%s: OK — Frame %dx%d", cam["name"], frame.shape[1], frame.shape[0],
+                "%s (DVR %s): OK — Frame %dx%d",
+                cam["name"], dvr_ip, frame.shape[1], frame.shape[0],
             )
         else:
-            logger.error("%s: FAILED — Could not capture frame", cam["name"])
+            logger.error("%s (DVR %s): FAILED — Could not capture frame", cam["name"], dvr_ip)
 
     logger.info("Cloud API: %s", CLOUD_API)
     logger.info("Test complete.")
