@@ -226,8 +226,8 @@ MEAL_CAMP_ROOM_GRADES = {"GRADE1A", "GRADE1B", "GRADE2A", "GRADE2B",
 # Teachers and entry gate/reception scanning continue normally.
 # Format: list of (start_date, end_date, set_of_normalized_grade_prefixes)
 SUMMER_BREAK_SCHEDULE = [
-    # Popsicles through Grade 8: May 12 - June 30, 2026
-    ("2026-05-12", "2026-06-30", {
+    # ALL grades: May 25 - June 30, 2026 (summer break — all student attendance disabled)
+    ("2026-05-25", "2026-06-30", {
         "POPSICLES", "NUR", "NUR1", "NUR2", "NUR3",
         "PREP", "PREP1", "PREP2", "PREP3",
         "GRADE1A", "GRADE1B", "GRADE1C",
@@ -238,9 +238,6 @@ SUMMER_BREAK_SCHEDULE = [
         "GRADE6A", "GRADE6B", "GRADE6C",
         "GRADE7A", "GRADE7B", "GRADE7C",
         "GRADE8A", "GRADE8B", "GRADE8C",
-    }),
-    # Grade 9-12: May 27 - June 30, 2026 (last working day May 26)
-    ("2026-05-27", "2026-06-30", {
         "GRADE9A", "GRADE9B", "GRADE9C",
         "GRADE10A", "GRADE10B", "GRADE10C",
         "GRADE11A", "GRADE11B", "GRADE11C",
