@@ -1,9 +1,13 @@
 """
-Teacher Sighting Tracker for Head Count Reconciliation.
+Teacher Sighting & Visitor Tracker for Head Count Reconciliation.
 
 Periodically captures frames from DVR cameras (Entry Gate 1 & 2,
 Reception 1-4, Teacher Staff, Administration) and detects teacher
-faces. Sends sightings to the cloud backend for reconciliation
+faces. Also counts visitors — any face detected on gate/reception
+cameras that does not match a registered person (teacher, student,
+staff) is counted as a visitor.
+
+Sends sightings to the cloud backend for reconciliation
 against TrueFace attendance records.
 
 Does NOT mark attendance or send WhatsApp — that remains the
@@ -52,6 +56,16 @@ SIGHTING_SCAN_INTERVAL = 60
 # on the same camera
 SIGHTING_COOLDOWN = 300  # 5 minutes
 
+# Visitor cooldown: minimum seconds between counting a new visitor
+# on the same camera (avoids re-counting the same unknown face)
+VISITOR_COOLDOWN = 600  # 10 minutes
+
+# Cameras to monitor specifically for visitors (entry + reception only)
+VISITOR_CAMERA_KEYWORDS = [
+    "ENTRY", "ENTRANCE", "DISPERSAL",  # Entry gates
+    "RECEPTION",                         # Reception cameras
+]
+
 # Camera types to monitor for teacher sightings
 SIGHTING_CAMERA_KEYWORDS = [
     "ENTRY", "ENTRANCE", "DISPERSAL",  # Entry gates
@@ -67,8 +81,15 @@ def _is_sighting_camera(location: str) -> bool:
     return any(kw in loc_upper for kw in SIGHTING_CAMERA_KEYWORDS)
 
 
+def _is_visitor_camera(location: str) -> bool:
+    """Check if a camera location is relevant for visitor counting."""
+    loc_upper = location.upper()
+    return any(kw in loc_upper for kw in VISITOR_CAMERA_KEYWORDS)
+
+
 class TeacherSightingTracker:
-    """Tracks teacher appearances on DVR cameras for head count reconciliation."""
+    """Tracks teacher appearances on DVR cameras for head count reconciliation.
+    Also counts visitors (unknown faces) on gate/reception cameras."""
 
     def __init__(self, cloud_url: str = "https://ppis-whatsapp-bot.fly.dev",
                  agent_secret: str = ""):
@@ -78,21 +99,27 @@ class TeacherSightingTracker:
         self._task: asyncio.Task | None = None
         self._dvr_clients: dict[str, httpx.AsyncClient] = {}
         self._teacher_encodings: dict[str, dict] = {}
+        self._all_encodings: dict[str, dict] = {}  # all registered faces
         # Dedup: (person_id, camera_label) → last_sighting_timestamp
         self._last_sighting: dict[tuple[str, str], float] = {}
+        # Visitor dedup: camera_label → list of (encoding, timestamp) for recent visitors
+        self._recent_visitor_encodings: dict[str, list[tuple[np.ndarray, float]]] = {}
         # Daily sighting log for local tracking
         self._today: str = ""
         self._daily_sightings: list[dict] = []
+        self._daily_visitor_sightings: list[dict] = []
 
     def load_teacher_faces(self):
-        """Load face encodings for all teachers from the database."""
+        """Load face encodings for all teachers and all known persons."""
         all_faces = face_db.load_known_faces()
         self._teacher_encodings = {}
+        self._all_encodings = all_faces  # keep all for visitor detection
 
         for pid, data in all_faces.items():
             if pid.startswith(("TEACHER_", "PRINCIPAL_")):
                 self._teacher_encodings[pid] = data
-        logger.info(f"[SIGHTING] Loaded {len(self._teacher_encodings)} teacher faces")
+        logger.info(f"[SIGHTING] Loaded {len(self._teacher_encodings)} teacher faces, "
+                     f"{len(self._all_encodings)} total known faces")
 
     def _get_dvr_client(self, dvr: dict) -> httpx.AsyncClient:
         ip = dvr["ip"]
@@ -121,38 +148,45 @@ class TeacherSightingTracker:
             logger.debug(f"[SIGHTING] Capture failed {ip} ch{channel}: {e}")
         return None
 
+    def _decode_image(self, image_bytes: bytes):
+        """Decode image bytes to RGB numpy array and detect face locations/encodings."""
+        if face_recognition is None or cv2 is None:
+            return None, [], []
+        try:
+            nparr = np.frombuffer(image_bytes, dtype=np.uint8)
+            bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if bgr is None:
+                return None, [], []
+            img_array = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            img_array = np.ascontiguousarray(img_array, dtype=np.uint8)
+        except Exception:
+            return None, [], []
+
+        try:
+            face_locations = face_recognition.face_locations(img_array, model="hog")
+        except Exception:
+            return img_array, [], []
+
+        if not face_locations:
+            return img_array, [], []
+
+        try:
+            face_encodings = face_recognition.face_encodings(img_array, face_locations)
+        except Exception:
+            return img_array, face_locations, []
+
+        return img_array, face_locations, face_encodings
+
     def _detect_teachers(self, image_bytes: bytes) -> list[dict]:
         """Detect teacher faces in an image.
 
         Returns list of dicts with person_id, name, confidence, face_distance.
         """
-        if face_recognition is None or not self._teacher_encodings:
+        if not self._teacher_encodings:
             return []
 
-        try:
-            if cv2 is not None:
-                nparr = np.frombuffer(image_bytes, dtype=np.uint8)
-                bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                if bgr is None:
-                    return []
-                img_array = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                img_array = np.ascontiguousarray(img_array, dtype=np.uint8)
-            else:
-                return []
-        except Exception:
-            return []
-
-        try:
-            face_locations = face_recognition.face_locations(img_array, model="hog")
-        except Exception:
-            return []
-
-        if not face_locations:
-            return []
-
-        try:
-            face_encodings = face_recognition.face_encodings(img_array, face_locations)
-        except Exception:
+        _, _, face_encodings = self._decode_image(image_bytes)
+        if not face_encodings:
             return []
 
         results = []
@@ -181,6 +215,71 @@ class TeacherSightingTracker:
 
         return results
 
+    def _detect_faces_with_visitors(self, image_bytes: bytes) -> tuple[list[dict], list[np.ndarray]]:
+        """Detect all faces in an image. Returns (known_teachers, unknown_encodings).
+
+        Matches each face against ALL registered persons (teachers, students, staff).
+        Faces that don't match anyone are returned as unknown visitor encodings.
+        """
+        if not self._all_encodings:
+            return [], []
+
+        _, _, face_encodings = self._decode_image(image_bytes)
+        if not face_encodings:
+            return [], []
+
+        teachers = []
+        unknown_encodings = []
+
+        for encoding in face_encodings:
+            best_match = None
+            best_distance = 1.0
+
+            # Check against ALL known faces (teachers + students + staff + chairman)
+            for pid, data in self._all_encodings.items():
+                known_encs = data.get("encodings", [])
+                if not known_encs:
+                    continue
+                distances = face_recognition.face_distance(known_encs, encoding)
+                min_dist = float(np.min(distances))
+                if min_dist < best_distance:
+                    best_distance = min_dist
+                    best_match = pid
+
+            if best_match and best_distance < 0.50:
+                # Known person — check if teacher
+                if best_match.startswith(("TEACHER_", "PRINCIPAL_")):
+                    data = self._teacher_encodings.get(best_match, self._all_encodings.get(best_match, {}))
+                    teachers.append({
+                        "person_id": best_match,
+                        "name": data.get("name", best_match),
+                        "confidence": round(1.0 - best_distance, 3),
+                        "face_distance": round(best_distance, 3),
+                    })
+                # else: known student/staff — skip (not a visitor)
+            else:
+                # Unknown face — potential visitor
+                unknown_encodings.append(encoding)
+
+        return teachers, unknown_encodings
+
+    def _is_new_visitor(self, encoding: np.ndarray, cam_label: str, now_ts: float) -> bool:
+        """Check if a visitor encoding is distinct from recently seen visitors on this camera."""
+        recent = self._recent_visitor_encodings.get(cam_label, [])
+        # Prune expired entries
+        recent = [(enc, ts) for enc, ts in recent if now_ts - ts < VISITOR_COOLDOWN]
+        self._recent_visitor_encodings[cam_label] = recent
+
+        if not recent:
+            return True
+
+        # Check if this face is similar to any recently seen visitor
+        recent_encs = [enc for enc, _ in recent]
+        distances = face_recognition.face_distance(recent_encs, encoding)
+        if len(distances) > 0 and float(np.min(distances)) < 0.45:
+            return False  # Same visitor seen recently
+        return True
+
     async def _post_sightings(self, sightings: list[dict]):
         """Send teacher sightings to the cloud backend."""
         if not sightings:
@@ -204,6 +303,29 @@ class TeacherSightingTracker:
         except Exception as e:
             logger.warning(f"[SIGHTING] POST failed: {e}")
 
+    async def _post_visitor_sightings(self, visitors: list[dict]):
+        """Send visitor sightings to the cloud backend."""
+        if not visitors:
+            return
+
+        headers = {"Content-Type": "application/json"}
+        if self.agent_secret:
+            headers["X-Agent-Secret"] = self.agent_secret
+
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    f"{self.cloud_url}/api/gate/visitor-sighting",
+                    json=visitors,
+                    headers=headers,
+                )
+                if resp.status_code == 200:
+                    logger.info(f"[VISITOR] Posted {len(visitors)} visitor sighting(s)")
+                else:
+                    logger.warning(f"[VISITOR] POST failed: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"[VISITOR] POST failed: {e}")
+
     def _is_in_sighting_window(self) -> bool:
         now = datetime.now(IST)
         cur_mins = now.hour * 60 + now.minute
@@ -215,10 +337,11 @@ class TeacherSightingTracker:
         return datetime.now(IST).weekday() < 5
 
     async def scan_cameras_for_sightings(self, dvrs: list[dict],
-                                          camera_mapping: dict) -> list[dict]:
-        """Scan relevant cameras and detect teachers. Returns new sightings."""
+                                          camera_mapping: dict) -> tuple[list[dict], list[dict]]:
+        """Scan relevant cameras and detect teachers + visitors.
+        Returns (new_teacher_sightings, new_visitor_sightings)."""
         if not self._teacher_encodings:
-            return []
+            return [], []
 
         now = datetime.now(IST)
         now_ts = time.time()
@@ -229,11 +352,16 @@ class TeacherSightingTracker:
             self._today = today
             self._last_sighting.clear()
             self._daily_sightings.clear()
+            self._daily_visitor_sightings.clear()
+            self._recent_visitor_encodings.clear()
 
         new_sightings = []
+        new_visitors = []
 
         for location, cam_data in camera_mapping.items():
-            if not _is_sighting_camera(location):
+            is_teacher_cam = _is_sighting_camera(location)
+            is_visitor_cam = _is_visitor_camera(location)
+            if not is_teacher_cam and not is_visitor_cam:
                 continue
 
             all_cams = cam_data.get("all_cameras", [])
@@ -251,9 +379,17 @@ class TeacherSightingTracker:
                     continue
 
                 cam_label = f"{location} (DVR {dvr_idx + 1} Ch {channel})"
-                detections = self._detect_teachers(frame)
 
-                for det in detections:
+                if is_visitor_cam:
+                    # On visitor-eligible cameras: detect teachers + visitors
+                    teachers, unknown_encs = self._detect_faces_with_visitors(frame)
+                else:
+                    # On teacher-only cameras (staff rooms, admin): only detect teachers
+                    teachers = self._detect_teachers(frame)
+                    unknown_encs = []
+
+                # Process teacher detections
+                for det in teachers:
                     pid = det["person_id"]
                     key = (pid, cam_label)
 
@@ -277,7 +413,25 @@ class TeacherSightingTracker:
                         f"[SIGHTING] {det['name']} on {cam_label} "
                         f"(conf={det['confidence']:.2f})")
 
-        return new_sightings
+                # Process visitor (unknown) detections
+                for enc in unknown_encs:
+                    if not self._is_new_visitor(enc, cam_label, now_ts):
+                        continue
+                    # Record this visitor encoding for dedup
+                    self._recent_visitor_encodings.setdefault(cam_label, []).append(
+                        (enc, now_ts))
+
+                    visitor = {
+                        "camera": cam_label,
+                        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "date": today,
+                    }
+                    new_visitors.append(visitor)
+                    self._daily_visitor_sightings.append(visitor)
+
+                    logger.info(f"[VISITOR] Unknown face on {cam_label}")
+
+        return new_sightings, new_visitors
 
     async def sighting_monitoring_loop(self, dvrs: list[dict],
                                         camera_mapping: dict):
@@ -306,9 +460,11 @@ class TeacherSightingTracker:
                     await asyncio.sleep(30)
                     continue
 
-                sightings = await self.scan_cameras_for_sightings(dvrs, camera_mapping)
+                sightings, visitors = await self.scan_cameras_for_sightings(dvrs, camera_mapping)
                 if sightings:
                     await self._post_sightings(sightings)
+                if visitors:
+                    await self._post_visitor_sightings(visitors)
 
                 # Reload faces periodically
                 if cycle % 30 == 0:

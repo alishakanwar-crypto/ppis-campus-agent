@@ -1778,13 +1778,16 @@ async def mood_status():
 
 @app.get("/api/sighting/status")
 async def sighting_status():
-    """Get teacher sighting tracker status."""
+    """Get teacher sighting tracker + visitor tracking status."""
     return {
         "running": sighting_tracker.running,
         "teachers_loaded": len(sighting_tracker._teacher_encodings),
+        "total_known_faces": len(sighting_tracker._all_encodings),
         "today": sighting_tracker._today,
         "sightings_today": len(sighting_tracker._daily_sightings),
+        "visitors_today": len(sighting_tracker._daily_visitor_sightings),
         "recent_sightings": sighting_tracker._daily_sightings[-10:],
+        "recent_visitors": sighting_tracker._daily_visitor_sightings[-10:],
     }
 
 
