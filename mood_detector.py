@@ -55,15 +55,16 @@ MOOD_SCAN_INTERVAL = 30
 
 # Tracked persons — person_ids in the face database that we monitor
 TRACKED_PERSONS = {
-    "chairman": ["PRINCIPAL_RAHUL_GUPTA", "TEACHER_RAHUL_GUPTA",
-                  "CHAIRMAN", "CHAIRMAN_RAHUL"],
+    "chairman": ["CHAIRMAN_RAHUL_GUPTA", "PRINCIPAL_RAHUL_GUPTA",
+                  "TEACHER_RAHUL_GUPTA", "CHAIRMAN", "CHAIRMAN_RAHUL"],
     "alisha": ["TEACHER_ALISHA_KANWAR", "TEACHER_ALISHA",
-               "ALISHA", "ALISHA_KANWAR"],
+               "ALISHA", "ALISHA_KANWAR", "TEACHER_ALISHA_AHUJA"],
 }
 
 # Camera types to monitor for mood (location keywords)
 MOOD_CAMERA_KEYWORDS = [
-    "RECEPTION", "ADMISSION", "ADMINISTRATION",
+    "ENTRY", "ENTRANCE",                          # Entry gates
+    "RECEPTION", "ADMISSION", "ADMINISTRATION",    # Indoor cameras
 ]
 
 # Simple emotion labels (OpenCV DNN or heuristic fallback)
