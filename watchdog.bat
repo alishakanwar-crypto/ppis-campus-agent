@@ -10,24 +10,39 @@ cd /d "%~dp0"
 
 REM Log file for watchdog events
 set LOGFILE=%~dp0watchdog.log
+set NEED_AGENT=0
+set NEED_TRUEFACE=0
 
-REM Check if python.exe is running
-tasklist /fi "imagename eq python.exe" 2>nul | find /i "python.exe" >nul
-if %ERRORLEVEL% EQU 0 (
-    REM Agent is running — do nothing
-    exit /b 0
+REM Check if campus agent (main.py) is running
+wmic process where "name='python.exe'" get commandline 2>nul | find /i "main.py" >nul
+if %ERRORLEVEL% NEQ 0 (
+    set NEED_AGENT=1
 )
 
-REM Agent is NOT running — restart it
-echo [%DATE% %TIME%] WATCHDOG: Agent not running, restarting... >> "%LOGFILE%"
+REM Check if TrueFace poller (trueface_poller.py) is running
+wmic process where "name='python.exe'" get commandline 2>nul | find /i "trueface_poller" >nul
+if %ERRORLEVEL% NEQ 0 (
+    set NEED_TRUEFACE=1
+)
 
-REM Also check if run_forever.bat is somehow stuck — kill stale wscript
-taskkill /F /IM wscript.exe /FI "WINDOWTITLE eq *" >nul 2>&1
+REM If both are running, do nothing
+if "%NEED_AGENT%"=="0" if "%NEED_TRUEFACE%"=="0" exit /b 0
 
-REM Start the agent via the hidden runner
-start "" /B wscript.exe "%~dp0run_hidden.vbs"
+REM Restart campus agent if needed
+if "%NEED_AGENT%"=="1" (
+    echo [%DATE% %TIME%] WATCHDOG: Campus agent not running, restarting... >> "%LOGFILE%"
+    REM Clean stale lock file
+    if exist "%~dp0.agent_lock" del "%~dp0.agent_lock" >nul 2>&1
+    start "" /B wscript.exe "%~dp0run_hidden.vbs"
+    echo [%DATE% %TIME%] WATCHDOG: Campus agent restart triggered >> "%LOGFILE%"
+)
 
-echo [%DATE% %TIME%] WATCHDOG: Restart triggered via run_hidden.vbs >> "%LOGFILE%"
+REM Restart TrueFace poller if needed
+if "%NEED_TRUEFACE%"=="1" (
+    echo [%DATE% %TIME%] WATCHDOG: TrueFace poller not running, restarting... >> "%LOGFILE%"
+    start "" /B wscript.exe "%~dp0run_trueface_hidden.vbs"
+    echo [%DATE% %TIME%] WATCHDOG: TrueFace poller restart triggered >> "%LOGFILE%"
+)
 
 REM Keep log file from growing too large (rotate at 500 lines)
 if exist "%LOGFILE%" (

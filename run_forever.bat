@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 REM PPIS Campus Agent — Auto-restart wrapper
 REM Features:
 REM   - Auto-restarts if the agent crashes
@@ -10,13 +11,23 @@ REM   - Cleans up old snapshot files to prevent disk fill
 title PPIS Campus Agent (24/7)
 cd /d "%~dp0"
 
-REM Prevent multiple instances of run_forever.bat
+REM Prevent multiple instances — check if python main.py is actually running
 set "LOCKFILE=%~dp0.agent_lock"
 if exist "%LOCKFILE%" (
-    echo Another run_forever.bat is already running! Exiting this instance.
-    echo If that's wrong, delete %LOCKFILE% and retry.
-    timeout /t 5
-    exit /b 1
+    REM Lock file exists — but is a campus agent actually running?
+    tasklist /fi "imagename eq python.exe" 2>nul | find /i "python.exe" >nul
+    if !ERRORLEVEL! EQU 0 (
+        REM Python is running — check if main.py is among them
+        wmic process where "name='python.exe'" get commandline 2>nul | find /i "main.py" >nul
+        if !ERRORLEVEL! EQU 0 (
+            echo Another campus agent is already running! Exiting this instance.
+            timeout /t 5
+            exit /b 1
+        )
+    )
+    REM Stale lock file from previous session — clean up and continue
+    echo Cleaning stale lock file from previous session...
+    del "%LOCKFILE%" >nul 2>&1
 )
 echo %DATE% %TIME% > "%LOCKFILE%"
 
