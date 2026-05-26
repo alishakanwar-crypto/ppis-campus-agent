@@ -87,6 +87,95 @@ def _is_visitor_camera(location: str) -> bool:
     return any(kw in loc_upper for kw in VISITOR_CAMERA_KEYWORDS)
 
 
+# Color name mapping from HSV ranges
+_COLOR_RANGES = [
+    ((0, 50, 50), (10, 255, 255), "red"),
+    ((170, 50, 50), (180, 255, 255), "red"),
+    ((11, 50, 50), (25, 255, 255), "orange"),
+    ((26, 50, 50), (34, 255, 255), "yellow"),
+    ((35, 50, 50), (85, 255, 255), "green"),
+    ((86, 50, 50), (125, 255, 255), "blue"),
+    ((126, 50, 50), (155, 255, 255), "purple"),
+    ((156, 50, 50), (169, 255, 255), "pink"),
+]
+
+
+def _detect_outfit_color(bgr_image: np.ndarray, face_top: int, face_bottom: int,
+                          face_left: int, face_right: int) -> dict:
+    """Analyze the clothing region below a detected face to identify outfit color.
+
+    Returns dict with dominant_color, colors list, and description.
+    """
+    if cv2 is None:
+        return {"dominant_color": "unknown", "colors": [], "description": "unknown"}
+
+    h, w = bgr_image.shape[:2]
+    face_h = face_bottom - face_top
+    face_w = face_right - face_left
+
+    # Body region: below face, roughly 1.5x face height, wider than face
+    body_top = min(face_bottom, h - 1)
+    body_bottom = min(face_bottom + int(face_h * 1.5), h)
+    body_left = max(0, face_left - int(face_w * 0.3))
+    body_right = min(w, face_right + int(face_w * 0.3))
+
+    if body_bottom - body_top < 10 or body_right - body_left < 10:
+        return {"dominant_color": "unknown", "colors": [], "description": "unknown"}
+
+    body_roi = bgr_image[body_top:body_bottom, body_left:body_right]
+    hsv = cv2.cvtColor(body_roi, cv2.COLOR_BGR2HSV)
+    total_pixels = hsv.shape[0] * hsv.shape[1]
+
+    # Check for achromatic colors first (white, black, gray)
+    gray_mask = hsv[:, :, 1] < 50  # low saturation
+    bright = hsv[:, :, 2]
+    black_pixels = int(np.sum(gray_mask & (bright < 60)))
+    white_pixels = int(np.sum(gray_mask & (bright > 180)))
+    gray_pixels = int(np.sum(gray_mask & (bright >= 60) & (bright <= 180)))
+
+    color_counts: dict[str, int] = {}
+    if black_pixels > 0:
+        color_counts["black"] = black_pixels
+    if white_pixels > 0:
+        color_counts["white"] = white_pixels
+    if gray_pixels > 0:
+        color_counts["gray"] = gray_pixels
+
+    # Check chromatic colors
+    for lower, upper, color_name in _COLOR_RANGES:
+        mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+        count = int(cv2.countNonZero(mask))
+        if count > 0:
+            color_counts[color_name] = color_counts.get(color_name, 0) + count
+
+    if not color_counts:
+        return {"dominant_color": "unknown", "colors": [], "description": "unknown"}
+
+    sorted_colors = sorted(color_counts.items(), key=lambda x: -x[1])
+    dominant = sorted_colors[0][0]
+
+    # Build color list with percentages (top 3)
+    colors = []
+    for name, count in sorted_colors[:3]:
+        pct = round(count / total_pixels * 100, 1)
+        if pct >= 5:
+            colors.append({"color": name, "percentage": pct})
+
+    # Build description
+    if len(colors) == 1:
+        description = colors[0]["color"]
+    elif len(colors) >= 2:
+        description = f"{colors[0]['color']} and {colors[1]['color']}"
+    else:
+        description = dominant
+
+    return {
+        "dominant_color": dominant,
+        "colors": colors,
+        "description": description,
+    }
+
+
 class TeacherSightingTracker:
     """Tracks teacher appearances on DVR cameras for head count reconciliation.
     Also counts visitors (unknown faces) on gate/reception cameras."""
@@ -180,17 +269,22 @@ class TeacherSightingTracker:
     def _detect_teachers(self, image_bytes: bytes) -> list[dict]:
         """Detect teacher faces in an image.
 
-        Returns list of dicts with person_id, name, confidence, face_distance.
+        Returns list of dicts with person_id, name, confidence, face_distance, outfit.
         """
         if not self._teacher_encodings:
             return []
 
-        _, _, face_encodings = self._decode_image(image_bytes)
+        img_array, face_locations, face_encodings = self._decode_image(image_bytes)
         if not face_encodings:
             return []
 
+        # Get BGR image for outfit detection
+        bgr_img = None
+        if cv2 is not None and img_array is not None:
+            bgr_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+
         results = []
-        for encoding in face_encodings:
+        for i, encoding in enumerate(face_encodings):
             best_match = None
             best_distance = 1.0
 
@@ -206,12 +300,22 @@ class TeacherSightingTracker:
 
             if best_match and best_distance < 0.50:
                 data = self._teacher_encodings[best_match]
-                results.append({
+                result = {
                     "person_id": best_match,
                     "name": data.get("name", best_match),
                     "confidence": round(1.0 - best_distance, 3),
                     "face_distance": round(best_distance, 3),
-                })
+                }
+
+                # Detect outfit color from body region below face
+                if bgr_img is not None and i < len(face_locations):
+                    top, right, bottom, left = face_locations[i]
+                    outfit = _detect_outfit_color(bgr_img, top, bottom, left, right)
+                    result["outfit"] = outfit
+                else:
+                    result["outfit"] = {"dominant_color": "unknown", "colors": [], "description": "unknown"}
+
+                results.append(result)
 
         return results
 
@@ -224,14 +328,19 @@ class TeacherSightingTracker:
         if not self._all_encodings:
             return [], []
 
-        _, _, face_encodings = self._decode_image(image_bytes)
+        img_array, face_locations, face_encodings = self._decode_image(image_bytes)
         if not face_encodings:
             return [], []
+
+        # Get BGR image for outfit detection
+        bgr_img = None
+        if cv2 is not None and img_array is not None:
+            bgr_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
         teachers = []
         unknown_encodings = []
 
-        for encoding in face_encodings:
+        for i, encoding in enumerate(face_encodings):
             best_match = None
             best_distance = 1.0
 
@@ -250,12 +359,22 @@ class TeacherSightingTracker:
                 # Known person — check if teacher
                 if best_match.startswith(("TEACHER_", "PRINCIPAL_")):
                     data = self._teacher_encodings.get(best_match, self._all_encodings.get(best_match, {}))
-                    teachers.append({
+                    result = {
                         "person_id": best_match,
                         "name": data.get("name", best_match),
                         "confidence": round(1.0 - best_distance, 3),
                         "face_distance": round(best_distance, 3),
-                    })
+                    }
+
+                    # Detect outfit color from body region below face
+                    if bgr_img is not None and i < len(face_locations):
+                        top, right, bottom, left = face_locations[i]
+                        outfit = _detect_outfit_color(bgr_img, top, bottom, left, right)
+                        result["outfit"] = outfit
+                    else:
+                        result["outfit"] = {"dominant_color": "unknown", "colors": [], "description": "unknown"}
+
+                    teachers.append(result)
                 # else: known student/staff — skip (not a visitor)
             else:
                 # Unknown face — potential visitor
@@ -398,6 +517,7 @@ class TeacherSightingTracker:
                         continue
                     self._last_sighting[key] = now_ts
 
+                    outfit = det.get("outfit", {})
                     sighting = {
                         "person_id": pid,
                         "name": det["name"],
@@ -405,13 +525,17 @@ class TeacherSightingTracker:
                         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                         "date": today,
                         "confidence": det["confidence"],
+                        "outfit_color": outfit.get("dominant_color", "unknown"),
+                        "outfit_colors": outfit.get("colors", []),
+                        "outfit_description": outfit.get("description", "unknown"),
                     }
                     new_sightings.append(sighting)
                     self._daily_sightings.append(sighting)
 
                     logger.info(
                         f"[SIGHTING] {det['name']} on {cam_label} "
-                        f"(conf={det['confidence']:.2f})")
+                        f"(conf={det['confidence']:.2f}, "
+                        f"outfit={outfit.get('description', 'unknown')})")
 
                 # Process visitor (unknown) detections
                 for enc in unknown_encs:
