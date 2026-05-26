@@ -766,6 +766,15 @@ def run_poller():
 
     while running:
         try:
+            # Skip Sundays — no teacher attendance on TrueFace
+            now_ist = datetime.now(IST)
+            if now_ist.weekday() == 6:  # Sunday
+                if poll_count <= 1 or poll_count % 600 == 0:
+                    logger.info("Sunday — TrueFace attendance disabled. Sleeping...")
+                poll_count += 1
+                time.sleep(60)
+                continue
+
             # Create driver if needed
             if driver is None:
                 logger.info("Starting headless Chrome...")
