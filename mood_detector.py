@@ -90,6 +90,89 @@ def _temperament_from_emotion(emotion: str, intensity: float) -> str:
     return "neutral"
 
 
+# ── Enhanced mood classification ──────────────────────────────
+MOOD_CATEGORY_MAP = {
+    "happy":    ("Positive", "Happy"),
+    "surprise": ("Positive", "Excited"),
+    "neutral":  ("Neutral", "Normal"),
+    "sad":      ("Negative", "Sad"),
+    "angry":    ("Negative", "Angry"),
+    "fear":     ("Negative", "Anxious"),
+    "disgust":  ("Negative", "Stressed"),
+}
+
+# Risk thresholds based on accumulated negative readings
+HIGH_RISK_EMOTIONS = {"angry", "fear", "sad", "disgust"}
+
+
+def _classify_mood_level(emotion: str, intensity: float,
+                         negative_ratio: float = 0.0) -> str:
+    """Classify into Positive / Neutral / Negative / High-Risk."""
+    if negative_ratio > 0.7 and intensity > 0.5:
+        return "High-Risk"
+    cat = MOOD_CATEGORY_MAP.get(emotion, ("Neutral", "Normal"))[0]
+    return cat
+
+
+def _aggregate_emotions(frames: list[dict]) -> dict:
+    """Aggregate emotion data across multiple frames.
+
+    Returns a consolidated emotion observation with:
+    - dominant_emotion from majority vote
+    - averaged intensity
+    - mood_category (Positive/Neutral/Negative/High-Risk)
+    - confidence score based on frame agreement
+    """
+    if not frames:
+        return {
+            "dominant_emotion": "neutral",
+            "emotions": {e: 0.0 for e in EMOTION_LABELS},
+            "intensity": 0.0,
+            "mood_category": "Neutral",
+            "mood_label": "Normal",
+            "frame_count": 0,
+            "agreement": 0.0,
+            "negative_ratio": 0.0,
+        }
+
+    from collections import Counter
+
+    # Majority vote on dominant emotion
+    emotion_votes = [f["dominant_emotion"] for f in frames]
+    vote_counts = Counter(emotion_votes)
+    dominant = vote_counts.most_common(1)[0][0]
+    agreement = vote_counts[dominant] / len(frames)
+
+    # Average intensity
+    avg_intensity = sum(f["intensity"] for f in frames) / len(frames)
+
+    # Average emotion distribution
+    avg_emotions: dict[str, float] = {e: 0.0 for e in EMOTION_LABELS}
+    for f in frames:
+        for e, v in f.get("emotions", {}).items():
+            if e in avg_emotions:
+                avg_emotions[e] += v / len(frames)
+
+    # Negative ratio
+    neg_count = sum(1 for e in emotion_votes if e in HIGH_RISK_EMOTIONS)
+    negative_ratio = neg_count / len(frames)
+
+    # Classify mood level
+    mood_category = _classify_mood_level(dominant, avg_intensity, negative_ratio)
+    mood_label = MOOD_CATEGORY_MAP.get(dominant, ("Neutral", "Normal"))[1]
+
+    return {
+        "dominant_emotion": dominant,
+        "emotions": avg_emotions,
+        "intensity": round(avg_intensity, 3),
+        "mood_category": mood_category,
+        "mood_label": mood_label,
+        "frame_count": len(frames),
+        "agreement": round(agreement, 2),
+        "negative_ratio": round(negative_ratio, 2),
+    }
+
+
 class MoodDetector:
     """Detects mood/temperament of tracked persons from DVR cameras."""
 
@@ -106,6 +189,12 @@ class MoodDetector:
         self._last_observation: dict[str, float] = {}
         self._cooldown = 120  # seconds between observations for same person
         self._debug_logs: list[dict] = []
+        # Multi-frame accumulation: collect N frames before concluding mood
+        self._frame_buffer: dict[str, list[dict]] = {}  # person -> list of emotion_data
+        self._min_frames = 3  # require at least 3 frames before posting
+        self._max_frames = 5  # post after collecting 5 frames
+        self._buffer_timeout = 60  # seconds — post even with fewer frames
+        self._buffer_start: dict[str, float] = {}  # person -> first frame time
 
     def _load_emotion_model(self):
         """Load a lightweight emotion classifier.
@@ -358,6 +447,11 @@ class MoodDetector:
             "face_distance": face_distance,
             "face_confidence": confidence,
             "face_crop": face_crop,
+            "mood_category": emotion_data.get("mood_category", "Neutral"),
+            "mood_label": emotion_data.get("mood_label", "Normal"),
+            "frame_count": emotion_data.get("frame_count", 1),
+            "agreement": emotion_data.get("agreement", 0.0),
+            "negative_ratio": emotion_data.get("negative_ratio", 0.0),
         }
 
         headers = {"Content-Type": "application/json"}
@@ -424,25 +518,51 @@ class MoodDetector:
                 for det in detections:
                     person_label = det["person_label"]
 
-                    # Cooldown check
-                    now = time.time()
+                    # Cooldown check — skip if we recently posted for this person
+                    now_ts = time.time()
                     last = self._last_observation.get(person_label, 0)
-                    if now - last < self._cooldown:
+                    if now_ts - last < self._cooldown:
                         continue
-                    self._last_observation[person_label] = now
 
-                    # Analyze emotion
+                    # Analyze emotion for this frame
                     emotion_data = self._analyze_emotion(frame)
 
-                    await self._post_mood_observation(
-                        person_label=person_label,
-                        name=det["name"],
-                        camera=cam_label,
-                        emotion_data=emotion_data,
-                        face_distance=det["face_distance"],
-                        confidence=det["confidence"],
-                        face_crop=det.get("face_crop", ""),
+                    # Accumulate into frame buffer
+                    if person_label not in self._frame_buffer:
+                        self._frame_buffer[person_label] = []
+                        self._buffer_start[person_label] = now_ts
+                    self._frame_buffer[person_label].append(emotion_data)
+
+                    buf = self._frame_buffer[person_label]
+                    elapsed = now_ts - self._buffer_start.get(person_label, now_ts)
+                    should_post = (
+                        len(buf) >= self._max_frames or
+                        (len(buf) >= self._min_frames and elapsed >= self._buffer_timeout)
                     )
+
+                    if should_post:
+                        # Aggregate multi-frame data and post
+                        aggregated = _aggregate_emotions(buf)
+                        self._frame_buffer.pop(person_label, None)
+                        self._buffer_start.pop(person_label, None)
+                        self._last_observation[person_label] = now_ts
+
+                        logger.info(
+                            f"[MOOD] Multi-frame: {person_label} — "
+                            f"{aggregated['dominant_emotion']} "
+                            f"({aggregated['mood_category']}) "
+                            f"from {aggregated['frame_count']} frames, "
+                            f"agreement={aggregated['agreement']:.0%}")
+
+                        await self._post_mood_observation(
+                            person_label=person_label,
+                            name=det["name"],
+                            camera=cam_label,
+                            emotion_data=aggregated,
+                            face_distance=det["face_distance"],
+                            confidence=det["confidence"],
+                            face_crop=det.get("face_crop", ""),
+                        )
 
     async def mood_monitoring_loop(self, dvrs: list[dict],
                                     camera_mapping: dict):
