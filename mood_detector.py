@@ -63,8 +63,12 @@ TRACKED_PERSONS = {
 
 # Camera types to monitor for mood (location keywords)
 MOOD_CAMERA_KEYWORDS = [
-    "ENTRY", "ENTRANCE",                          # Entry gates
-    "RECEPTION", "ADMISSION", "ADMINISTRATION",    # Indoor cameras
+    "RECEPTION", "ADMISSION", "ADMINISTRATION",    # Indoor cameras only
+]
+
+# Camera locations to explicitly exclude from mood detection
+MOOD_CAMERA_EXCLUDES = [
+    "ADMIN ROOM",
 ]
 
 # Simple emotion labels (OpenCV DNN or heuristic fallback)
@@ -76,6 +80,8 @@ EMOTION_LABELS = [
 def _classify_mood_camera(location: str) -> bool:
     """Check if a camera location is relevant for mood detection."""
     loc_upper = location.upper()
+    if any(ex in loc_upper for ex in MOOD_CAMERA_EXCLUDES):
+        return False
     return any(kw in loc_upper for kw in MOOD_CAMERA_KEYWORDS)
 
 
