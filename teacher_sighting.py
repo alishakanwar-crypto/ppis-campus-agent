@@ -72,6 +72,7 @@ SIGHTING_CAMERA_KEYWORDS = [
     "RECEPTION",                         # Reception cameras
     "TEACHER STAFF", "STAFF ROOM",       # Staff rooms
     "ADMINISTRATION", "ADMIN",           # Administration
+    "ADMISSION",                         # Admission room
 ]
 
 
