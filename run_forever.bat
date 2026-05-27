@@ -64,8 +64,8 @@ if exist "%~dp0__pycache__" rmdir /s /q "%~dp0__pycache__" 2>nul
 
 REM Clean up old snapshot files (older than 1 day) to prevent disk fill
 echo [%DATE% %TIME%] Cleaning old snapshots...
-forfiles /p "%~dp0snapshots" /d -1 /c "cmd /c del @path" 2>nul
-forfiles /p "%~dp0attendance_snapshots" /d -1 /c "cmd /c del @path" 2>nul
+forfiles /p "%~dp0snapshots" /d -1 /m *.* /c "cmd /c del /Q @path" 2>nul
+forfiles /p "%~dp0attendance_snapshots" /d -1 /m *.* /c "cmd /c del /Q @path" 2>nul
 
 echo.
 echo [%DATE% %TIME%] Starting PPIS Campus Agent...
