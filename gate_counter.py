@@ -19,6 +19,7 @@ Cameras:
     Reception C2: DVR 2 (192.168.0.12) Channel 55
     Reception C3: DVR 2 (192.168.0.12) Channel 53
     Reception C4: DVR 2 (192.168.0.12) Channel 52
+    DISPERSAL EXIT: DVR 2 (192.168.0.12) Channel 8
 
 All timestamps use IST (Asia/Kolkata, UTC+05:30).
 """
@@ -63,6 +64,7 @@ GATE_CAMERAS = [
     {"channel": 35, "name": "Teacher Staff 1", "dvr_ip": "192.168.0.11"},
     {"channel": 38, "name": "Teacher Staff 2", "dvr_ip": "192.168.0.11"},
     {"channel": 23, "name": "Administration",  "dvr_ip": "192.168.0.14"},
+    {"channel":  8, "name": "DISPERSAL EXIT",  "dvr_ip": "192.168.0.12"},
 ]
 
 CLOUD_API = os.environ.get(
