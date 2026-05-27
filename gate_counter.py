@@ -2,8 +2,9 @@
 Gate Head Count Counter
 =======================
 Captures frames from ENTRY GATE and RECEPTION cameras on school DVRs,
-detects people using YOLOv8-nano, tracks them across frames,
-and counts entries with attire color.
+detects people and vehicles using YOLOv8-nano, tracks them across frames,
+and counts entries with attire color. Vehicles (cars, buses, trucks,
+motorcycles) are counted separately from people.
 
 Sends events to the cloud backend for reconciliation with
 TrueFace face-recognition attendance.
@@ -87,8 +88,21 @@ MODEL_DIR = Path(__file__).parent / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 YOLO_MODEL = os.environ.get("GATE_YOLO_MODEL", "yolov8n")
 
-# Person detection confidence threshold
+# Detection confidence thresholds
 CONFIDENCE_THRESHOLD = float(os.environ.get("GATE_CONF_THRESHOLD", "0.5"))
+VEHICLE_CONF_THRESHOLD = float(os.environ.get("GATE_VEHICLE_CONF", "0.45"))
+
+# YOLOv8 COCO classes for vehicles
+VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+
+# Only detect vehicles on entry gate cameras (not indoor cameras)
+VEHICLE_CAMERAS = {"ENTRY GATE-1", "ENTRY GATE-2", "DISPERSAL EXIT"}
+
+# Cloud API for vehicle events
+VEHICLE_CLOUD_API = os.environ.get(
+    "GATE_VEHICLE_API",
+    "https://ppis-whatsapp-bot.fly.dev/api/gate/vehicle-entry",
+)
 
 # Tracker settings
 MAX_DISAPPEARED = 15  # frames before removing a tracked person
@@ -378,7 +392,7 @@ class CentroidTracker:
 # ---------------------------------------------------------------------------
 
 class PersonDetector:
-    """YOLOv8-nano person detector."""
+    """YOLOv8-nano person and vehicle detector."""
 
     def __init__(self):
         self.model = None
@@ -426,6 +440,32 @@ class PersonDetector:
 
         return detections
 
+    def detect_vehicles(self, frame: np.ndarray) -> list[tuple[tuple[int, int, int, int], float, str]]:
+        """Detect vehicles in a frame.
+
+        Returns:
+            list of (bbox, confidence, vehicle_type) tuples
+        """
+        if self.model is None:
+            return []
+
+        vehicle_cls = list(VEHICLE_CLASSES.keys())
+        results = self.model(frame, verbose=False, classes=vehicle_cls)
+        detections = []
+
+        for r in results:
+            if r.boxes is None:
+                continue
+            for box in r.boxes:
+                conf = float(box.conf[0])
+                if conf < VEHICLE_CONF_THRESHOLD:
+                    continue
+                cls_id = int(box.cls[0])
+                x1, y1, x2, y2 = box.xyxy[0].int().tolist()
+                detections.append(((x1, y1, x2, y2), conf, VEHICLE_CLASSES.get(cls_id, "vehicle")))
+
+        return detections
+
 
 # ---------------------------------------------------------------------------
 # Cloud API
@@ -446,6 +486,25 @@ def send_gate_event(events: list[dict]) -> bool:
                 logger.warning("Cloud API returned %d: %s", resp.status_code, resp.text[:200])
     except Exception as e:
         logger.error("Cloud API error: %s", e)
+
+    return False
+
+
+def send_vehicle_event(events: list[dict]) -> bool:
+    """Send vehicle entry events to the cloud backend."""
+    if not events:
+        return True
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(VEHICLE_CLOUD_API, json=events)
+            if resp.status_code == 200:
+                logger.info("Sent %d vehicle event(s) to cloud — OK", len(events))
+                return True
+            else:
+                logger.warning("Vehicle API returned %d: %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.error("Vehicle API error: %s", e)
 
     return False
 
@@ -545,7 +604,7 @@ def run_gate_counter():
     detector = PersonDetector()
     detector.load()
 
-    # One tracker per camera
+    # One tracker per camera (for people)
     trackers: dict[str, CentroidTracker] = {}
     for cam in GATE_CAMERAS:
         trackers[cam["name"]] = CentroidTracker(
@@ -553,12 +612,23 @@ def run_gate_counter():
             max_distance=MAX_DISTANCE,
         )
 
+    # Vehicle trackers (only for entry gate cameras)
+    vehicle_trackers: dict[str, CentroidTracker] = {}
+    for cam_name in VEHICLE_CAMERAS:
+        vehicle_trackers[cam_name] = CentroidTracker(
+            max_disappeared=MAX_DISAPPEARED,
+            max_distance=MAX_DISTANCE * 2,  # vehicles move faster
+        )
+
     # Daily counters
     daily_in: dict[str, int] = {c["name"]: 0 for c in GATE_CAMERAS}
     daily_out: dict[str, int] = {c["name"]: 0 for c in GATE_CAMERAS}
+    daily_vehicles_in: dict[str, int] = {n: 0 for n in VEHICLE_CAMERAS}
+    daily_vehicles_out: dict[str, int] = {n: 0 for n in VEHICLE_CAMERAS}
     current_date = datetime.now(IST).strftime("%Y-%m-%d")
     poll_count = 0
     pending_events: list[dict] = []
+    pending_vehicle_events: list[dict] = []
 
     while running:
         now = datetime.now(IST)
@@ -567,16 +637,23 @@ def run_gate_counter():
         # Reset daily counters on date change
         if today != current_date:
             logger.info(
-                "Date changed: %s -> %s. Previous totals: IN=%s OUT=%s",
-                current_date, today, daily_in, daily_out,
+                "Date changed: %s -> %s. Previous totals: IN=%s OUT=%s Vehicles IN=%s",
+                current_date, today, daily_in, daily_out, daily_vehicles_in,
             )
             current_date = today
             daily_in = {c["name"]: 0 for c in GATE_CAMERAS}
             daily_out = {c["name"]: 0 for c in GATE_CAMERAS}
+            daily_vehicles_in = {n: 0 for n in VEHICLE_CAMERAS}
+            daily_vehicles_out = {n: 0 for n in VEHICLE_CAMERAS}
             for cam in GATE_CAMERAS:
                 trackers[cam["name"]] = CentroidTracker(
                     max_disappeared=MAX_DISAPPEARED,
                     max_distance=MAX_DISTANCE,
+                )
+            for cam_name in VEHICLE_CAMERAS:
+                vehicle_trackers[cam_name] = CentroidTracker(
+                    max_disappeared=MAX_DISAPPEARED,
+                    max_distance=MAX_DISTANCE * 2,
                 )
 
         # Only monitor during school hours
@@ -647,6 +724,45 @@ def run_gate_counter():
                     daily_in[cam_name], daily_out[cam_name],
                 )
 
+            # Detect vehicles on entry gate cameras
+            if cam_name in VEHICLE_CAMERAS:
+                v_detections = detector.detect_vehicles(frame)
+                if v_detections:
+                    # Convert to tracker format (bbox, conf) — ignore vehicle_type for tracking
+                    v_track_input = [((d[0]), d[1]) for d in v_detections]
+                    # Build a map from bbox to vehicle_type for lookup after crossing
+                    v_type_map = {d[0]: d[2] for d in v_detections}
+
+                    vehicle_trackers[cam_name].set_line_y(line_y)
+                    v_crossings = vehicle_trackers[cam_name].update(v_track_input)
+
+                    for vc in v_crossings:
+                        v_dir = vc["direction"]
+                        v_bbox = vc["bbox"]
+                        v_type = v_type_map.get(v_bbox, "vehicle")
+
+                        if v_dir == "IN":
+                            daily_vehicles_in[cam_name] += 1
+                        else:
+                            daily_vehicles_out[cam_name] += 1
+
+                        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+                        v_event = {
+                            "timestamp": timestamp,
+                            "camera": cam_name,
+                            "direction": v_dir,
+                            "vehicle_type": v_type,
+                            "daily_in": daily_vehicles_in[cam_name],
+                            "daily_out": daily_vehicles_out[cam_name],
+                        }
+                        pending_vehicle_events.append(v_event)
+
+                        logger.info(
+                            "%s: VEHICLE %s (%s) at %s — Day vehicles IN=%d OUT=%d",
+                            cam_name, v_dir, v_type, timestamp,
+                            daily_vehicles_in[cam_name], daily_vehicles_out[cam_name],
+                        )
+
         # Send pending events to cloud in batches
         if pending_events:
             ok = send_gate_event(pending_events)
@@ -654,13 +770,20 @@ def run_gate_counter():
                 pending_events = []
             # If failed, keep pending and retry next cycle
 
+        if pending_vehicle_events:
+            ok = send_vehicle_event(pending_vehicle_events)
+            if ok:
+                pending_vehicle_events = []
+
         # Periodic status log
         if poll_count % 60 == 0:  # Every ~5 minutes
             total_in = sum(daily_in.values())
             total_out = sum(daily_out.values())
+            total_v_in = sum(daily_vehicles_in.values())
+            total_v_out = sum(daily_vehicles_out.values())
             logger.info(
-                "Poll #%d — Day totals: IN=%d OUT=%d — Per camera: IN=%s OUT=%s",
-                poll_count, total_in, total_out, daily_in, daily_out,
+                "Poll #%d — Day totals: IN=%d OUT=%d Vehicles IN=%d OUT=%d",
+                poll_count, total_in, total_out, total_v_in, total_v_out,
             )
 
         time.sleep(POLL_INTERVAL)
