@@ -76,7 +76,7 @@ MONITOR_END_MIN = 0
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-FACE_MATCH_TOLERANCE = float(os.environ.get("MOOD_FACE_TOLERANCE", "0.5"))
+FACE_MATCH_TOLERANCE = float(os.environ.get("MOOD_FACE_TOLERANCE", "0.55"))
 
 # Tracked persons: list of {name, ref_photos: [Path, ...]}
 BASE_DIR = Path(__file__).parent
@@ -260,30 +260,44 @@ class PersonDetector:
         if not self.ref_encodings:
             return []
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        locations = face_recognition.face_locations(rgb, model="hog")
+        # Upscale frame for better detection of distant/small faces
+        scale = 2
+        h, w = frame.shape[:2]
+        upscaled = cv2.resize(frame, (w * scale, h * scale), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB)
+        locations = face_recognition.face_locations(rgb, number_of_times_to_upsample=2, model="hog")
         if not locations:
             return []
+
+        logger.debug("Found %d face(s) in frame (%dx%d upscaled)", len(locations), w * scale, h * scale)
 
         encodings = face_recognition.face_encodings(rgb, locations)
         matches = []
         for loc, enc in zip(locations, encodings):
             best_person = None
             best_dist = float("inf")
+            all_dists = {}
 
             for person_name, ref_encs in self.ref_encodings.items():
                 distances = face_recognition.face_distance(ref_encs, enc)
                 min_dist = float(min(distances))
+                all_dists[person_name] = min_dist
                 if min_dist <= self.tolerance and min_dist < best_dist:
                     best_person = person_name
                     best_dist = min_dist
 
+            if best_person is None and all_dists:
+                closest = min(all_dists, key=all_dists.get)
+                logger.info("Face detected but no match (closest: %s dist=%.3f, threshold=%.2f)",
+                           closest, all_dists[closest], self.tolerance)
+
             if best_person is not None:
                 top, right, bottom, left = loc
+                # Scale bbox back to original frame coordinates
                 matches.append({
                     "person": best_person,
-                    "location": loc,
-                    "bbox": (left, top, right - left, bottom - top),
+                    "location": (top // scale, right // scale, bottom // scale, left // scale),
+                    "bbox": (left // scale, top // scale, (right - left) // scale, (bottom - top) // scale),
                     "distance": best_dist,
                 })
 
