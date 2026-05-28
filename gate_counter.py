@@ -21,6 +21,16 @@ Cameras:
     Reception C3: DVR 2 (192.168.0.12) Channel 53
     Reception C4: DVR 2 (192.168.0.12) Channel 52
     DISPERSAL EXIT: DVR 2 (192.168.0.12) Channel 8
+    Basement Main Gate: DVR 4 (192.168.0.13) Channel 12
+    Basement R/W First Strs: DVR 4 (192.168.0.13) Channel 42
+    Basement R/W Middle Strs: DVR 4 (192.168.0.13) Channel 6
+    Basement L/W Middle Strs: DVR 4 (192.168.0.13) Channel 20
+    Basement Generator Right Exit: DVR 4 (192.168.0.13) Channel 25
+    Basement Cam 2: DVR 4 (192.168.0.13) Channel 21
+    Basement Cam 5: DVR 4 (192.168.0.13) Channel 37
+    Basement Cam 8: DVR 4 (192.168.0.13) Channel 10
+    Basement Cam 10: DVR 4 (192.168.0.13) Channel 19
+    Basement Electricity: DVR 4 (192.168.0.13) Channel 11
 
 All timestamps use IST (Asia/Kolkata, UTC+05:30).
 """
@@ -62,10 +72,18 @@ GATE_CAMERAS = [
     {"channel": 55, "name": "Reception C2",    "dvr_ip": "192.168.0.12"},
     {"channel": 53, "name": "Reception C3",    "dvr_ip": "192.168.0.12"},
     {"channel": 52, "name": "Reception C4",    "dvr_ip": "192.168.0.12"},
-    {"channel": 35, "name": "Teacher Staff 1", "dvr_ip": "192.168.0.11"},
-    {"channel": 38, "name": "Teacher Staff 2", "dvr_ip": "192.168.0.11"},
-    {"channel": 23, "name": "Administration",  "dvr_ip": "192.168.0.14"},
     {"channel":  8, "name": "DISPERSAL EXIT",  "dvr_ip": "192.168.0.12"},
+    # Basement cameras (DVR 4)
+    {"channel": 12, "name": "Basement Main Gate",             "dvr_ip": "192.168.0.13"},
+    {"channel": 42, "name": "Basement R/W First Strs",        "dvr_ip": "192.168.0.13"},
+    {"channel":  6, "name": "Basement R/W Middle Strs",       "dvr_ip": "192.168.0.13"},
+    {"channel": 20, "name": "Basement L/W Middle Strs",       "dvr_ip": "192.168.0.13"},
+    {"channel": 25, "name": "Basement Generator Right Exit",  "dvr_ip": "192.168.0.13"},
+    {"channel": 21, "name": "Basement Cam 2",                 "dvr_ip": "192.168.0.13"},
+    {"channel": 37, "name": "Basement Cam 5",                 "dvr_ip": "192.168.0.13"},
+    {"channel": 10, "name": "Basement Cam 8",                 "dvr_ip": "192.168.0.13"},
+    {"channel": 19, "name": "Basement Cam 10",                "dvr_ip": "192.168.0.13"},
+    {"channel": 11, "name": "Basement Electricity",           "dvr_ip": "192.168.0.13"},
 ]
 
 CLOUD_API = os.environ.get(
