@@ -641,8 +641,7 @@ def run_gate_counter():
     needed_ips = {c["dvr_ip"] for c in GATE_CAMERAS}
     missing = needed_ips - set(DVR_CREDS.keys())
     if missing:
-        logger.error("Missing DVR credentials for: %s", ", ".join(missing))
-        sys.exit(1)
+        logger.warning("Missing DVR credentials for: %s — skipping those cameras", ", ".join(missing))
 
     # Initialize detector
     detector = PersonDetector()
