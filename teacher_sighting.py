@@ -17,6 +17,7 @@ exclusive domain of TrueFace 3000 via the Selenium poller.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import logging
 import os
@@ -320,11 +321,11 @@ class TeacherSightingTracker:
 
         return results
 
-    def _detect_faces_with_visitors(self, image_bytes: bytes) -> tuple[list[dict], list[np.ndarray]]:
-        """Detect all faces in an image. Returns (known_teachers, unknown_encodings).
+    def _detect_faces_with_visitors(self, image_bytes: bytes) -> tuple[list[dict], list[tuple[np.ndarray, str]]]:
+        """Detect all faces in an image. Returns (known_teachers, unknown_faces).
 
         Matches each face against ALL registered persons (teachers, students, staff).
-        Faces that don't match anyone are returned as unknown visitor encodings.
+        Faces that don't match anyone are returned as (encoding, face_crop_b64) tuples.
         """
         if not self._all_encodings:
             return [], []
@@ -333,13 +334,13 @@ class TeacherSightingTracker:
         if not face_encodings:
             return [], []
 
-        # Get BGR image for outfit detection
+        # Get BGR image for outfit detection and face crops
         bgr_img = None
         if cv2 is not None and img_array is not None:
             bgr_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
         teachers = []
-        unknown_encodings = []
+        unknown_faces: list[tuple[np.ndarray, str]] = []
 
         for i, encoding in enumerate(face_encodings):
             best_match = None
@@ -378,10 +379,21 @@ class TeacherSightingTracker:
                     teachers.append(result)
                 # else: known student/staff — skip (not a visitor)
             else:
-                # Unknown face — potential visitor
-                unknown_encodings.append(encoding)
+                # Unknown face — crop and include for alert
+                crop_b64 = ""
+                if bgr_img is not None and i < len(face_locations):
+                    top, right, bottom, left = face_locations[i]
+                    h, w = bgr_img.shape[:2]
+                    pad = 30
+                    y1, y2 = max(0, top - pad), min(h, bottom + pad)
+                    x1, x2 = max(0, left - pad), min(w, right + pad)
+                    face_crop = bgr_img[y1:y2, x1:x2]
+                    if face_crop.size > 0:
+                        _, buf = cv2.imencode(".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                        crop_b64 = base64.b64encode(buf).decode()
+                unknown_faces.append((encoding, crop_b64))
 
-        return teachers, unknown_encodings
+        return teachers, unknown_faces
 
     def _is_new_visitor(self, encoding: np.ndarray, cam_label: str, now_ts: float) -> bool:
         """Check if a visitor encoding is distinct from recently seen visitors on this camera."""
@@ -539,7 +551,7 @@ class TeacherSightingTracker:
                         f"outfit={outfit.get('description', 'unknown')})")
 
                 # Process visitor (unknown) detections
-                for enc in unknown_encs:
+                for enc, crop_b64 in unknown_encs:
                     if not self._is_new_visitor(enc, cam_label, now_ts):
                         continue
                     # Record this visitor encoding for dedup
@@ -550,11 +562,12 @@ class TeacherSightingTracker:
                         "camera": cam_label,
                         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                         "date": today,
+                        "snapshot": crop_b64,
                     }
                     new_visitors.append(visitor)
                     self._daily_visitor_sightings.append(visitor)
 
-                    logger.info(f"[VISITOR] Unknown face on {cam_label}")
+                    logger.info(f"[VISITOR] Unknown face on {cam_label} (snapshot={'yes' if crop_b64 else 'no'})")
 
         return new_sightings, new_visitors
 
