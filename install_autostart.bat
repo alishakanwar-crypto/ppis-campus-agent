@@ -136,8 +136,8 @@ echo     ^<ExecutionTimeLimit^>PT2M^</ExecutionTimeLimit^>
 echo   ^</Settings^>
 echo   ^<Actions Context="Author"^>
 echo     ^<Exec^>
-echo       ^<Command^>cmd.exe^</Command^>
-echo       ^<Arguments^>/c "!AGENT_DIR!watchdog.bat"^</Arguments^>
+echo       ^<Command^>wscript.exe^</Command^>
+echo       ^<Arguments^>"!AGENT_DIR!run_watchdog_hidden.vbs"^</Arguments^>
 echo       ^<WorkingDirectory^>!AGENT_DIR!^</WorkingDirectory^>
 echo     ^</Exec^>
 echo   ^</Actions^>
@@ -150,7 +150,7 @@ if !ERRORLEVEL! EQU 0 (
     set WATCHDOG_OK=1
 ) else (
     echo       XML method failed, trying simple command...
-    schtasks /create /tn "PPIS Campus Agent Watchdog" /tr "cmd.exe /c \"%AGENT_DIR%watchdog.bat\"" /sc minute /mo 5 /f >nul 2>&1
+    schtasks /create /tn "PPIS Campus Agent Watchdog" /tr "wscript.exe \"%AGENT_DIR%run_watchdog_hidden.vbs\"" /sc minute /mo 5 /f >nul 2>&1
     if !ERRORLEVEL! EQU 0 (
         echo       Watchdog task created (simple method)
         set WATCHDOG_OK=1
