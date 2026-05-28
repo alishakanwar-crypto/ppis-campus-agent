@@ -625,6 +625,7 @@ def run_gate_counter():
     daily_out: dict[str, int] = {c["name"]: 0 for c in GATE_CAMERAS}
     daily_vehicles_in: dict[str, int] = {n: 0 for n in VEHICLE_CAMERAS}
     daily_vehicles_out: dict[str, int] = {n: 0 for n in VEHICLE_CAMERAS}
+    counted_vehicle_ids: dict[str, set[int]] = {n: set() for n in VEHICLE_CAMERAS}
     current_date = datetime.now(IST).strftime("%Y-%m-%d")
     poll_count = 0
     pending_events: list[dict] = []
@@ -645,6 +646,7 @@ def run_gate_counter():
             daily_out = {c["name"]: 0 for c in GATE_CAMERAS}
             daily_vehicles_in = {n: 0 for n in VEHICLE_CAMERAS}
             daily_vehicles_out = {n: 0 for n in VEHICLE_CAMERAS}
+            counted_vehicle_ids = {n: set() for n in VEHICLE_CAMERAS}
             for cam in GATE_CAMERAS:
                 trackers[cam["name"]] = CentroidTracker(
                     max_disappeared=MAX_DISAPPEARED,
@@ -736,32 +738,75 @@ def run_gate_counter():
                     vehicle_trackers[cam_name].set_line_y(line_y)
                     v_crossings = vehicle_trackers[cam_name].update(v_track_input)
 
+                    # Count line crossings (when vehicles drive through)
                     for vc in v_crossings:
                         v_dir = vc["direction"]
                         v_bbox = vc["bbox"]
                         v_type = v_type_map.get(v_bbox, "vehicle")
+                        v_id = vc["id"]
 
-                        if v_dir == "IN":
-                            daily_vehicles_in[cam_name] += 1
-                        else:
-                            daily_vehicles_out[cam_name] += 1
+                        if v_id not in counted_vehicle_ids[cam_name]:
+                            counted_vehicle_ids[cam_name].add(v_id)
+                            if v_dir == "IN":
+                                daily_vehicles_in[cam_name] += 1
+                            else:
+                                daily_vehicles_out[cam_name] += 1
 
-                        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-                        v_event = {
-                            "timestamp": timestamp,
-                            "camera": cam_name,
-                            "direction": v_dir,
-                            "vehicle_type": v_type,
-                            "daily_in": daily_vehicles_in[cam_name],
-                            "daily_out": daily_vehicles_out[cam_name],
-                        }
-                        pending_vehicle_events.append(v_event)
+                            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+                            v_event = {
+                                "timestamp": timestamp,
+                                "camera": cam_name,
+                                "direction": v_dir,
+                                "vehicle_type": v_type,
+                                "daily_in": daily_vehicles_in[cam_name],
+                                "daily_out": daily_vehicles_out[cam_name],
+                            }
+                            pending_vehicle_events.append(v_event)
 
-                        logger.info(
-                            "%s: VEHICLE %s (%s) at %s — Day vehicles IN=%d OUT=%d",
-                            cam_name, v_dir, v_type, timestamp,
-                            daily_vehicles_in[cam_name], daily_vehicles_out[cam_name],
-                        )
+                            logger.info(
+                                "%s: VEHICLE %s (%s) at %s — Day vehicles IN=%d OUT=%d",
+                                cam_name, v_dir, v_type, timestamp,
+                                daily_vehicles_in[cam_name], daily_vehicles_out[cam_name],
+                            )
+
+                    # Also count NEW vehicle appearances (even without line crossing)
+                    for obj_id in vehicle_trackers[cam_name].objects:
+                        if obj_id not in counted_vehicle_ids[cam_name]:
+                            # New vehicle appeared — count as IN on entry gates
+                            counted_vehicle_ids[cam_name].add(obj_id)
+                            # Determine type from current detection
+                            obj_centroid = vehicle_trackers[cam_name].objects[obj_id]
+                            v_type = "vehicle"
+                            for det in v_detections:
+                                bbox = det[0]
+                                cx = (bbox[0] + bbox[2]) // 2
+                                cy = (bbox[1] + bbox[3]) // 2
+                                if abs(cx - obj_centroid[0]) < 50 and abs(cy - obj_centroid[1]) < 50:
+                                    v_type = det[2]
+                                    break
+
+                            direction = "IN" if "ENTRY" in cam_name else "OUT" if "EXIT" in cam_name else "IN"
+                            if direction == "IN":
+                                daily_vehicles_in[cam_name] += 1
+                            else:
+                                daily_vehicles_out[cam_name] += 1
+
+                            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+                            v_event = {
+                                "timestamp": timestamp,
+                                "camera": cam_name,
+                                "direction": direction,
+                                "vehicle_type": v_type,
+                                "daily_in": daily_vehicles_in[cam_name],
+                                "daily_out": daily_vehicles_out[cam_name],
+                            }
+                            pending_vehicle_events.append(v_event)
+
+                            logger.info(
+                                "%s: VEHICLE %s (%s, appearance) at %s — Day vehicles IN=%d OUT=%d",
+                                cam_name, direction, v_type, timestamp,
+                                daily_vehicles_in[cam_name], daily_vehicles_out[cam_name],
+                            )
 
         # Send pending events to cloud in batches
         if pending_events:
