@@ -42,7 +42,15 @@ echo   All Python processes terminated.
 REM --- Step 3: Pull latest code ---
 echo [Step 3/5] Pulling latest code from GitHub...
 git fetch origin 2>nul
-git reset --hard origin/main 2>nul
+for /f "tokens=*" %%b in ('git symbolic-ref refs/remotes/origin/HEAD 2^>nul') do set "DEFAULT_BRANCH=%%b"
+if defined DEFAULT_BRANCH (
+    set "DEFAULT_BRANCH=!DEFAULT_BRANCH:refs/remotes/origin/=!"
+    echo   Default branch: !DEFAULT_BRANCH!
+    git checkout "!DEFAULT_BRANCH!" 2>nul
+    git reset --hard "origin/!DEFAULT_BRANCH!" 2>nul
+) else (
+    git reset --hard origin/main 2>nul
+)
 echo   Code updated.
 
 REM --- Step 4: Clean up lock file ---
