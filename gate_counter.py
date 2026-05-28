@@ -254,6 +254,32 @@ def crop_person_jpeg(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> str:
     return base64.b64encode(buf).decode("ascii")
 
 
+def snapshot_vehicle_jpeg(frame: np.ndarray, bbox: tuple[int, int, int, int],
+                          vehicle_type: str) -> str:
+    """Draw bounding box on vehicle and return annotated crop as base64 JPEG."""
+    x1, y1, x2, y2 = bbox
+    h, w = frame.shape[:2]
+    # Add padding around vehicle for context
+    pad = int(max(x2 - x1, y2 - y1) * 0.3)
+    cx1 = max(0, x1 - pad)
+    cy1 = max(0, y1 - pad)
+    cx2 = min(w, x2 + pad)
+    cy2 = min(h, y2 + pad)
+    crop = frame[cy1:cy2, cx1:cx2].copy()
+    if crop.size == 0:
+        return ""
+    # Draw bounding box on the crop
+    bx1 = x1 - cx1
+    by1 = y1 - cy1
+    bx2 = x2 - cx1
+    by2 = y2 - cy1
+    cv2.rectangle(crop, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+    label = vehicle_type.upper()
+    cv2.putText(crop, label, (bx1, by1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    return base64.b64encode(buf).decode("ascii")
+
+
 # ---------------------------------------------------------------------------
 # Centroid Tracker with Line Crossing
 # ---------------------------------------------------------------------------
@@ -753,11 +779,13 @@ def run_gate_counter():
                                 daily_vehicles_out[cam_name] += 1
 
                             timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+                            v_snapshot = snapshot_vehicle_jpeg(frame, v_bbox, v_type)
                             v_event = {
                                 "timestamp": timestamp,
                                 "camera": cam_name,
                                 "direction": v_dir,
                                 "vehicle_type": v_type,
+                                "snapshot": v_snapshot,
                                 "daily_in": daily_vehicles_in[cam_name],
                                 "daily_out": daily_vehicles_out[cam_name],
                             }
@@ -792,11 +820,22 @@ def run_gate_counter():
                                 daily_vehicles_out[cam_name] += 1
 
                             timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+                            # Find best matching bbox for snapshot
+                            v_snap_bbox = None
+                            for det in v_detections:
+                                dbbox = det[0]
+                                dcx = (dbbox[0] + dbbox[2]) // 2
+                                dcy = (dbbox[1] + dbbox[3]) // 2
+                                if abs(dcx - obj_centroid[0]) < 80 and abs(dcy - obj_centroid[1]) < 80:
+                                    v_snap_bbox = dbbox
+                                    break
+                            v_snapshot = snapshot_vehicle_jpeg(frame, v_snap_bbox, v_type) if v_snap_bbox else ""
                             v_event = {
                                 "timestamp": timestamp,
                                 "camera": cam_name,
                                 "direction": direction,
                                 "vehicle_type": v_type,
+                                "snapshot": v_snapshot,
                                 "daily_in": daily_vehicles_in[cam_name],
                                 "daily_out": daily_vehicles_out[cam_name],
                             }
