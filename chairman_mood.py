@@ -76,7 +76,7 @@ MONITOR_END_MIN = 0
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-FACE_MATCH_TOLERANCE = float(os.environ.get("MOOD_FACE_TOLERANCE", "0.55"))
+FACE_MATCH_TOLERANCE = float(os.environ.get("MOOD_FACE_TOLERANCE", "0.62"))
 
 # Tracked persons: list of {name, ref_photos: [Path, ...]}
 BASE_DIR = Path(__file__).parent
