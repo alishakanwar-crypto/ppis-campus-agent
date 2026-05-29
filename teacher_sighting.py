@@ -606,18 +606,32 @@ class TeacherSightingTracker:
                      f"{len(_pending_visitors)} visitors")
 
         # Delayed recapture: wait for person to walk further inside, then
-        # pull a fresh snapshot from the same camera for a clearer image
+        # pull a fresh snapshot from the same camera + Reception cameras
         if _pending_visitors:
-            delay = 10
+            delay = 15
             logger.info(f"[VISITOR] Waiting {delay}s for {len(_pending_visitors)} "
                         f"visitor(s) to walk inside before recapture...")
             await asyncio.sleep(delay)
+
+            # Build list of Reception cameras for follow-up captures
+            reception_cams = []
+            for location, cam_data in camera_mapping.items():
+                if "RECEPTION" in location.upper():
+                    all_cams = cam_data.get("all_cameras", [])
+                    for cam in (all_cams if all_cams else [cam_data]):
+                        dvr_idx = cam.get("dvr_index", 0)
+                        ch = cam.get("channel", 1)
+                        if dvr_idx < len(dvrs):
+                            reception_cams.append((location, dvrs[dvr_idx], ch))
 
             for pv in _pending_visitors:
                 dvr = pv["dvr"]
                 channel = pv["channel"]
                 cam_label = pv["cam_label"]
+                snapshot = pv["initial_snapshot"]
+                best_source = "initial"
 
+                # Try delayed recapture from same camera
                 fresh_frame = await self._capture_frame(dvr, channel)
                 if fresh_frame is not None:
                     nparr = np.frombuffer(fresh_frame, dtype=np.uint8)
@@ -626,13 +640,36 @@ class TeacherSightingTracker:
                         _, buf = cv2.imencode(".jpg", bgr,
                                               [cv2.IMWRITE_JPEG_QUALITY, 85])
                         snapshot = base64.b64encode(buf).decode()
-                        logger.info(f"[VISITOR] Delayed recapture OK: {cam_label}")
-                    else:
-                        snapshot = pv["initial_snapshot"]
-                        logger.warning(f"[VISITOR] Delayed decode failed: {cam_label}, using initial")
-                else:
-                    snapshot = pv["initial_snapshot"]
-                    logger.warning(f"[VISITOR] Delayed capture failed: {cam_label}, using initial")
+                        best_source = "delayed-gate"
+
+                # Also capture from Reception cameras for a closer indoor shot
+                reception_snapshots = []
+                for rec_loc, rec_dvr, rec_ch in reception_cams:
+                    rec_frame = await self._capture_frame(rec_dvr, rec_ch)
+                    if rec_frame is not None:
+                        nparr = np.frombuffer(rec_frame, dtype=np.uint8)
+                        bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        if bgr is not None:
+                            _, buf = cv2.imencode(".jpg", bgr,
+                                                  [cv2.IMWRITE_JPEG_QUALITY, 85])
+                            reception_snapshots.append((rec_loc, base64.b64encode(buf).decode()))
+
+                # Pick first Reception snapshot that captured successfully
+                if reception_snapshots:
+                    rec_loc, rec_snap = reception_snapshots[0]
+                    logger.info(f"[VISITOR] Reception follow-up from {rec_loc}")
+                    # Send both: gate snapshot as primary, reception as extra
+                    visitor_reception = {
+                        "camera": f"{rec_loc} (follow-up)",
+                        "timestamp": pv["timestamp"],
+                        "date": pv["date"],
+                        "snapshot": rec_snap,
+                    }
+                    new_visitors.append(visitor_reception)
+                    self._daily_visitor_sightings.append(visitor_reception)
+
+                logger.info(f"[VISITOR] Recapture: {cam_label} (source={best_source}, "
+                            f"reception_followups={len(reception_snapshots)})")
 
                 visitor = {
                     "camera": cam_label,
