@@ -65,6 +65,11 @@ VISITOR_COOLDOWN = 600  # 10 minutes
 # 30px balances filtering car/gate false positives vs catching real distant faces.
 MIN_VISITOR_FACE_SIZE = 30
 
+# Maximum face distance for DVR teacher recognition.
+# Lower = stricter (fewer false matches like misidentifying absent teachers).
+# 0.45 distance ≈ 55% confidence minimum.
+TEACHER_MATCH_DISTANCE = 0.45
+
 # Cameras to monitor specifically for visitors (entry only — NOT dispersal/exit)
 VISITOR_CAMERA_KEYWORDS = [
     "ENTRY", "ENTRANCE",  # Entry gates only (people entering)
@@ -307,7 +312,7 @@ class TeacherSightingTracker:
                     best_distance = min_dist
                     best_match = pid
 
-            if best_match and best_distance < 0.50:
+            if best_match and best_distance < TEACHER_MATCH_DISTANCE:
                 data = self._teacher_encodings[best_match]
                 result = {
                     "person_id": best_match,
@@ -364,7 +369,7 @@ class TeacherSightingTracker:
                     best_distance = min_dist
                     best_match = pid
 
-            if best_match and best_distance < 0.50:
+            if best_match and best_distance < TEACHER_MATCH_DISTANCE:
                 # Known person — check if teacher
                 if best_match.startswith(("TEACHER_", "PRINCIPAL_")):
                     data = self._teacher_encodings.get(best_match, self._all_encodings.get(best_match, {}))
