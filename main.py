@@ -19,6 +19,7 @@ import base64
 import io
 import json
 import logging
+import logging.handlers
 import os
 import subprocess
 import sys
@@ -114,9 +115,18 @@ try:
 except ImportError:
     Image = None
 
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_LOG_FILE = Path(__file__).parent / "campus_agent.log"
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format=_LOG_FORMAT,
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            _LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3,
+            encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger("ppis-agent")
 
