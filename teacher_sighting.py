@@ -62,8 +62,8 @@ SIGHTING_COOLDOWN = 300  # 5 minutes
 VISITOR_COOLDOWN = 600  # 10 minutes
 
 # Minimum face size (pixels) to consider for visitor alerts.
-# Lowered to 20px to avoid filtering distant but real faces at Entry Gate.
-MIN_VISITOR_FACE_SIZE = 20
+# 30px balances filtering car/gate false positives vs catching real distant faces.
+MIN_VISITOR_FACE_SIZE = 30
 
 # Cameras to monitor specifically for visitors (entry + reception only)
 VISITOR_CAMERA_KEYWORDS = [
@@ -419,49 +419,21 @@ class TeacherSightingTracker:
 
         return teachers, unknown_faces
 
-    def _annotate_frame_with_target(self, frame_bytes: bytes,
-                                     target_encoding: np.ndarray | None) -> str | None:
-        """Annotate a camera frame with a red box around the target person.
+    def _label_frame(self, frame_bytes: bytes) -> str | None:
+        """Add a simple UNKNOWN PERSON DETECTED label to a camera frame.
 
-        Runs face detection on the frame, matches against target_encoding,
-        and draws a red rectangle + UNKNOWN label. Returns base64 JPEG or None.
+        Returns base64 JPEG or None.
         """
-        if face_recognition is None or cv2 is None:
+        if cv2 is None:
             return None
 
-        img_array, face_locations, face_encodings = self._decode_image(frame_bytes)
-        if img_array is None:
+        nparr = np.frombuffer(frame_bytes, dtype=np.uint8)
+        bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if bgr is None:
             return None
 
-        bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-        box_drawn = False
-
-        if face_locations and face_encodings and target_encoding is not None:
-            # Find the face closest to the target encoding
-            distances = face_recognition.face_distance(face_encodings, target_encoding)
-            best_idx = int(np.argmin(distances))
-            if distances[best_idx] < 0.55:
-                top, right, bottom, left = face_locations[best_idx]
-                face_h = bottom - top
-                face_w = right - left
-                pad_top = int(face_h * 0.5)
-                pad_bottom = int(face_h * 3.0)
-                pad_lr = int(face_w * 1.5)
-                h, w = bgr.shape[:2]
-                box_y1 = max(0, top - pad_top)
-                box_y2 = min(h, bottom + pad_bottom)
-                box_x1 = max(0, left - pad_lr)
-                box_x2 = min(w, right + pad_lr)
-                cv2.rectangle(bgr, (box_x1, box_y1), (box_x2, box_y2),
-                              (0, 0, 255), 3)
-                cv2.putText(bgr, "UNKNOWN", (box_x1, box_y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-                box_drawn = True
-
-        if not box_drawn:
-            # Person not re-detected — add label at top of frame
-            cv2.putText(bgr, "UNKNOWN PERSON DETECTED", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+        cv2.putText(bgr, "UNKNOWN PERSON DETECTED", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 
         _, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return base64.b64encode(buf).decode()
@@ -687,13 +659,12 @@ class TeacherSightingTracker:
                 snapshot = pv["initial_snapshot"]
                 best_source = "initial"
 
-                # Try delayed recapture from same camera with face re-detection
+                # Try delayed recapture from same camera
                 fresh_frame = await self._capture_frame(dvr, channel)
                 if fresh_frame is not None:
-                    annotated = self._annotate_frame_with_target(
-                        fresh_frame, pv.get("encoding"))
-                    if annotated is not None:
-                        snapshot = annotated
+                    labelled = self._label_frame(fresh_frame)
+                    if labelled is not None:
+                        snapshot = labelled
                         best_source = "delayed-gate"
 
                 # Also capture from Reception cameras for a closer indoor shot
