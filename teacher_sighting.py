@@ -61,6 +61,12 @@ SIGHTING_COOLDOWN = 300  # 5 minutes
 # on the same camera (avoids re-counting the same unknown face)
 VISITOR_COOLDOWN = 600  # 10 minutes
 
+# Minimum face size (pixels) to consider for visitor alerts.
+# Faces smaller than this are likely false positives (car reflections,
+# gate patterns, distant objects). DVR cameras at 720p typically show
+# a real face at ~50px+ when person is near the gate.
+MIN_VISITOR_FACE_SIZE = 40
+
 # Cameras to monitor specifically for visitors (entry + reception only)
 VISITOR_CAMERA_KEYWORDS = [
     "ENTRY", "ENTRANCE", "DISPERSAL",  # Entry gates
@@ -387,10 +393,14 @@ class TeacherSightingTracker:
                 crop_b64 = ""
                 if bgr_img is not None and i < len(face_locations):
                     top, right, bottom, left = face_locations[i]
-                    # Draw rectangle around detected face on a copy
-                    annotated = bgr_img.copy()
                     face_h = bottom - top
                     face_w = right - left
+                    # Skip tiny faces — likely false positives (car, gate, etc.)
+                    if face_h < MIN_VISITOR_FACE_SIZE or face_w < MIN_VISITOR_FACE_SIZE:
+                        logger.debug(f"[VISITOR] Skipping tiny face {face_w}x{face_h}px (min={MIN_VISITOR_FACE_SIZE})")
+                        continue
+                    # Draw rectangle around detected face on a copy
+                    annotated = bgr_img.copy()
                     # Expand box to show head + upper body
                     pad_top = int(face_h * 0.5)
                     pad_bottom = int(face_h * 3.0)
@@ -410,6 +420,53 @@ class TeacherSightingTracker:
                 unknown_faces.append((encoding, crop_b64))
 
         return teachers, unknown_faces
+
+    def _annotate_frame_with_target(self, frame_bytes: bytes,
+                                     target_encoding: np.ndarray | None) -> str | None:
+        """Annotate a camera frame with a red box around the target person.
+
+        Runs face detection on the frame, matches against target_encoding,
+        and draws a red rectangle + UNKNOWN label. Returns base64 JPEG or None.
+        """
+        if face_recognition is None or cv2 is None:
+            return None
+
+        img_array, face_locations, face_encodings = self._decode_image(frame_bytes)
+        if img_array is None:
+            return None
+
+        bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        box_drawn = False
+
+        if face_locations and face_encodings and target_encoding is not None:
+            # Find the face closest to the target encoding
+            distances = face_recognition.face_distance(face_encodings, target_encoding)
+            best_idx = int(np.argmin(distances))
+            if distances[best_idx] < 0.55:
+                top, right, bottom, left = face_locations[best_idx]
+                face_h = bottom - top
+                face_w = right - left
+                pad_top = int(face_h * 0.5)
+                pad_bottom = int(face_h * 3.0)
+                pad_lr = int(face_w * 1.5)
+                h, w = bgr.shape[:2]
+                box_y1 = max(0, top - pad_top)
+                box_y2 = min(h, bottom + pad_bottom)
+                box_x1 = max(0, left - pad_lr)
+                box_x2 = min(w, right + pad_lr)
+                cv2.rectangle(bgr, (box_x1, box_y1), (box_x2, box_y2),
+                              (0, 0, 255), 3)
+                cv2.putText(bgr, "UNKNOWN", (box_x1, box_y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                box_drawn = True
+
+        if not box_drawn:
+            # Person not re-detected — add label at top of frame
+            cv2.putText(bgr, "UNKNOWN PERSON DETECTED", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+
+        _, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return base64.b64encode(buf).decode()
 
     def _is_new_visitor(self, encoding: np.ndarray, cam_label: str, now_ts: float) -> bool:
         """Check if a visitor encoding is distinct from recently seen visitors on this camera."""
@@ -589,7 +646,7 @@ class TeacherSightingTracker:
                     self._recent_visitor_encodings.setdefault(cam_label, []).append(
                         (enc, now_ts))
 
-                    # Store DVR info for delayed recapture
+                    # Store DVR info + face encoding for delayed recapture
                     _pending_visitors.append({
                         "cam_label": cam_label,
                         "dvr": dvr,
@@ -597,6 +654,7 @@ class TeacherSightingTracker:
                         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                         "date": today,
                         "initial_snapshot": crop_b64,
+                        "encoding": enc,
                     })
                     logger.info(f"[VISITOR] Unknown face on {cam_label} — queued for delayed recapture")
 
@@ -631,15 +689,13 @@ class TeacherSightingTracker:
                 snapshot = pv["initial_snapshot"]
                 best_source = "initial"
 
-                # Try delayed recapture from same camera
+                # Try delayed recapture from same camera with face re-detection
                 fresh_frame = await self._capture_frame(dvr, channel)
                 if fresh_frame is not None:
-                    nparr = np.frombuffer(fresh_frame, dtype=np.uint8)
-                    bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    if bgr is not None:
-                        _, buf = cv2.imencode(".jpg", bgr,
-                                              [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        snapshot = base64.b64encode(buf).decode()
+                    annotated = self._annotate_frame_with_target(
+                        fresh_frame, pv.get("encoding"))
+                    if annotated is not None:
+                        snapshot = annotated
                         best_source = "delayed-gate"
 
                 # Also capture from Reception cameras for a closer indoor shot
