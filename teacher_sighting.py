@@ -254,7 +254,10 @@ class TeacherSightingTracker:
             return None, [], []
 
         try:
-            face_locations = face_recognition.face_locations(img_array, model="hog")
+            # number_of_times_to_upsample=2 helps detect smaller/distant faces
+            # on DVR cameras where subjects are far from the camera
+            face_locations = face_recognition.face_locations(
+                img_array, model="hog", number_of_times_to_upsample=2)
         except Exception:
             return img_array, [], []
 
@@ -490,6 +493,12 @@ class TeacherSightingTracker:
         new_sightings = []
         new_visitors = []
 
+        # Diagnostic: count cameras scanned, frames captured, faces found
+        cams_eligible = 0
+        cams_scanned = 0
+        frames_captured = 0
+        total_faces_found = 0
+
         for location, cam_data in camera_mapping.items():
             is_teacher_cam = _is_sighting_camera(location)
             is_visitor_cam = _is_visitor_camera(location)
@@ -498,6 +507,7 @@ class TeacherSightingTracker:
 
             all_cams = cam_data.get("all_cameras", [])
             cams_to_scan = all_cams if all_cams else [cam_data]
+            cams_eligible += len(cams_to_scan)
 
             for cam in cams_to_scan:
                 dvr_idx = cam.get("dvr_index", 0)
@@ -505,10 +515,12 @@ class TeacherSightingTracker:
                 if dvr_idx >= len(dvrs):
                     continue
 
+                cams_scanned += 1
                 dvr = dvrs[dvr_idx]
                 frame = await self._capture_frame(dvr, channel)
                 if frame is None:
                     continue
+                frames_captured += 1
 
                 cam_label = f"{location} (DVR {dvr_idx + 1} Ch {channel})"
 
@@ -519,6 +531,12 @@ class TeacherSightingTracker:
                     # On teacher-only cameras (staff rooms, admin): only detect teachers
                     teachers = self._detect_teachers(frame)
                     unknown_encs = []
+
+                n_faces = len(teachers) + len(unknown_encs)
+                total_faces_found += n_faces
+                if n_faces > 0:
+                    logger.info(f"[SIGHTING] {cam_label}: {len(teachers)} known, "
+                                f"{len(unknown_encs)} unknown face(s)")
 
                 # Process teacher detections
                 for det in teachers:
@@ -569,6 +587,10 @@ class TeacherSightingTracker:
 
                     logger.info(f"[VISITOR] Unknown face on {cam_label} (snapshot={'yes' if crop_b64 else 'no'})")
 
+        logger.info(f"[SIGHTING] Scan complete: {cams_eligible} eligible, "
+                     f"{cams_scanned} scanned, {frames_captured} frames, "
+                     f"{total_faces_found} faces, {len(new_sightings)} teachers, "
+                     f"{len(new_visitors)} visitors")
         return new_sightings, new_visitors
 
     async def sighting_monitoring_loop(self, dvrs: list[dict],
@@ -577,9 +599,18 @@ class TeacherSightingTracker:
         self.running = True
         self.load_teacher_faces()
 
+        # Count eligible cameras for diagnostics
+        n_teacher_cams = sum(1 for loc in camera_mapping if _is_sighting_camera(loc))
+        n_visitor_cams = sum(1 for loc in camera_mapping if _is_visitor_camera(loc))
+        visitor_cam_names = [loc for loc in camera_mapping if _is_visitor_camera(loc)]
+
         logger.info(f"[SIGHTING] Started. Window: {SIGHTING_START_HOUR}:{SIGHTING_START_MIN:02d}"
                      f"-{SIGHTING_END_HOUR}:{SIGHTING_END_MIN:02d} IST. "
-                     f"Teachers: {len(self._teacher_encodings)}")
+                     f"Teachers: {len(self._teacher_encodings)}, "
+                     f"All faces: {len(self._all_encodings)}, "
+                     f"DVRs: {len(dvrs)}, "
+                     f"Teacher cams: {n_teacher_cams}, Visitor cams: {n_visitor_cams}")
+        logger.info(f"[SIGHTING] Visitor-eligible cameras: {visitor_cam_names}")
 
         cycle = 0
         while self.running:
