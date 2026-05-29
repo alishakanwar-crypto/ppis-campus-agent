@@ -65,10 +65,10 @@ VISITOR_COOLDOWN = 600  # 10 minutes
 # 30px balances filtering car/gate false positives vs catching real distant faces.
 MIN_VISITOR_FACE_SIZE = 30
 
-# Cameras to monitor specifically for visitors (entry + reception only)
+# Cameras to monitor specifically for visitors (entry only — NOT dispersal/exit)
 VISITOR_CAMERA_KEYWORDS = [
-    "ENTRY", "ENTRANCE", "DISPERSAL",  # Entry gates
-    "RECEPTION",                         # Reception cameras
+    "ENTRY", "ENTRANCE",  # Entry gates only (people entering)
+    "RECEPTION",           # Reception cameras (indoor follow-up)
 ]
 
 # Camera types to monitor for teacher sightings
