@@ -678,13 +678,28 @@ ws_task = None
 async def websocket_client():
     """Persistent WebSocket connection to the cloud bot.
     Receives snapshot requests and sends back images."""
-    global ws_connection
+    global ws_connection, config
     url = config.get("cloud_bot_url", "wss://ppis-whatsapp-bot.fly.dev/ws/agent")
     secret = config.get("agent_secret", os.environ.get("AGENT_SECRET", ""))
 
     ws_backoff = 5
     while True:
         try:
+            # Refresh DVR config from cloud on every reconnect so credential
+            # changes (e.g. after a cloud deploy) take effect without a full
+            # agent restart.
+            try:
+                refreshed = await fetch_config_from_cloud()
+                if refreshed and refreshed.get("dvrs"):
+                    config["dvrs"] = refreshed["dvrs"]
+                    config["camera_mapping"] = refreshed.get("camera_mapping", config.get("camera_mapping", {}))
+                    logger.info(
+                        f"Config refreshed on reconnect: {len(config['dvrs'])} DVRs, "
+                        f"{len(config.get('camera_mapping', {}))} camera mappings"
+                    )
+            except Exception as e:
+                logger.warning(f"Config refresh on reconnect failed (using cached): {e}")
+
             logger.info(f"Connecting to cloud bot WebSocket: {url}")
             async with websockets.connect(
                 url,
@@ -724,6 +739,33 @@ async def websocket_client():
                             if 0 <= dvr_idx < len(dvrs):
                                 result = await test_dvr_connection(dvrs[dvr_idx])
                                 await ws.send(json.dumps({"type": "test_result", **result}))
+
+                        elif msg_type == "reload_config":
+                            try:
+                                refreshed = await fetch_config_from_cloud()
+                                if refreshed and refreshed.get("dvrs"):
+                                    config["dvrs"] = refreshed["dvrs"]
+                                    config["camera_mapping"] = refreshed.get(
+                                        "camera_mapping", config.get("camera_mapping", {}))
+                                    logger.info(
+                                        f"Config reloaded via WS command: "
+                                        f"{len(config['dvrs'])} DVRs")
+                                    await ws.send(json.dumps({
+                                        "type": "reload_config_result",
+                                        "status": "ok",
+                                        "dvr_count": len(config["dvrs"]),
+                                    }))
+                                else:
+                                    await ws.send(json.dumps({
+                                        "type": "reload_config_result",
+                                        "status": "no_data",
+                                    }))
+                            except Exception as e:
+                                await ws.send(json.dumps({
+                                    "type": "reload_config_result",
+                                    "status": "error",
+                                    "error": str(e),
+                                }))
 
                         elif msg_type == "test_all_dvrs":
                             request_id = data.get("request_id", "")
