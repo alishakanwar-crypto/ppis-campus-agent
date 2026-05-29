@@ -244,6 +244,15 @@ class TeacherSightingTracker:
             if resp.status_code == 200 and resp.headers.get(
                     "content-type", "").startswith("image"):
                 return resp.content
+            if resp.status_code == 401:
+                basic = httpx.BasicAuth(dvr["username"], dvr["password"])
+                resp2 = await client.get(url, auth=basic)
+                if resp2.status_code == 200 and resp2.headers.get(
+                        "content-type", "").startswith("image"):
+                    return resp2.content
+                logger.warning(
+                    f"[SIGHTING] 401 Unauthorized on {ip} ch{channel} "
+                    f"(digest+basic failed) — check DVR credentials")
         except Exception as e:
             logger.debug(f"[SIGHTING] Capture failed {ip} ch{channel}: {e}")
         return None
