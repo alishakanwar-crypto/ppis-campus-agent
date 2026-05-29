@@ -505,6 +505,7 @@ class TeacherSightingTracker:
 
         new_sightings = []
         new_visitors = []
+        _pending_visitors = []
 
         # Diagnostic: count cameras scanned, frames captured, faces found
         cams_eligible = 0
@@ -581,29 +582,67 @@ class TeacherSightingTracker:
                         f"(conf={det['confidence']:.2f}, "
                         f"outfit={outfit.get('description', 'unknown')})")
 
-                # Process visitor (unknown) detections
+                # Process visitor (unknown) detections — collect for delayed recapture
                 for enc, crop_b64 in unknown_encs:
                     if not self._is_new_visitor(enc, cam_label, now_ts):
                         continue
-                    # Record this visitor encoding for dedup
                     self._recent_visitor_encodings.setdefault(cam_label, []).append(
                         (enc, now_ts))
 
-                    visitor = {
-                        "camera": cam_label,
+                    # Store DVR info for delayed recapture
+                    _pending_visitors.append({
+                        "cam_label": cam_label,
+                        "dvr": dvr,
+                        "channel": channel,
                         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                         "date": today,
-                        "snapshot": crop_b64,
-                    }
-                    new_visitors.append(visitor)
-                    self._daily_visitor_sightings.append(visitor)
-
-                    logger.info(f"[VISITOR] Unknown face on {cam_label} (snapshot={'yes' if crop_b64 else 'no'})")
+                        "initial_snapshot": crop_b64,
+                    })
+                    logger.info(f"[VISITOR] Unknown face on {cam_label} — queued for delayed recapture")
 
         logger.info(f"[SIGHTING] Scan complete: {cams_eligible} eligible, "
                      f"{cams_scanned} scanned, {frames_captured} frames, "
                      f"{total_faces_found} faces, {len(new_sightings)} teachers, "
-                     f"{len(new_visitors)} visitors")
+                     f"{len(_pending_visitors)} visitors")
+
+        # Delayed recapture: wait for person to walk further inside, then
+        # pull a fresh snapshot from the same camera for a clearer image
+        if _pending_visitors:
+            delay = 10
+            logger.info(f"[VISITOR] Waiting {delay}s for {len(_pending_visitors)} "
+                        f"visitor(s) to walk inside before recapture...")
+            await asyncio.sleep(delay)
+
+            for pv in _pending_visitors:
+                dvr = pv["dvr"]
+                channel = pv["channel"]
+                cam_label = pv["cam_label"]
+
+                fresh_frame = await self._capture_frame(dvr, channel)
+                if fresh_frame is not None:
+                    nparr = np.frombuffer(fresh_frame, dtype=np.uint8)
+                    bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    if bgr is not None:
+                        _, buf = cv2.imencode(".jpg", bgr,
+                                              [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        snapshot = base64.b64encode(buf).decode()
+                        logger.info(f"[VISITOR] Delayed recapture OK: {cam_label}")
+                    else:
+                        snapshot = pv["initial_snapshot"]
+                        logger.warning(f"[VISITOR] Delayed decode failed: {cam_label}, using initial")
+                else:
+                    snapshot = pv["initial_snapshot"]
+                    logger.warning(f"[VISITOR] Delayed capture failed: {cam_label}, using initial")
+
+                visitor = {
+                    "camera": cam_label,
+                    "timestamp": pv["timestamp"],
+                    "date": pv["date"],
+                    "snapshot": snapshot,
+                }
+                new_visitors.append(visitor)
+                self._daily_visitor_sightings.append(visitor)
+
         return new_sightings, new_visitors
 
     async def sighting_monitoring_loop(self, dvrs: list[dict],
