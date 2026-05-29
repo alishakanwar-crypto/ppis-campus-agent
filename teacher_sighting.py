@@ -382,28 +382,31 @@ class TeacherSightingTracker:
                     teachers.append(result)
                 # else: known student/staff — skip (not a visitor)
             else:
-                # Unknown face — crop with generous padding to show
-                # head + upper body for easier identification on DVR cameras
+                # Unknown face — send full frame with face highlighted
+                # (face crops are too small on DVR cameras to be useful)
                 crop_b64 = ""
                 if bgr_img is not None and i < len(face_locations):
                     top, right, bottom, left = face_locations[i]
-                    h, w = bgr_img.shape[:2]
+                    # Draw rectangle around detected face on a copy
+                    annotated = bgr_img.copy()
                     face_h = bottom - top
                     face_w = right - left
-                    # Expand: 1x face height above, 2.5x below (show torso),
-                    # 1.5x face width on each side
-                    pad_top = int(face_h * 1.0)
-                    pad_bottom = int(face_h * 2.5)
-                    pad_left = int(face_w * 1.5)
-                    pad_right = int(face_w * 1.5)
-                    y1 = max(0, top - pad_top)
-                    y2 = min(h, bottom + pad_bottom)
-                    x1 = max(0, left - pad_left)
-                    x2 = min(w, right + pad_right)
-                    face_crop = bgr_img[y1:y2, x1:x2]
-                    if face_crop.size > 0:
-                        _, buf = cv2.imencode(".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                        crop_b64 = base64.b64encode(buf).decode()
+                    # Expand box to show head + upper body
+                    pad_top = int(face_h * 0.5)
+                    pad_bottom = int(face_h * 3.0)
+                    pad_lr = int(face_w * 1.5)
+                    h, w = annotated.shape[:2]
+                    box_y1 = max(0, top - pad_top)
+                    box_y2 = min(h, bottom + pad_bottom)
+                    box_x1 = max(0, left - pad_lr)
+                    box_x2 = min(w, right + pad_lr)
+                    cv2.rectangle(annotated, (box_x1, box_y1), (box_x2, box_y2),
+                                  (0, 0, 255), 3)
+                    cv2.putText(annotated, "UNKNOWN", (box_x1, box_y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                    _, buf = cv2.imencode(".jpg", annotated,
+                                          [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    crop_b64 = base64.b64encode(buf).decode()
                 unknown_faces.append((encoding, crop_b64))
 
         return teachers, unknown_faces
