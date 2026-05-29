@@ -382,14 +382,24 @@ class TeacherSightingTracker:
                     teachers.append(result)
                 # else: known student/staff — skip (not a visitor)
             else:
-                # Unknown face — crop and include for alert
+                # Unknown face — crop with generous padding to show
+                # head + upper body for easier identification on DVR cameras
                 crop_b64 = ""
                 if bgr_img is not None and i < len(face_locations):
                     top, right, bottom, left = face_locations[i]
                     h, w = bgr_img.shape[:2]
-                    pad = 30
-                    y1, y2 = max(0, top - pad), min(h, bottom + pad)
-                    x1, x2 = max(0, left - pad), min(w, right + pad)
+                    face_h = bottom - top
+                    face_w = right - left
+                    # Expand: 1x face height above, 2.5x below (show torso),
+                    # 1.5x face width on each side
+                    pad_top = int(face_h * 1.0)
+                    pad_bottom = int(face_h * 2.5)
+                    pad_left = int(face_w * 1.5)
+                    pad_right = int(face_w * 1.5)
+                    y1 = max(0, top - pad_top)
+                    y2 = min(h, bottom + pad_bottom)
+                    x1 = max(0, left - pad_left)
+                    x2 = min(w, right + pad_right)
                     face_crop = bgr_img[y1:y2, x1:x2]
                     if face_crop.size > 0:
                         _, buf = cv2.imencode(".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
