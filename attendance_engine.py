@@ -85,14 +85,10 @@ ATTENDANCE_START_MINUTE = 30
 ATTENDANCE_END_HOUR = 12
 ATTENDANCE_END_MINUTE = 0
 
-# Three-phase attendance windows (production mode from 18 May 2026)
-# Phase 1: Teacher recognition (6:30-8:00 AM)
-#   DVR3 Ch23 Administration Camera ONLY, confidence 35-45%, min 1 sighting
-# Phase 2: Summer Camp students (8:15-9:15 AM)
-#   Scan ALL classroom cameras (students can sit anywhere), 35-50%, min 2 sightings
-# Phase 3: Grades 9-12 students (8:15-9:15 AM)
-#   Scan ONLY assigned classroom cameras, 35-50%, min 2 sightings
-# Open House (16 May 2026): special wider windows
+# Attendance windows (from 1 July 2026 — normal classes resume)
+# Teacher attendance: handled by TrueFace 3000 only (DVR = recognition, no marking)
+# Student attendance: ALL grades (Popsicles to Grade 12) scanned from
+#   their respective classroom cameras, 40-75% confidence, min 2 sightings
 
 OPEN_HOUSE_DATE = "2026-05-16"  # Saturday Open House
 
@@ -184,43 +180,16 @@ ENTRY_VALIDATION_CAMERAS = {
 FORCE_RENOTIFY_TEST = False
 
 # ---------------------------------------------------------------------------
-# STUDENT CATEGORY DEFINITIONS (for Phase 2 & Phase 3 scanning)
+# STUDENT CATEGORY DEFINITIONS
 # ---------------------------------------------------------------------------
-# Grades 9-12: sit in their assigned classrooms ONLY → grade-specific scanning
-GRADES_9_TO_12 = {
-    "GRADE9A", "GRADE9B", "GRADE9C",
-    "GRADE10A", "GRADE10B", "GRADE10C",
-    "GRADE11A", "GRADE11B", "GRADE11C",
-    "GRADE12A", "GRADE12B", "GRADE12C",
-}
+# All students (Popsicles to Grade 12) scanned from their respective
+# classroom cameras. No summer camp / Grade 9-12 separation.
 
-# Summer camp students: may sit in ANY classroom → scan all cameras
-# Identified by person_id NOT matching any Grade 9-12 pattern
-def _is_grade_9_to_12_student(person_id: str) -> bool:
-    """Check if a student belongs to Grades 9-12 based on person_id."""
-    grade = _grade_from_person_id(person_id)
-    return grade in GRADES_9_TO_12 if grade else False
-
-# ---------------------------------------------------------------------------
-# MEAL SNAPSHOT NOTIFICATION SCHEDULE (Summer Camp)
-# ---------------------------------------------------------------------------
-# Sends classroom camera snapshots to parents of present children during
-# meal breaks. Uses ppis_meal_update template (force-send via template API).
-# Active: weekdays only, until May 26, 2026.
+# Meal snapshot disabled (summer camp ended)
 MEAL_SNAPSHOT_ENABLED = False
-MEAL_SNAPSHOT_END_DATE = "2026-05-26"  # Last day of summer camp
-MEAL_WINDOWS = [
-    # (start_hour, start_min, end_hour, end_min, label)
-    (8, 45, 9, 0, "Short Break"),
-    (11, 30, 12, 0, "Lunch Break"),
-]
-# Summer camp meal room mapping: younger students eat in Grade 1A/1B,
-# while Grades 9-12 eat in their own classrooms.
-MEAL_OWN_CLASSROOM_GRADES = {"GRADE9A", "GRADE9B", "GRADE10A", "GRADE10B",
-                              "GRADE11A", "GRADE11B", "GRADE12A", "GRADE12B"}
-# Summer camp students eat in these rooms (snapshot any of them)
-MEAL_CAMP_ROOM_GRADES = {"GRADE1A", "GRADE1B", "GRADE2A", "GRADE2B",
-                          "NURSERY", "PREP", "PREP1", "PREP2", "PREP3"}
+MEAL_WINDOWS: list[tuple[int, int, int, int, str]] = []
+MEAL_OWN_CLASSROOM_GRADES: set[str] = set()
+MEAL_CAMP_ROOM_GRADES: set[str] = set()
 
 # Summer break schedule: grades on break won't be scanned on classroom cameras.
 # Teachers and entry gate/reception scanning continue normally.
@@ -523,7 +492,7 @@ class AttendanceEngine:
         self.classwise_running = False
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
-        self.confidence_threshold = 0.35  # Student min confidence 35%
+        self.confidence_threshold = 0.40  # Student min confidence 40%
         self.confidence_max = 0.75  # Student max confidence 75%
         self.review_threshold = 0.30  # Below 30% gets rejected outright
         self.min_sightings = 2  # Students: require 2 independent sightings
@@ -2718,21 +2687,19 @@ class AttendanceEngine:
             self.add_debug_log(
                 "classwise_started",
                 f"Mode: {mode} | "
-                f"Phase1 teacher cams: {len(teacher_phase_cams)} "
-                f"(Admin={len(administration_cams)}, Principal={len(teacher_principal_cams)}) | "
-                f"Phase2 student cams: {len(student_phase_cams_classroom)} classroom ONLY | "
+                f"Teacher DVR recognition (no attendance marking): "
+                f"{len(teacher_phase_cams)} cams | "
+                f"Student classroom cams: {len(student_phase_cams_classroom)} | "
                 f"Other (skipped): {len(all_other_cams)} | "
                 f"{len(self.known_faces)} total faces loaded, "
                 f"{len(self._grade_face_cache)} grades with faces | "
-                f"Teacher window: {_tw_log[0]}:{_tw_log[1]:02d}-"
-                f"{_tw_log[2]}:{_tw_log[3]:02d} | "
                 f"Student window: {_sw_log[0]}:{_sw_log[1]:02d}-"
-                f"{_sw_log[2]}:{_sw_log[3]:02d}"
+                f"{_sw_log[2]}:{_sw_log[3]:02d} | "
+                f"Student confidence: {self.confidence_threshold:.0%}-{self.confidence_max:.0%}, "
+                f"min {self.min_sightings} sightings"
             )
-            if teacher_phase_cams:
-                logger.info(f"Phase1 teacher cameras: {[c['label'] for c in teacher_phase_cams]}")
             if student_phase_cams_classroom:
-                logger.info(f"Phase2 classroom cameras: {[c['label'] for c in student_phase_cams_classroom[:5]]}... ({len(student_phase_cams_classroom)} total)")
+                logger.info(f"Student classroom cameras: {[c['label'] for c in student_phase_cams_classroom[:5]]}... ({len(student_phase_cams_classroom)} total)")
 
             # Resync disabled — backend already has all records and handles
             # notifications as safety net. Resync was causing startup crashes.
@@ -2946,72 +2913,15 @@ class AttendanceEngine:
                             logger.error(f"Error scanning {cam['label']}: {e}")
                         await asyncio.sleep(0.1)
 
-                # === PHASE 2: Student Recognition ===
+                # === STUDENT RECOGNITION (all grades, respective classrooms) ===
                 if in_student_phase:
                     if cycle <= 1 or (cycle % 30 == 0):
                         self.add_debug_log("student_phase",
-                                           f"Phase 2 ACTIVE (OPEN HOUSE): scanning "
+                                           f"Student phase ACTIVE: scanning "
                                            f"{len(student_phase_cams_classroom)} classroom cameras "
-                                           f"for student faces + admin cam for teachers")
+                                           f"(all grades, respective classrooms)")
 
-                    # 2a. Scan gate/reception cameras for ALL student faces (parallel by DVR)
-                    gate_cams_to_scan = [
-                        cam for cam in student_phase_cams_gate
-                        if not (in_teacher_phase and cam in teacher_phase_cams)
-                    ]
-                    if gate_cams_to_scan:
-                        gate_dvr_groups: dict[str, list] = {}
-                        for cam in gate_cams_to_scan:
-                            ip = cam["dvr"]["ip"]
-                            gate_dvr_groups.setdefault(ip, []).append(cam)
-
-                        async def _scan_gate_group(cams):
-                            _s, _f, _e = 0, 0, 0
-                            for cam in cams:
-                                if not self.classwise_running:
-                                    break
-                                try:
-                                    self._classwise_stats["current_camera"] = cam["label"]
-                                    results = await self.scan_camera(
-                                        cam["dvr"], cam["channel"], cam["label"],
-                                        faces_subset=None, insightface_subset=None,
-                                    )
-                                    _s += 1
-                                    _f += len(results)
-                                except Exception as e:
-                                    _e += 1
-                                    logger.error(f"Error scanning {cam['label']}: {e}")
-                                await asyncio.sleep(0.1)
-                            return _s, _f, _e
-
-                        gate_tasks = [_scan_gate_group(cams) for cams in gate_dvr_groups.values()]
-                        gate_results = await asyncio.gather(*gate_tasks, return_exceptions=True)
-                        for r in gate_results:
-                            if isinstance(r, tuple):
-                                scanned += r[0]
-                                faces_in_cycle += r[1]
-                                cycle_errors += r[2]
-                                self._classwise_stats["errors"] += r[2]
-                    gc.collect()
-
-                    # 2b. Dual student scanning logic:
-                    #   Phase 2 (Summer Camp): Scan ALL cameras with ALL
-                    #     non-Grade-9-12 student faces (they can sit anywhere).
-                    #   Phase 3 (Grades 9-12): Scan ONLY assigned classroom
-                    #     cameras with grade-specific faces.
                     active_classroom_cams = student_phase_cams_classroom
-
-                    # Build face subsets once per cycle
-                    summer_camp_faces = {
-                        k: v for k, v in self.known_faces.items()
-                        if not k.startswith(("TEACHER_", "PRINCIPAL_"))
-                        and not _is_grade_9_to_12_student(k)
-                    }
-                    summer_camp_faces_if = {
-                        k: v for k, v in self.known_faces_insightface.items()
-                        if not k.startswith(("TEACHER_", "PRINCIPAL_"))
-                        and not _is_grade_9_to_12_student(k)
-                    }
 
                     BATCH_SIZE = 10
                     for batch_start in range(0, len(active_classroom_cams), BATCH_SIZE):
@@ -3022,28 +2932,19 @@ class AttendanceEngine:
                             try:
                                 cam_grade = cam.get("grade")
 
-                                # Merge faces to scan on this camera:
-                                # 1) Summer camp students → always included (can be in any room)
-                                # 2) Grade 9-12 students → only if camera matches their grade
-                                faces_to_scan = dict(summer_camp_faces)
-                                faces_to_scan_if = dict(summer_camp_faces_if)
+                                # Load only faces of students assigned to this classroom's grade
+                                grade_faces = self._grade_face_cache.get(cam_grade, {}) if cam_grade else {}
+                                grade_faces_if = self._grade_face_cache_insightface.get(cam_grade, {}) if cam_grade else {}
 
-                                if cam_grade and cam_grade in GRADES_9_TO_12:
-                                    # Add grade-specific 9-12 faces for this camera
-                                    grade_faces = self._grade_face_cache.get(cam_grade, {})
-                                    grade_faces_if = self._grade_face_cache_insightface.get(cam_grade, {})
-                                    faces_to_scan.update(grade_faces)
-                                    faces_to_scan_if.update(grade_faces_if)
-
-                                if not faces_to_scan and not faces_to_scan_if:
+                                if not grade_faces and not grade_faces_if:
                                     scanned += 1
                                     continue
 
                                 self._classwise_stats["current_camera"] = cam["label"]
                                 results = await self.scan_camera(
                                     cam["dvr"], cam["channel"], cam["label"],
-                                    faces_subset=faces_to_scan,
-                                    insightface_subset=faces_to_scan_if,
+                                    faces_subset=grade_faces if grade_faces else None,
+                                    insightface_subset=grade_faces_if if grade_faces_if else None,
                                 )
                                 scanned += 1
                                 faces_in_cycle += len(results)
