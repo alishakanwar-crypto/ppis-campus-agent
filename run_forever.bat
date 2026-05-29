@@ -49,15 +49,10 @@ timeout /t 2 /nobreak >nul
 echo ============================================
 echo [%DATE% %TIME%] Pulling latest code...
 echo ============================================
-REM Force-sync to latest remote code (nuclear but reliable)
+REM Force-sync to latest remote main branch
 git fetch origin 2>nul
-for /f "tokens=*" %%b in ('git symbolic-ref refs/remotes/origin/HEAD 2^>nul') do set "DEFAULT_BRANCH=%%b"
-if defined DEFAULT_BRANCH (
-    set "DEFAULT_BRANCH=!DEFAULT_BRANCH:refs/remotes/origin/=!"
-    git reset --hard "origin/!DEFAULT_BRANCH!" 2>nul
-) else (
-    git reset --hard origin/main 2>nul
-)
+git checkout main 2>nul
+git reset --hard origin/main 2>nul
 
 REM Clear bytecode cache to avoid stale .pyc files after code updates
 if exist "%~dp0__pycache__" rmdir /s /q "%~dp0__pycache__" 2>nul
