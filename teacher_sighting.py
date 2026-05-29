@@ -62,10 +62,8 @@ SIGHTING_COOLDOWN = 300  # 5 minutes
 VISITOR_COOLDOWN = 600  # 10 minutes
 
 # Minimum face size (pixels) to consider for visitor alerts.
-# Faces smaller than this are likely false positives (car reflections,
-# gate patterns, distant objects). DVR cameras at 720p typically show
-# a real face at ~50px+ when person is near the gate.
-MIN_VISITOR_FACE_SIZE = 40
+# Lowered to 20px to avoid filtering distant but real faces at Entry Gate.
+MIN_VISITOR_FACE_SIZE = 20
 
 # Cameras to monitor specifically for visitors (entry + reception only)
 VISITOR_CAMERA_KEYWORDS = [
@@ -397,7 +395,7 @@ class TeacherSightingTracker:
                     face_w = right - left
                     # Skip tiny faces — likely false positives (car, gate, etc.)
                     if face_h < MIN_VISITOR_FACE_SIZE or face_w < MIN_VISITOR_FACE_SIZE:
-                        logger.debug(f"[VISITOR] Skipping tiny face {face_w}x{face_h}px (min={MIN_VISITOR_FACE_SIZE})")
+                        logger.info(f"[VISITOR] Skipping tiny face {face_w}x{face_h}px (min={MIN_VISITOR_FACE_SIZE})")
                         continue
                     # Draw rectangle around detected face on a copy
                     annotated = bgr_img.copy()
