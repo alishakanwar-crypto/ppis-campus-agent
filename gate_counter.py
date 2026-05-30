@@ -165,6 +165,33 @@ signal.signal(signal.SIGTERM, _handle_signal)
 # DVR Snapshot Capture (Hikvision ISAPI)
 # ---------------------------------------------------------------------------
 
+# DVR IPs where ISAPI auth is broken but RTSP works
+_RTSP_FALLBACK_IPS: set[str] = {"192.168.0.13"}  # DVR 4
+
+
+def _capture_gate_frame_rtsp(channel: int, dvr_ip: str) -> np.ndarray | None:
+    """Capture a single frame via RTSP (fallback for DVRs with broken ISAPI)."""
+    creds = DVR_CREDS.get(dvr_ip, {})
+    dvr_user = creds.get("user", DVR_DEFAULT_USER)
+    dvr_pass = creds.get("pass", "")
+    stream_channel = channel * 100 + 1
+    safe_pwd = dvr_pass.replace("@", "%40")
+    rtsp_url = f"rtsp://{dvr_user}:{safe_pwd}@{dvr_ip}:554/Streaming/Channels/{stream_channel}"
+    try:
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            logger.warning("RTSP fallback failed to open %s ch%d", dvr_ip, channel)
+            return None
+        ret, frame = cap.read()
+        cap.release()
+        if ret and frame is not None:
+            logger.info("RTSP fallback captured frame from %s ch%d", dvr_ip, channel)
+            return frame
+    except Exception as e:
+        logger.error("RTSP fallback error %s ch%d: %s", dvr_ip, channel, e)
+    return None
+
+
 def capture_gate_frame(channel: int, dvr_ip: str = "192.168.0.14") -> np.ndarray | None:
     """Capture a JPEG frame from a DVR camera and return as numpy array."""
     stream_channel = channel * 100 + 1
@@ -193,8 +220,13 @@ def capture_gate_frame(channel: int, dvr_ip: str = "192.168.0.14") -> np.ndarray
                     channel, resp.status_code,
                     resp.headers.get("content-type", "unknown"),
                 )
+                # RTSP fallback for DVRs with broken ISAPI auth
+                if dvr_ip in _RTSP_FALLBACK_IPS:
+                    return _capture_gate_frame_rtsp(channel, dvr_ip)
     except Exception as e:
         logger.error("Gate frame capture error ch%d: %s", channel, e)
+        if dvr_ip in _RTSP_FALLBACK_IPS:
+            return _capture_gate_frame_rtsp(channel, dvr_ip)
 
     return None
 

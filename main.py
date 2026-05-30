@@ -427,6 +427,61 @@ def compress_jpeg(data: bytes, max_bytes: int = 200_000, quality_start: int = 70
 _last_capture_error: str = ""
 
 
+# ---------------------------------------------------------------------------
+# RTSP Snapshot Fallback (for DVRs where ISAPI auth is broken)
+# ---------------------------------------------------------------------------
+_RTSP_FALLBACK_IPS: set[str] = {"192.168.0.13"}  # DVR 4 — ISAPI 401 but RTSP works
+
+
+def _capture_frame_rtsp(ip: str, port: int, user: str, pwd: str,
+                        channel: int) -> bytes | None:
+    """Capture a single JPEG frame via RTSP using OpenCV.
+
+    This is a synchronous fallback for DVRs where ISAPI returns 401 but RTSP works.
+    """
+    try:
+        import cv2
+    except ImportError:
+        logger.warning("[RTSP] cv2 not available for RTSP fallback")
+        return None
+
+    stream_channel = channel * 100 + 1
+    # URL-encode the @ in password
+    safe_pwd = pwd.replace("@", "%40")
+    rtsp_url = f"rtsp://{user}:{safe_pwd}@{ip}:{port}/Streaming/Channels/{stream_channel}"
+    logger.debug("[RTSP] Attempting capture from %s ch%d", ip, channel)
+
+    cap = None
+    try:
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            logger.warning("[RTSP] Failed to open %s ch%d", ip, channel)
+            return None
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            logger.warning("[RTSP] Failed to read frame from %s ch%d", ip, channel)
+            return None
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if ok:
+            logger.info("[RTSP] Captured frame from %s ch%d (%d bytes)",
+                        ip, channel, len(buf))
+            return buf.tobytes()
+        return None
+    except Exception as e:
+        logger.error("[RTSP] Error capturing from %s ch%d: %s", ip, channel, e)
+        return None
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+async def _capture_snapshot_rtsp(dvr: dict, channel: int) -> bytes | None:
+    """Async wrapper around synchronous RTSP capture."""
+    return await asyncio.get_event_loop().run_in_executor(
+        None, _capture_frame_rtsp,
+        dvr["ip"], 554, dvr["username"], dvr["password"], channel)
+
+
 async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
     """Capture a JPEG snapshot from a Hikvision NVR via ISAPI.
 
@@ -496,23 +551,36 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
                     _last_capture_error = ""
                     return resp3.content
 
+                # RTSP fallback for DVRs with broken ISAPI auth
+                if ip in _RTSP_FALLBACK_IPS:
+                    logger.info(f"ISAPI failed on {ip} ch{channel}, trying RTSP fallback")
+                    rtsp_frame = await _capture_snapshot_rtsp(dvr, channel)
+                    if rtsp_frame:
+                        _last_capture_error = ""
+                        return rtsp_frame
+
                 return None
     except httpx.ConnectError as e:
         _last_capture_error = f"{ip} ch{channel}: connection_refused ({e})"
         logger.error(f"Snapshot connection error from {ip} ch{channel}: {e}")
-        return None
     except httpx.ConnectTimeout as e:
         _last_capture_error = f"{ip} ch{channel}: connect_timeout ({e})"
         logger.error(f"Snapshot connect timeout from {ip} ch{channel}: {e}")
-        return None
     except httpx.ReadTimeout as e:
         _last_capture_error = f"{ip} ch{channel}: read_timeout ({e})"
         logger.error(f"Snapshot read timeout from {ip} ch{channel}: {e}")
-        return None
     except Exception as e:
         _last_capture_error = f"{ip} ch{channel}: {type(e).__name__}: {e}"
         logger.error(f"Snapshot error from {ip} ch{channel}: {e}")
-        return None
+
+    # Final RTSP fallback after any ISAPI error
+    if ip in _RTSP_FALLBACK_IPS:
+        logger.info(f"ISAPI error on {ip} ch{channel}, trying RTSP fallback")
+        rtsp_frame = await _capture_snapshot_rtsp(dvr, channel)
+        if rtsp_frame:
+            _last_capture_error = ""
+            return rtsp_frame
+    return None
 
 
 async def test_dvr_connection(dvr: dict) -> dict:

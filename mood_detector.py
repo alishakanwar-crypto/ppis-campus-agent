@@ -264,7 +264,7 @@ class MoodDetector:
         return self._dvr_clients[ip]
 
     async def _capture_frame(self, dvr: dict, channel: int) -> bytes | None:
-        """Capture a single JPEG frame from a DVR camera via ISAPI."""
+        """Capture a single JPEG frame from a DVR camera via ISAPI (RTSP fallback for DVR 4)."""
         ip = dvr["ip"]
         port = dvr.get("port", 80)
         client = self._get_dvr_client(dvr)
@@ -276,8 +276,15 @@ class MoodDetector:
             if resp.status_code == 200 and resp.headers.get(
                     "content-type", "").startswith("image"):
                 return resp.content
+            if resp.status_code == 401:
+                from main import _RTSP_FALLBACK_IPS, _capture_snapshot_rtsp
+                if ip in _RTSP_FALLBACK_IPS:
+                    return await _capture_snapshot_rtsp(dvr, channel)
         except Exception as e:
             logger.debug(f"[MOOD] Capture failed {ip} ch{channel}: {e}")
+            from main import _RTSP_FALLBACK_IPS, _capture_snapshot_rtsp
+            if ip in _RTSP_FALLBACK_IPS:
+                return await _capture_snapshot_rtsp(dvr, channel)
         return None
 
     def _detect_tracked_person(self, image_bytes: bytes) -> list[dict]:

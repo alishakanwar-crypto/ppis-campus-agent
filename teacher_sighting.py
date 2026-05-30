@@ -232,7 +232,7 @@ class TeacherSightingTracker:
         return self._dvr_clients[ip]
 
     async def _capture_frame(self, dvr: dict, channel: int) -> bytes | None:
-        """Capture a single JPEG frame from a DVR camera via ISAPI."""
+        """Capture a single JPEG frame from a DVR camera via ISAPI (RTSP fallback for DVR 4)."""
         ip = dvr["ip"]
         port = dvr.get("port", 80)
         client = self._get_dvr_client(dvr)
@@ -252,9 +252,17 @@ class TeacherSightingTracker:
                     return resp2.content
                 logger.warning(
                     f"[SIGHTING] 401 Unauthorized on {ip} ch{channel} "
-                    f"(digest+basic failed) — check DVR credentials")
+                    f"(digest+basic failed) — trying RTSP fallback")
+                # RTSP fallback for DVRs with broken ISAPI auth
+                from main import _RTSP_FALLBACK_IPS, _capture_snapshot_rtsp
+                if ip in _RTSP_FALLBACK_IPS:
+                    return await _capture_snapshot_rtsp(dvr, channel)
         except Exception as e:
             logger.debug(f"[SIGHTING] Capture failed {ip} ch{channel}: {e}")
+            # RTSP fallback on connection errors too
+            from main import _RTSP_FALLBACK_IPS, _capture_snapshot_rtsp
+            if ip in _RTSP_FALLBACK_IPS:
+                return await _capture_snapshot_rtsp(dvr, channel)
         return None
 
     def _decode_image(self, image_bytes: bytes):
