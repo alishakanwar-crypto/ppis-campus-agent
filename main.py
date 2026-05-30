@@ -1086,6 +1086,75 @@ def _cleanup_old_snapshots():
             pass
 
 
+# ---------------------------------------------------------------------------
+# Periodic Entry Gate Snapshot → WhatsApp (every 10 minutes)
+# ---------------------------------------------------------------------------
+_GATE_SNAPSHOT_INTERVAL = 600  # 10 minutes
+_GATE_SNAPSHOT_CAMERA_IP = "192.168.0.14"  # DVR 3
+_GATE_SNAPSHOT_CHANNEL = 20               # Entry Gate-1
+_GATE_SNAPSHOT_API = f"{CLOUD_API_BASE}/api/gate/entry-gate-snapshot"
+
+
+async def _entry_gate_snapshot_loop():
+    """Capture Entry Gate-1 snapshot every 10 minutes and send to WhatsApp via backend."""
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    IST = _tz(_td(hours=5, minutes=30))
+
+    await asyncio.sleep(30)  # initial delay to let config load
+    logger.info("[GATE-SNAP] Entry gate snapshot loop started (every %ds)", _GATE_SNAPSHOT_INTERVAL)
+
+    while True:
+        try:
+            now = _dt.now(IST)
+            hour = now.hour
+            # Only send snapshots during school hours (7 AM - 5 PM IST)
+            if hour < 7 or hour >= 17:
+                logger.debug("[GATE-SNAP] Outside school hours (%d), skipping", hour)
+                await asyncio.sleep(_GATE_SNAPSHOT_INTERVAL)
+                continue
+
+            # Find DVR 3 in config
+            dvr = None
+            for d in config.get("dvrs", []):
+                if d.get("ip") == _GATE_SNAPSHOT_CAMERA_IP:
+                    dvr = d
+                    break
+
+            if not dvr:
+                logger.warning("[GATE-SNAP] DVR 3 (%s) not found in config", _GATE_SNAPSHOT_CAMERA_IP)
+                await asyncio.sleep(_GATE_SNAPSHOT_INTERVAL)
+                continue
+
+            frame = await capture_snapshot(dvr, _GATE_SNAPSHOT_CHANNEL)
+            if not frame:
+                logger.warning("[GATE-SNAP] Failed to capture Entry Gate-1 snapshot")
+                await asyncio.sleep(_GATE_SNAPSHOT_INTERVAL)
+                continue
+
+            # Compress if needed
+            frame = compress_jpeg(frame, max_bytes=200_000)
+
+            image_b64 = base64.b64encode(frame).decode("ascii")
+            ts = now.strftime("%d-%m-%Y %H:%M:%S IST")
+            payload = {
+                "image_b64": image_b64,
+                "camera": "ENTRY GATE-1",
+                "timestamp": ts,
+            }
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(_GATE_SNAPSHOT_API, json=payload)
+                if resp.status_code == 200:
+                    logger.info("[GATE-SNAP] Entry Gate snapshot sent to WhatsApp at %s", ts)
+                else:
+                    logger.warning("[GATE-SNAP] Backend returned %d: %s", resp.status_code, resp.text[:200])
+
+        except Exception as e:
+            logger.error("[GATE-SNAP] Error in snapshot loop: %s", e)
+
+        await asyncio.sleep(_GATE_SNAPSHOT_INTERVAL)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ws_task, config
@@ -1134,6 +1203,8 @@ async def lifespan(app: FastAPI):
             logger.error(f"Health watchdog failed: {e}", exc_info=True)
 
     asyncio.create_task(_delayed_watchdog())
+    # Start periodic Entry Gate snapshot → WhatsApp (every 10 min)
+    asyncio.create_task(_entry_gate_snapshot_loop())
     logger.info("PPIS Campus Agent started (24/7 mode with auto-recovery)")
     try:
         yield
