@@ -70,19 +70,22 @@ MIN_VISITOR_FACE_SIZE = 30
 # 0.45 distance ≈ 55% confidence minimum.
 TEACHER_MATCH_DISTANCE = 0.45
 
-# Cameras to monitor specifically for visitors (entry only — NOT dispersal/exit)
+# Cameras to monitor specifically for visitors (entry + exit + basement)
 VISITOR_CAMERA_KEYWORDS = [
-    "ENTRY", "ENTRANCE",  # Entry gates only (people entering)
+    "ENTRY", "ENTRANCE",  # Entry gates (people entering)
+    "DISPERSAL", "EXIT",  # Exit cameras (people leaving)
     "RECEPTION",           # Reception cameras (indoor follow-up)
+    "BASEMENT",            # Basement cameras (movement tracking)
 ]
 
 # Camera types to monitor for teacher sightings
 SIGHTING_CAMERA_KEYWORDS = [
-    "ENTRY", "ENTRANCE", "DISPERSAL",  # Entry gates
-    "RECEPTION",                         # Reception cameras
-    "TEACHER STAFF", "STAFF ROOM",       # Staff rooms
-    "ADMINISTRATION", "ADMIN",           # Administration
-    "ADMISSION",                         # Admission room
+    "ENTRY", "ENTRANCE", "DISPERSAL", "EXIT",  # Entry/exit gates
+    "RECEPTION",                                  # Reception cameras
+    "TEACHER STAFF", "STAFF ROOM",                # Staff rooms
+    "ADMINISTRATION", "ADMIN",                    # Administration
+    "ADMISSION",                                   # Admission room
+    "BASEMENT",                                    # Basement cameras
 ]
 
 
@@ -96,6 +99,17 @@ def _is_visitor_camera(location: str) -> bool:
     """Check if a camera location is relevant for visitor counting."""
     loc_upper = location.upper()
     return any(kw in loc_upper for kw in VISITOR_CAMERA_KEYWORDS)
+
+
+_EXIT_CAMERA_KEYWORDS = ("DISPERSAL", "EXIT")
+
+
+def _infer_direction(location: str) -> str:
+    """Infer movement direction from camera name: OUT for exit cameras, IN otherwise."""
+    loc_upper = location.upper()
+    if any(kw in loc_upper for kw in _EXIT_CAMERA_KEYWORDS):
+        return "OUT"
+    return "IN"
 
 
 # Color name mapping from HSV ranges
@@ -631,6 +645,7 @@ class TeacherSightingTracker:
                         "camera": cam_label,
                         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                         "date": today,
+                        "direction": _infer_direction(location),
                         "confidence": det["confidence"],
                         "outfit_color": outfit.get("dominant_color", "unknown"),
                         "outfit_colors": outfit.get("colors", []),
@@ -658,6 +673,7 @@ class TeacherSightingTracker:
                         "channel": channel,
                         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                         "date": today,
+                        "direction": _infer_direction(location),
                         "initial_snapshot": body_b64,
                         "snapshot_face": face_b64,
                         "snapshot_body": body_b64,
@@ -746,6 +762,7 @@ class TeacherSightingTracker:
                     "camera": cam_label,
                     "timestamp": pv["timestamp"],
                     "date": pv["date"],
+                    "direction": pv.get("direction", "IN"),
                     "snapshot": snapshot,
                     "snapshot_face": snapshot_face,
                     "snapshot_body": snapshot_body,
