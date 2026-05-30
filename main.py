@@ -427,6 +427,61 @@ def compress_jpeg(data: bytes, max_bytes: int = 200_000, quality_start: int = 70
 _last_capture_error: str = ""
 
 
+# ---------------------------------------------------------------------------
+# RTSP Snapshot Fallback (for DVRs where ISAPI auth is broken)
+# ---------------------------------------------------------------------------
+_RTSP_FALLBACK_IPS: set[str] = {"192.168.0.13"}  # DVR 4 — ISAPI 401 but RTSP works
+
+
+def _capture_frame_rtsp(ip: str, port: int, user: str, pwd: str,
+                        channel: int) -> bytes | None:
+    """Capture a single JPEG frame via RTSP using OpenCV.
+
+    This is a synchronous fallback for DVRs where ISAPI returns 401 but RTSP works.
+    """
+    try:
+        import cv2
+    except ImportError:
+        logger.warning("[RTSP] cv2 not available for RTSP fallback")
+        return None
+
+    stream_channel = channel * 100 + 1
+    # URL-encode the @ in password
+    safe_pwd = pwd.replace("@", "%40")
+    rtsp_url = f"rtsp://{user}:{safe_pwd}@{ip}:{port}/Streaming/Channels/{stream_channel}"
+    logger.debug("[RTSP] Attempting capture from %s ch%d", ip, channel)
+
+    cap = None
+    try:
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            logger.warning("[RTSP] Failed to open %s ch%d", ip, channel)
+            return None
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            logger.warning("[RTSP] Failed to read frame from %s ch%d", ip, channel)
+            return None
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if ok:
+            logger.info("[RTSP] Captured frame from %s ch%d (%d bytes)",
+                        ip, channel, len(buf))
+            return buf.tobytes()
+        return None
+    except Exception as e:
+        logger.error("[RTSP] Error capturing from %s ch%d: %s", ip, channel, e)
+        return None
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+async def _capture_snapshot_rtsp(dvr: dict, channel: int) -> bytes | None:
+    """Async wrapper around synchronous RTSP capture."""
+    return await asyncio.get_event_loop().run_in_executor(
+        None, _capture_frame_rtsp,
+        dvr["ip"], 554, dvr["username"], dvr["password"], channel)
+
+
 async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
     """Capture a JPEG snapshot from a Hikvision NVR via ISAPI.
 
@@ -496,23 +551,36 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
                     _last_capture_error = ""
                     return resp3.content
 
+                # RTSP fallback for DVRs with broken ISAPI auth
+                if ip in _RTSP_FALLBACK_IPS:
+                    logger.info(f"ISAPI failed on {ip} ch{channel}, trying RTSP fallback")
+                    rtsp_frame = await _capture_snapshot_rtsp(dvr, channel)
+                    if rtsp_frame:
+                        _last_capture_error = ""
+                        return rtsp_frame
+
                 return None
     except httpx.ConnectError as e:
         _last_capture_error = f"{ip} ch{channel}: connection_refused ({e})"
         logger.error(f"Snapshot connection error from {ip} ch{channel}: {e}")
-        return None
     except httpx.ConnectTimeout as e:
         _last_capture_error = f"{ip} ch{channel}: connect_timeout ({e})"
         logger.error(f"Snapshot connect timeout from {ip} ch{channel}: {e}")
-        return None
     except httpx.ReadTimeout as e:
         _last_capture_error = f"{ip} ch{channel}: read_timeout ({e})"
         logger.error(f"Snapshot read timeout from {ip} ch{channel}: {e}")
-        return None
     except Exception as e:
         _last_capture_error = f"{ip} ch{channel}: {type(e).__name__}: {e}"
         logger.error(f"Snapshot error from {ip} ch{channel}: {e}")
-        return None
+
+    # Final RTSP fallback after any ISAPI error
+    if ip in _RTSP_FALLBACK_IPS:
+        logger.info(f"ISAPI error on {ip} ch{channel}, trying RTSP fallback")
+        rtsp_frame = await _capture_snapshot_rtsp(dvr, channel)
+        if rtsp_frame:
+            _last_capture_error = ""
+            return rtsp_frame
+    return None
 
 
 async def test_dvr_connection(dvr: dict) -> dict:
@@ -1086,6 +1154,75 @@ def _cleanup_old_snapshots():
             pass
 
 
+# ---------------------------------------------------------------------------
+# Periodic Entry Gate Snapshot → WhatsApp (every 10 minutes)
+# ---------------------------------------------------------------------------
+_GATE_SNAPSHOT_INTERVAL = 600  # 10 minutes
+_GATE_SNAPSHOT_CAMERA_IP = "192.168.0.14"  # DVR 3
+_GATE_SNAPSHOT_CHANNEL = 20               # Entry Gate-1
+_GATE_SNAPSHOT_API = f"{CLOUD_API_BASE}/api/gate/entry-gate-snapshot"
+
+
+async def _entry_gate_snapshot_loop():
+    """Capture Entry Gate-1 snapshot every 10 minutes and send to WhatsApp via backend."""
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    IST = _tz(_td(hours=5, minutes=30))
+
+    await asyncio.sleep(30)  # initial delay to let config load
+    logger.info("[GATE-SNAP] Entry gate snapshot loop started (every %ds)", _GATE_SNAPSHOT_INTERVAL)
+
+    while True:
+        try:
+            now = _dt.now(IST)
+            hour = now.hour
+            # Only send snapshots during school hours (7 AM - 5 PM IST)
+            if hour < 7 or hour >= 17:
+                logger.debug("[GATE-SNAP] Outside school hours (%d), skipping", hour)
+                await asyncio.sleep(_GATE_SNAPSHOT_INTERVAL)
+                continue
+
+            # Find DVR 3 in config
+            dvr = None
+            for d in config.get("dvrs", []):
+                if d.get("ip") == _GATE_SNAPSHOT_CAMERA_IP:
+                    dvr = d
+                    break
+
+            if not dvr:
+                logger.warning("[GATE-SNAP] DVR 3 (%s) not found in config", _GATE_SNAPSHOT_CAMERA_IP)
+                await asyncio.sleep(_GATE_SNAPSHOT_INTERVAL)
+                continue
+
+            frame = await capture_snapshot(dvr, _GATE_SNAPSHOT_CHANNEL)
+            if not frame:
+                logger.warning("[GATE-SNAP] Failed to capture Entry Gate-1 snapshot")
+                await asyncio.sleep(_GATE_SNAPSHOT_INTERVAL)
+                continue
+
+            # Compress if needed
+            frame = compress_jpeg(frame, max_bytes=200_000)
+
+            image_b64 = base64.b64encode(frame).decode("ascii")
+            ts = now.strftime("%d-%m-%Y %H:%M:%S IST")
+            payload = {
+                "image_b64": image_b64,
+                "camera": "ENTRY GATE-1",
+                "timestamp": ts,
+            }
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(_GATE_SNAPSHOT_API, json=payload)
+                if resp.status_code == 200:
+                    logger.info("[GATE-SNAP] Entry Gate snapshot sent to WhatsApp at %s", ts)
+                else:
+                    logger.warning("[GATE-SNAP] Backend returned %d: %s", resp.status_code, resp.text[:200])
+
+        except Exception as e:
+            logger.error("[GATE-SNAP] Error in snapshot loop: %s", e)
+
+        await asyncio.sleep(_GATE_SNAPSHOT_INTERVAL)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ws_task, config
@@ -1134,6 +1271,8 @@ async def lifespan(app: FastAPI):
             logger.error(f"Health watchdog failed: {e}", exc_info=True)
 
     asyncio.create_task(_delayed_watchdog())
+    # Start periodic Entry Gate snapshot → WhatsApp (every 10 min)
+    asyncio.create_task(_entry_gate_snapshot_loop())
     logger.info("PPIS Campus Agent started (24/7 mode with auto-recovery)")
     try:
         yield

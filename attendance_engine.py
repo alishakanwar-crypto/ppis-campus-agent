@@ -2445,6 +2445,13 @@ class AttendanceEngine:
                     self.add_debug_log("dvr_error",
                                        f"Capture failed from {ip} ch{channel} "
                                        f"after {max_retries} attempts: {e}")
+        # RTSP fallback for DVRs with broken ISAPI auth (e.g. DVR 4)
+        try:
+            from main import _RTSP_FALLBACK_IPS, _capture_snapshot_rtsp
+            if ip in _RTSP_FALLBACK_IPS:
+                return await _capture_snapshot_rtsp(dvr, channel)
+        except Exception:
+            pass
         return None
 
     async def scan_camera(self, dvr: dict, channel: int,
