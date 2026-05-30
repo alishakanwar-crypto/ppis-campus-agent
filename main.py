@@ -1272,8 +1272,9 @@ async def lifespan(app: FastAPI):
             logger.error(f"Health watchdog failed: {e}", exc_info=True)
 
     asyncio.create_task(_delayed_watchdog())
-    # Start periodic Entry Gate snapshot → WhatsApp (every 10 min)
-    asyncio.create_task(_entry_gate_snapshot_loop())
+    # Periodic Entry Gate snapshots DISABLED per user request (2026-05-30).
+    # User only wants unknown person alerts, not routine snapshots.
+    # asyncio.create_task(_entry_gate_snapshot_loop())
     logger.info("PPIS Campus Agent started (24/7 mode with auto-recovery)")
     try:
         yield
