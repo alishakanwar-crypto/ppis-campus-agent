@@ -350,11 +350,12 @@ class TeacherSightingTracker:
 
         return results
 
-    def _detect_faces_with_visitors(self, image_bytes: bytes) -> tuple[list[dict], list[tuple[np.ndarray, str]]]:
+    def _detect_faces_with_visitors(self, image_bytes: bytes) -> tuple[list[dict], list[tuple[np.ndarray, str, str, str]]]:
         """Detect all faces in an image. Returns (known_teachers, unknown_faces).
 
         Matches each face against ALL registered persons (teachers, students, staff).
-        Faces that don't match anyone are returned as (encoding, face_crop_b64) tuples.
+        Faces that don't match anyone are returned as
+        (encoding, face_crop_b64, body_b64, context_b64) tuples — 3-angle photos.
         """
         if not self._all_encodings:
             return [], []
@@ -369,7 +370,7 @@ class TeacherSightingTracker:
             bgr_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
 
         teachers = []
-        unknown_faces: list[tuple[np.ndarray, str]] = []
+        unknown_faces: list[tuple[np.ndarray, str, str, str]] = []
 
         for i, encoding in enumerate(face_encodings):
             best_match = None
@@ -408,36 +409,48 @@ class TeacherSightingTracker:
                     teachers.append(result)
                 # else: known student/staff — skip (not a visitor)
             else:
-                # Unknown face — send full frame with face highlighted
-                # (face crops are too small on DVR cameras to be useful)
-                crop_b64 = ""
-                if bgr_img is not None and i < len(face_locations):
-                    top, right, bottom, left = face_locations[i]
-                    face_h = bottom - top
-                    face_w = right - left
-                    # Skip tiny faces — likely false positives (car, gate, etc.)
-                    if face_h < MIN_VISITOR_FACE_SIZE or face_w < MIN_VISITOR_FACE_SIZE:
-                        logger.info(f"[VISITOR] Skipping tiny face {face_w}x{face_h}px (min={MIN_VISITOR_FACE_SIZE})")
-                        continue
-                    # Draw rectangle around detected face on a copy
-                    annotated = bgr_img.copy()
-                    # Expand box to show head + upper body
-                    pad_top = int(face_h * 0.5)
-                    pad_bottom = int(face_h * 3.0)
-                    pad_lr = int(face_w * 1.5)
-                    h, w = annotated.shape[:2]
-                    box_y1 = max(0, top - pad_top)
-                    box_y2 = min(h, bottom + pad_bottom)
-                    box_x1 = max(0, left - pad_lr)
-                    box_x2 = min(w, right + pad_lr)
-                    cv2.rectangle(annotated, (box_x1, box_y1), (box_x2, box_y2),
-                                  (0, 0, 255), 3)
-                    cv2.putText(annotated, "UNKNOWN", (box_x1, box_y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-                    _, buf = cv2.imencode(".jpg", annotated,
-                                          [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    crop_b64 = base64.b64encode(buf).decode()
-                unknown_faces.append((encoding, crop_b64))
+                # Unknown face — generate 3-angle photos
+                if bgr_img is None or i >= len(face_locations):
+                    continue
+                top, right, bottom, left = face_locations[i]
+                face_h = bottom - top
+                face_w = right - left
+                if face_h < MIN_VISITOR_FACE_SIZE or face_w < MIN_VISITOR_FACE_SIZE:
+                    logger.info(f"[VISITOR] Skipping tiny face {face_w}x{face_h}px (min={MIN_VISITOR_FACE_SIZE})")
+                    continue
+                h, w = bgr_img.shape[:2]
+
+                # Angle 1: Face close-up (tight crop around face)
+                face_pad = int(max(face_h, face_w) * 0.4)
+                fy1 = max(0, top - face_pad)
+                fy2 = min(h, bottom + face_pad)
+                fx1 = max(0, left - face_pad)
+                fx2 = min(w, right + face_pad)
+                face_crop = bgr_img[fy1:fy2, fx1:fx2].copy()
+                _, fb = cv2.imencode(".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                face_b64 = base64.b64encode(fb).decode()
+
+                # Angle 2: Full body (head + upper/lower body with red highlight)
+                annotated = bgr_img.copy()
+                pad_top = int(face_h * 0.5)
+                pad_bottom = int(face_h * 3.0)
+                pad_lr = int(face_w * 1.5)
+                box_y1 = max(0, top - pad_top)
+                box_y2 = min(h, bottom + pad_bottom)
+                box_x1 = max(0, left - pad_lr)
+                box_x2 = min(w, right + pad_lr)
+                cv2.rectangle(annotated, (box_x1, box_y1), (box_x2, box_y2),
+                              (0, 0, 255), 3)
+                cv2.putText(annotated, "UNKNOWN", (box_x1, box_y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                _, bb = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                body_b64 = base64.b64encode(bb).decode()
+
+                # Angle 3: Context (full camera frame, no annotation)
+                _, cb = cv2.imencode(".jpg", bgr_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                context_b64 = base64.b64encode(cb).decode()
+
+                unknown_faces.append((encoding, face_b64, body_b64, context_b64))
 
         return teachers, unknown_faces
 
@@ -632,23 +645,26 @@ class TeacherSightingTracker:
                         f"outfit={outfit.get('description', 'unknown')})")
 
                 # Process visitor (unknown) detections — collect for delayed recapture
-                for enc, crop_b64 in unknown_encs:
+                for enc, face_b64, body_b64, context_b64 in unknown_encs:
                     if not self._is_new_visitor(enc, cam_label, now_ts):
                         continue
                     self._recent_visitor_encodings.setdefault(cam_label, []).append(
                         (enc, now_ts))
 
-                    # Store DVR info + face encoding for delayed recapture
+                    # Store DVR info + face encoding + 3-angle photos for delayed recapture
                     _pending_visitors.append({
                         "cam_label": cam_label,
                         "dvr": dvr,
                         "channel": channel,
                         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                         "date": today,
-                        "initial_snapshot": crop_b64,
+                        "initial_snapshot": body_b64,
+                        "snapshot_face": face_b64,
+                        "snapshot_body": body_b64,
+                        "snapshot_context": context_b64,
                         "encoding": enc,
                     })
-                    logger.info(f"[VISITOR] Unknown face on {cam_label} — queued for delayed recapture")
+                    logger.info(f"[VISITOR] Unknown face on {cam_label} — queued for delayed recapture (3-angle)")
 
         logger.info(f"[SIGHTING] Scan complete: {cams_eligible} eligible, "
                      f"{cams_scanned} scanned, {frames_captured} frames, "
@@ -679,6 +695,9 @@ class TeacherSightingTracker:
                 channel = pv["channel"]
                 cam_label = pv["cam_label"]
                 snapshot = pv["initial_snapshot"]
+                snapshot_face = pv.get("snapshot_face", "")
+                snapshot_body = pv.get("snapshot_body", "")
+                snapshot_context = pv.get("snapshot_context", "")
                 best_source = "initial"
 
                 # Try delayed recapture from same camera
@@ -688,6 +707,12 @@ class TeacherSightingTracker:
                     if labelled is not None:
                         snapshot = labelled
                         best_source = "delayed-gate"
+                    # Update context with the delayed (fresher) full frame
+                    nparr = np.frombuffer(fresh_frame, dtype=np.uint8)
+                    bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    if bgr is not None:
+                        _, cb = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        snapshot_context = base64.b64encode(cb).decode()
 
                 # Also capture from Reception cameras for a closer indoor shot
                 reception_snapshots = []
@@ -705,7 +730,6 @@ class TeacherSightingTracker:
                 if reception_snapshots:
                     rec_loc, rec_snap = reception_snapshots[0]
                     logger.info(f"[VISITOR] Reception follow-up from {rec_loc}")
-                    # Send both: gate snapshot as primary, reception as extra
                     visitor_reception = {
                         "camera": f"{rec_loc} (follow-up)",
                         "timestamp": pv["timestamp"],
@@ -723,6 +747,9 @@ class TeacherSightingTracker:
                     "timestamp": pv["timestamp"],
                     "date": pv["date"],
                     "snapshot": snapshot,
+                    "snapshot_face": snapshot_face,
+                    "snapshot_body": snapshot_body,
+                    "snapshot_context": snapshot_context,
                 }
                 new_visitors.append(visitor)
                 self._daily_visitor_sightings.append(visitor)
