@@ -923,7 +923,8 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
         if snapshot:
             ts = int(time.time())
             cam_label = desc.split()[-1] if desc else f"ch{channel}"
-            filename = f"{classroom.replace(' ', '_')}_{cam_label}_{ts}.jpg"
+            safe_name = classroom.replace(' ', '_').replace('/', '_').replace('\\', '_')
+            filename = f"{safe_name}_{cam_label}_{ts}.jpg"
             filepath = SNAPSHOT_DIR / filename
             with open(filepath, "wb") as f:
                 f.write(snapshot)
@@ -1403,7 +1404,8 @@ async def take_snapshot(classroom: str):
         )
 
     ts = int(time.time())
-    filename = f"{classroom.replace(' ', '_')}_{ts}.jpg"
+    safe_name = classroom.replace(' ', '_').replace('/', '_').replace('\\', '_')
+    filename = f"{safe_name}_{ts}.jpg"
     filepath = SNAPSHOT_DIR / filename
     with open(filepath, "wb") as f:
         f.write(snapshot)
