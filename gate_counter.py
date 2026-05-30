@@ -126,9 +126,23 @@ VEHICLE_CLOUD_API = os.environ.get(
 MAX_DISAPPEARED = 15  # frames before removing a tracked person
 MAX_DISTANCE = 100    # max pixel distance for centroid matching
 
-# Virtual line position (fraction of frame height, 0.0=top, 1.0=bottom)
-# People crossing this line from top to bottom = "IN"
+# Virtual line position (kept for backward compat, but appearance-based
+# counting is now the primary method for people)
 LINE_POSITION = float(os.environ.get("GATE_LINE_POSITION", "0.5"))
+
+# Entry/exit camera classification for direction assignment
+_EXIT_CAMERAS = {"DISPERSAL EXIT"}
+
+
+def _camera_direction(cam_name: str) -> str:
+    """Determine entry direction based on camera name.
+
+    All cameras default to IN except explicit exit cameras.
+    This covers Entry Gates, Basement cameras, and Reception cameras.
+    """
+    if cam_name in _EXIT_CAMERAS:
+        return "OUT"
+    return "IN"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -687,6 +701,9 @@ def run_gate_counter():
             max_distance=MAX_DISTANCE,
         )
 
+    # Appearance-based counting: track which person IDs have been counted
+    counted_person_ids: dict[str, set[int]] = {c["name"]: set() for c in GATE_CAMERAS}
+
     # Vehicle trackers (only for entry gate cameras)
     vehicle_trackers: dict[str, CentroidTracker] = {}
     for cam_name in VEHICLE_CAMERAS:
@@ -722,6 +739,7 @@ def run_gate_counter():
             daily_vehicles_in = {n: 0 for n in VEHICLE_CAMERAS}
             daily_vehicles_out = {n: 0 for n in VEHICLE_CAMERAS}
             counted_vehicle_ids = {n: set() for n in VEHICLE_CAMERAS}
+            counted_person_ids = {c["name"]: set() for c in GATE_CAMERAS}
             for cam in GATE_CAMERAS:
                 trackers[cam["name"]] = CentroidTracker(
                     max_disappeared=MAX_DISAPPEARED,
@@ -764,42 +782,45 @@ def run_gate_counter():
             # Detect people
             detections = detector.detect(frame)
 
-            # Update tracker and get crossings
-            crossings = trackers[cam_name].update(detections)
+            # Update tracker (maintains person identity across frames)
+            trackers[cam_name].update(detections)
 
-            for crossing in crossings:
-                direction = crossing["direction"]
-                bbox = crossing["bbox"]
+            # Appearance-based counting: count NEW people on first detection
+            # (replaces line-crossing which fails with 5-second snapshot gaps)
+            direction = _camera_direction(cam_name)
+            for obj_id in list(trackers[cam_name].objects.keys()):
+                if obj_id not in counted_person_ids[cam_name]:
+                    counted_person_ids[cam_name].add(obj_id)
 
-                if direction == "IN":
-                    daily_in[cam_name] += 1
-                else:
-                    daily_out[cam_name] += 1
+                    if direction == "IN":
+                        daily_in[cam_name] += 1
+                    else:
+                        daily_out[cam_name] += 1
 
-                # Extract attire color
-                attire_color = extract_dominant_color(frame, bbox)
+                    bbox = trackers[cam_name].bboxes.get(obj_id)
+                    if bbox is None:
+                        continue
 
-                # Crop person for the report
-                person_crop = crop_person_jpeg(frame, bbox)
+                    attire_color = extract_dominant_color(frame, bbox)
+                    person_crop = crop_person_jpeg(frame, bbox)
+                    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
 
-                timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+                    event = {
+                        "timestamp": timestamp,
+                        "camera": cam_name,
+                        "direction": direction,
+                        "attire_color": attire_color,
+                        "person_crop": person_crop,
+                        "daily_in": daily_in[cam_name],
+                        "daily_out": daily_out[cam_name],
+                    }
+                    pending_events.append(event)
 
-                event = {
-                    "timestamp": timestamp,
-                    "camera": cam_name,
-                    "direction": direction,
-                    "attire_color": attire_color,
-                    "person_crop": person_crop,
-                    "daily_in": daily_in[cam_name],
-                    "daily_out": daily_out[cam_name],
-                }
-                pending_events.append(event)
-
-                logger.info(
-                    "%s: %s crossing at %s — %s attire — Day total IN=%d OUT=%d",
-                    cam_name, direction, timestamp, attire_color,
-                    daily_in[cam_name], daily_out[cam_name],
-                )
+                    logger.info(
+                        "%s: %s person #%d at %s — %s attire — Day total IN=%d OUT=%d",
+                        cam_name, direction, obj_id, timestamp, attire_color,
+                        daily_in[cam_name], daily_out[cam_name],
+                    )
 
             # Detect vehicles on entry gate cameras
             if cam_name in VEHICLE_CAMERAS:
