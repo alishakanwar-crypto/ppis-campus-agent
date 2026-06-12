@@ -65,6 +65,13 @@ def _kill_port_holder_early(port: int = 8897) -> None:
 
 if __name__ == "__main__":
     _kill_port_holder_early()
+    # Early diagnostic: write startup timestamp so we know the process launched
+    try:
+        _diag_path = Path(__file__).parent / "startup_diag.log"
+        with open(_diag_path, "a", encoding="utf-8") as _df:
+            _df.write(f"\n[{datetime.now().isoformat()}] main.py starting (PID={os.getpid()})...\n")
+    except Exception:
+        pass
 
 import httpx
 import websockets
@@ -1250,14 +1257,19 @@ async def lifespan(app: FastAPI):
     cleanup_junk_face_entries()
 
     # Sync face registrations from cloud DB (downloads images, computes encodings)
+    logger.info("Starting face sync from cloud...")
     try:
         await sync_faces_from_cloud()
+        logger.info("Face sync completed successfully")
     except Exception as e:
         logger.error(f"Face sync crashed during startup (non-fatal): {e}")
     # Pre-load registered faces into attendance engine
+    logger.info("Loading face encodings into attendance engine...")
     attendance_engine.reload_faces()
+    logger.info("Face encodings loaded")
 
     # Start WebSocket client in background
+    logger.info("Starting WebSocket client task...")
     ws_task = asyncio.create_task(websocket_client())
     # Auto-start classwise monitoring after brief delay (24/7 always-on)
     asyncio.create_task(_auto_start_classwise())

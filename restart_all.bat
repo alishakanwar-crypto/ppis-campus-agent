@@ -51,23 +51,35 @@ REM --- Step 4: Clean up lock file ---
 echo [Step 4/5] Cleaning up...
 if exist ".agent_lock" del ".agent_lock" >nul 2>&1
 if exist "__pycache__" rmdir /s /q "__pycache__" 2>nul
+REM Also kill any stale port hold from previous run
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8897 ^| findstr LISTENING') do (
+    taskkill /F /PID %%a >nul 2>&1
+)
+timeout /t 2 /nobreak >nul
 
 :start_agents
 REM --- Step 5: Start all 3 agents with delays ---
 echo [Step 5/5] Starting agents...
 echo.
 
+REM Kill any process holding port 8897 before starting campus agent
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8897 ^| findstr LISTENING') do (
+    echo   Killing stale process on port 8897 (PID %%a)...
+    taskkill /F /PID %%a >nul 2>&1
+)
+timeout /t 3 /nobreak >nul
+
 echo   Starting Campus Agent...
 wscript.exe run_hidden.vbs
-timeout /t 15 /nobreak >nul
+timeout /t 20 /nobreak >nul
 
 echo   Starting TrueFace Poller...
 wscript.exe run_trueface_hidden.vbs
-timeout /t 15 /nobreak >nul
+timeout /t 10 /nobreak >nul
 
 echo   Starting Gate Counter...
 wscript.exe run_gate_counter_hidden.vbs
-timeout /t 15 /nobreak >nul
+timeout /t 10 /nobreak >nul
 
 REM --- Verify ---
 echo.
