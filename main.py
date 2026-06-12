@@ -174,8 +174,15 @@ async def fetch_config_from_cloud() -> dict | None:
 def load_config_local() -> dict:
     """Load config from local config.json (fallback)."""
     if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except (json.JSONDecodeError, ValueError) as e:
+            logging.getLogger("ppis-agent").warning(
+                f"config.json is corrupted ({e}), using defaults"
+            )
     return {
         "cloud_bot_url": "wss://ppis-whatsapp-bot.fly.dev/ws/agent",
         "agent_secret": os.environ.get("AGENT_SECRET", ""),

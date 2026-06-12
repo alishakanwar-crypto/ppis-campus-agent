@@ -51,6 +51,9 @@ REM --- Step 4: Clean up lock file ---
 echo [Step 4/5] Cleaning up...
 if exist ".agent_lock" del ".agent_lock" >nul 2>&1
 if exist "__pycache__" rmdir /s /q "__pycache__" 2>nul
+REM Ensure config.json exists and is valid (empty file causes crash)
+if not exist "config.json" echo {} > "config.json"
+for %%A in (config.json) do if %%~zA EQU 0 echo {} > "config.json"
 REM Also kill any stale port hold from previous run
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8897 ^| findstr LISTENING') do (
     taskkill /F /PID %%a >nul 2>&1
