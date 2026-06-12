@@ -1253,6 +1253,11 @@ async def lifespan(app: FastAPI):
         f"Config loaded: {len(config.get('dvrs', []))} DVRs, "
         f"{len(config.get('camera_mapping', {}))} camera mappings"
     )
+    # Start WebSocket client FIRST — connects to backend immediately
+    # so snapshot requests work even during face sync
+    logger.info("Starting WebSocket client task...")
+    ws_task = asyncio.create_task(websocket_client())
+
     # Clean up known junk/duplicate face entries before syncing
     cleanup_junk_face_entries()
 
@@ -1262,15 +1267,15 @@ async def lifespan(app: FastAPI):
         await sync_faces_from_cloud()
         logger.info("Face sync completed successfully")
     except Exception as e:
-        logger.error(f"Face sync crashed during startup (non-fatal): {e}")
+        logger.error(f"Face sync crashed during startup (non-fatal): {e}", exc_info=True)
     # Pre-load registered faces into attendance engine
     logger.info("Loading face encodings into attendance engine...")
-    attendance_engine.reload_faces()
-    logger.info("Face encodings loaded")
+    try:
+        attendance_engine.reload_faces()
+        logger.info("Face encodings loaded")
+    except Exception as e:
+        logger.error(f"Face reload crashed during startup (non-fatal): {e}", exc_info=True)
 
-    # Start WebSocket client in background
-    logger.info("Starting WebSocket client task...")
-    ws_task = asyncio.create_task(websocket_client())
     # Auto-start classwise monitoring after brief delay (24/7 always-on)
     asyncio.create_task(_auto_start_classwise())
     # Auto-start mood detection and teacher sighting after delay
