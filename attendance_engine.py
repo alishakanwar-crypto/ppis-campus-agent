@@ -1339,21 +1339,22 @@ class AttendanceEngine:
     def _is_off_day(dt: datetime) -> bool:
         """Check if the given datetime falls on a school off-day.
 
-        Off-days: ALL Saturdays and Sundays (full weekends).
+        Off-days: Sundays only. Saturdays are working days for teachers
+        (TrueFace) but student attendance is skipped separately.
         """
-        return dt.weekday() >= 5  # 5=Saturday, 6=Sunday
+        return dt.weekday() == 6  # 6=Sunday
 
     def _is_within_attendance_window(self, person_id: str = "") -> bool:
         """Check if the current IST time is within the attendance window.
 
         Uses a shorter window (7:00-8:00) for teachers vs students (7:00-9:30).
-        Returns False on weekends (all Saturdays and Sundays) and holidays.
+        Returns False on Sundays and holidays. School is open on Saturdays.
         """
         from datetime import timezone, timedelta as _td
         _ist = timezone(_td(hours=5, minutes=30))
         now = datetime.now(_ist)
 
-        # Block ALL attendance on weekends (Saturday + Sunday)
+        # Block attendance on Sundays (school open on Saturdays)
         if self._is_off_day(now):
             return False
 
@@ -2798,6 +2799,10 @@ class AttendanceEngine:
 
                 in_teacher_phase = teacher_start <= _now_mins < teacher_end
                 in_student_phase = student_start <= _now_mins < student_end
+
+                # No student attendance on Saturdays
+                if _now_phase.weekday() == 5:  # Saturday
+                    in_student_phase = False
 
                 if FORCE_RENOTIFY_TEST:
                     # Test mode: both phases always active
