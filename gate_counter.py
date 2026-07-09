@@ -561,7 +561,13 @@ def run_cpplus_worker(cam: dict):
             if bbox is None:
                 continue
             attire_color = extract_dominant_color(frame, bbox)
-            person_crop = crop_person_jpeg(frame, bbox)
+            # Snapshot uses a full-resolution crop (see docstring) so the cloud
+            # frontal-face gate can actually resolve a face; only IN crossings
+            # trigger a snapshot, so only pay the hi-res grab for those.
+            if direction == "IN":
+                person_crop = crop_person_hires_cpplus(cam, frame, bbox)
+            else:
+                person_crop = crop_person_jpeg(frame, bbox)
             ts = now.strftime("%Y-%m-%d %H:%M:%S")
             events.append({
                 "timestamp": ts,
@@ -660,6 +666,49 @@ def crop_person_jpeg(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> str:
         return ""
     _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 70])
     return base64.b64encode(buf).decode("ascii")
+
+
+def crop_person_hires_cpplus(
+    cam: dict, lo_frame: np.ndarray, bbox: tuple[int, int, int, int]
+) -> str:
+    """Return a base64 JPEG person crop suitable for a face snapshot.
+
+    Detection runs on the low-res RTSP sub-stream (fast, catches quick
+    passers), but that crop is far too small for the cloud's frontal-face
+    gate to resolve a face. So grab a full-resolution snapshot (the Dahua/
+    CP Plus HTTP snapshot.cgi returns the main-stream resolution), scale the
+    sub-stream bbox up to it, and crop with head-room padding. Falls back to
+    the low-res crop if the snapshot can't be captured.
+    """
+    try:
+        hi = capture_cpplus_frame(cam)
+        if hi is None:
+            return crop_person_jpeg(lo_frame, bbox)
+        lh, lw = lo_frame.shape[:2]
+        hh, hw = hi.shape[:2]
+        if lw <= 0 or lh <= 0:
+            return crop_person_jpeg(lo_frame, bbox)
+        sx, sy = hw / lw, hh / lh
+        x1, y1, x2, y2 = bbox
+        X1, Y1, X2, Y2 = int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
+        bw, bh = max(1, X2 - X1), max(1, Y2 - Y1)
+        # Extra head-room on top (face is near the top of a person box) and a
+        # little around the sides so a slightly-moved person stays in frame.
+        pad_x = int(bw * 0.30)
+        pad_top = int(bh * 0.35)
+        pad_bot = int(bh * 0.10)
+        X1 = max(0, X1 - pad_x)
+        X2 = min(hw, X2 + pad_x)
+        Y1 = max(0, Y1 - pad_top)
+        Y2 = min(hh, Y2 + pad_bot)
+        crop = hi[Y1:Y2, X1:X2]
+        if crop.size == 0:
+            return crop_person_jpeg(lo_frame, bbox)
+        _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return base64.b64encode(buf).decode("ascii")
+    except Exception as e:
+        logger.debug("CP Plus hi-res crop failed (%s); using low-res", e)
+        return crop_person_jpeg(lo_frame, bbox)
 
 
 def snapshot_vehicle_jpeg(frame: np.ndarray, bbox: tuple[int, int, int, int],
