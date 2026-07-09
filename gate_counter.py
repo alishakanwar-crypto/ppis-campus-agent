@@ -144,6 +144,15 @@ CPPLUS_RTSP_TIMEOUT_SEC = int(os.environ.get("CPPLUS_RTSP_TIMEOUT_SEC", "5"))
 # rate to bound CPU; ~5 FPS gives several detections even for a fast 1-2s pass.
 CPPLUS_TARGET_FPS = float(os.environ.get("CPPLUS_TARGET_FPS", "5"))
 
+# Direction of travel that counts as ENTERING for the CP Plus outside gate.
+# The CentroidTracker labels a virtual-line crossing "IN" when the person moves
+# top-to-bottom in the frame and "OUT" bottom-to-top. If the camera is mounted
+# so that people ENTER the school moving up the frame instead, set
+# CPPLUS_IN_TOP_TO_BOTTOM=0 to swap IN/OUT — no code change needed.
+CPPLUS_IN_TOP_TO_BOTTOM = os.environ.get("CPPLUS_IN_TOP_TO_BOTTOM", "1") not in (
+    "0", "false", "False", "no", "NO",
+)
+
 # Allow disabling the CP Plus outside-gate camera without a code change
 CPPLUS_ENABLED = os.environ.get("CPPLUS_GATE_ENABLED", "1") not in ("0", "false", "False")
 if not CPPLUS_ENABLED:
@@ -481,11 +490,12 @@ def run_cpplus_worker(cam: dict):
     detector = PersonDetector()
     detector.load()
     tracker = CentroidTracker(max_disappeared=MAX_DISAPPEARED, max_distance=MAX_DISTANCE)
-    counted_ids: set[int] = set()
+    # Count each (tracked-person, direction) crossing once so a single person
+    # walking through the gate is not counted on every frame.
+    counted_crossings: set[tuple[int, str]] = set()
     daily_in = 0
     daily_out = 0
     current_date = datetime.now(IST).strftime("%Y-%m-%d")
-    direction = _camera_direction(cam_name)
     cap = None
     min_interval = 1.0 / CPPLUS_TARGET_FPS if CPPLUS_TARGET_FPS > 0 else 0.0
     reconnect_backoff = 2.0
@@ -509,7 +519,7 @@ def run_cpplus_worker(cam: dict):
             current_date = today
             daily_in = 0
             daily_out = 0
-            counted_ids = set()
+            counted_crossings = set()
             tracker = CentroidTracker(max_disappeared=MAX_DISAPPEARED, max_distance=MAX_DISTANCE)
 
         loop_start = time.monotonic()
@@ -545,26 +555,40 @@ def run_cpplus_worker(cam: dict):
         except Exception as e:
             logger.error("CP Plus %s: detection error: %s", cam_name, e)
             detections = []
-        tracker.update(detections)
+        # Directional counting: the tracker reports each virtual-line crossing
+        # with a raw direction (top-to-bottom = "IN", bottom-to-top = "OUT").
+        # We map that to the real ENTER/EXIT direction via CPPLUS_IN_TOP_TO_BOTTOM
+        # so people leaving the school are recorded as OUT (and deducted from
+        # the head-count), not miscounted as another entry.
+        crossings = tracker.update(detections)
 
         events: list[dict] = []
         now = datetime.now(IST)
-        for obj_id in list(tracker.objects.keys()):
-            if obj_id in counted_ids:
+        for cr in crossings:
+            raw_dir = cr["direction"]  # "IN" = top->bottom, "OUT" = bottom->top
+            if CPPLUS_IN_TOP_TO_BOTTOM:
+                person_dir = raw_dir
+            else:
+                person_dir = "OUT" if raw_dir == "IN" else "IN"
+
+            key = (cr["id"], person_dir)
+            if key in counted_crossings:
                 continue
-            counted_ids.add(obj_id)
-            if direction == "IN":
+            counted_crossings.add(key)
+
+            if person_dir == "IN":
                 daily_in += 1
             else:
                 daily_out += 1
-            bbox = tracker.bboxes.get(obj_id)
+
+            bbox = cr.get("bbox")
             if bbox is None:
                 continue
             attire_color = extract_dominant_color(frame, bbox)
             # Snapshot uses a full-resolution crop (see docstring) so the cloud
             # frontal-face gate can actually resolve a face; only IN crossings
             # trigger a snapshot, so only pay the hi-res grab for those.
-            if direction == "IN":
+            if person_dir == "IN":
                 person_crop = crop_person_hires_cpplus(cam, frame, bbox)
             else:
                 person_crop = crop_person_jpeg(frame, bbox)
@@ -572,14 +596,14 @@ def run_cpplus_worker(cam: dict):
             events.append({
                 "timestamp": ts,
                 "camera": cam_name,
-                "direction": direction,
+                "direction": person_dir,
                 "attire_color": attire_color,
                 "person_crop": person_crop,
                 "daily_in": daily_in,
                 "daily_out": daily_out,
             })
             logger.info("%s: %s person #%d at %s — %s attire — Day IN=%d OUT=%d",
-                        cam_name, direction, obj_id, ts, attire_color, daily_in, daily_out)
+                        cam_name, person_dir, cr["id"], ts, attire_color, daily_in, daily_out)
 
         if events:
             send_gate_event(events)
