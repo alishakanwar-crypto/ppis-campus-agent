@@ -6,3 +6,7 @@ attendance_snapshots/
 *.db
 agent.lock
 .agent_lock
+
+# Per-machine local config (agent_secret, DVR creds, camera mapping).
+# Not tracked so restart scripts (git reset --hard) never overwrite it.
+config.json
