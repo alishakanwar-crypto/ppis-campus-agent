@@ -54,6 +54,7 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
@@ -136,6 +137,12 @@ CPPLUS_RTSP_SUBTYPE = int(os.environ.get("CPPLUS_RTSP_SUBTYPE", "1"))
 CPPLUS_CONNECT_TIMEOUT_SEC = float(os.environ.get("CPPLUS_CONNECT_TIMEOUT_SEC", "3"))
 CPPLUS_HTTP_TIMEOUT_SEC = float(os.environ.get("CPPLUS_HTTP_TIMEOUT_SEC", "8"))
 CPPLUS_RTSP_TIMEOUT_SEC = int(os.environ.get("CPPLUS_RTSP_TIMEOUT_SEC", "5"))
+
+# The CP Plus outside gate is head-counted by its own dedicated worker thread
+# that reads a continuous stream (not the slow ~15-20s DVR poll cycle) so people
+# who cross quickly are never missed. This throttles the worker's processing
+# rate to bound CPU; ~5 FPS gives several detections even for a fast 1-2s pass.
+CPPLUS_TARGET_FPS = float(os.environ.get("CPPLUS_TARGET_FPS", "5"))
 
 # Allow disabling the CP Plus outside-gate camera without a code change
 CPPLUS_ENABLED = os.environ.get("CPPLUS_GATE_ENABLED", "1") not in ("0", "false", "False")
@@ -416,6 +423,170 @@ def capture_camera_frame(cam: dict) -> np.ndarray | None:
     if cam.get("type") == "cpplus":
         return capture_cpplus_frame(cam)
     return capture_gate_frame(cam["channel"], cam["dvr_ip"])
+
+
+def _open_cpplus_stream(cam: dict):
+    """Open a persistent, low-latency RTSP stream to the CP Plus camera.
+
+    Returns an opened cv2.VideoCapture (buffer size 1 so reads stay current) or
+    None if no username/password combination can open the stream.
+    """
+    ip = cam["ip"]
+    password = _resolve_cpplus_password(cam)
+    if not password:
+        logger.warning("CP Plus %s: no password available for stream", ip)
+        return None
+
+    configured_user = cam.get("user", "admin")
+    users = [configured_user] + [u for u in CPPLUS_USER_ALTERNATES if u != configured_user]
+
+    timeout_us = str(CPPLUS_RTSP_TIMEOUT_SEC * 1_000_000)
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+        f"rtsp_transport;tcp|stimeout;{timeout_us}|timeout;{timeout_us}"
+    )
+    for user in users:
+        rtsp_url = (
+            f"rtsp://{user}:{password}@{ip}:554/cam/realmonitor"
+            f"?channel=1&subtype={CPPLUS_RTSP_SUBTYPE}"
+        )
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, CPPLUS_RTSP_TIMEOUT_SEC * 1000)
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, CPPLUS_RTSP_TIMEOUT_SEC * 1000)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        if cap.isOpened():
+            ok, _ = cap.read()
+            if ok:
+                cam["user"] = user  # remember the working username
+                logger.info("CP Plus %s: RTSP stream opened (user=%s)", ip, user)
+                return cap
+        cap.release()
+    logger.warning("CP Plus %s: could not open RTSP stream (will use HTTP snapshots)", ip)
+    return None
+
+
+def run_cpplus_worker(cam: dict):
+    """Dedicated head-count loop for the CP Plus outside gate camera.
+
+    The main DVR poll loop samples every camera only once per ~15-20s cycle,
+    which misses people who cross the outside gate quickly. This worker keeps a
+    persistent RTSP stream (falling back to fast HTTP snapshots if RTSP can't
+    open) and processes frames continuously, throttled to CPPLUS_TARGET_FPS, so
+    every person is caught. Each NEW tracked person is counted once
+    (appearance-based) and streamed to the cloud. Runs in its own thread.
+    """
+    cam_name = cam["name"]
+    detector = PersonDetector()
+    detector.load()
+    tracker = CentroidTracker(max_disappeared=MAX_DISAPPEARED, max_distance=MAX_DISTANCE)
+    counted_ids: set[int] = set()
+    daily_in = 0
+    daily_out = 0
+    current_date = datetime.now(IST).strftime("%Y-%m-%d")
+    direction = _camera_direction(cam_name)
+    cap = None
+    min_interval = 1.0 / CPPLUS_TARGET_FPS if CPPLUS_TARGET_FPS > 0 else 0.0
+    reconnect_backoff = 2.0
+
+    logger.info("CP Plus worker started for %s (target %.1f FPS)", cam_name, CPPLUS_TARGET_FPS)
+
+    while running:
+        # Only monitor during school hours; drop the stream when idle.
+        if not is_monitoring_time():
+            if cap is not None:
+                cap.release()
+                cap = None
+            time.sleep(30)
+            continue
+
+        # Reset counters/tracker at date change (mirrors the main loop).
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+        if today != current_date:
+            logger.info("CP Plus worker date change %s -> %s (prev IN=%d OUT=%d)",
+                        current_date, today, daily_in, daily_out)
+            current_date = today
+            daily_in = 0
+            daily_out = 0
+            counted_ids = set()
+            tracker = CentroidTracker(max_disappeared=MAX_DISAPPEARED, max_distance=MAX_DISTANCE)
+
+        loop_start = time.monotonic()
+
+        # Acquire a frame: prefer the persistent RTSP stream; if it can't be
+        # opened or a read fails, fall back to a single HTTP snapshot so the
+        # head-count keeps working through any RTSP outage.
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
+                cap = None
+            cap = _open_cpplus_stream(cam)
+
+        frame = None
+        if cap is not None:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                cap.release()
+                cap = None
+                frame = None
+        if frame is None:
+            frame = capture_cpplus_frame(cam)
+        if frame is None:
+            time.sleep(reconnect_backoff)
+            continue
+
+        frame_h = frame.shape[0]
+        line_y = int(frame_h * (cam.get("line_position") or LINE_POSITION))
+        tracker.set_line_y(line_y)
+
+        try:
+            detections = detector.detect(frame)
+        except Exception as e:
+            logger.error("CP Plus %s: detection error: %s", cam_name, e)
+            detections = []
+        tracker.update(detections)
+
+        events: list[dict] = []
+        now = datetime.now(IST)
+        for obj_id in list(tracker.objects.keys()):
+            if obj_id in counted_ids:
+                continue
+            counted_ids.add(obj_id)
+            if direction == "IN":
+                daily_in += 1
+            else:
+                daily_out += 1
+            bbox = tracker.bboxes.get(obj_id)
+            if bbox is None:
+                continue
+            attire_color = extract_dominant_color(frame, bbox)
+            person_crop = crop_person_jpeg(frame, bbox)
+            ts = now.strftime("%Y-%m-%d %H:%M:%S")
+            events.append({
+                "timestamp": ts,
+                "camera": cam_name,
+                "direction": direction,
+                "attire_color": attire_color,
+                "person_crop": person_crop,
+                "daily_in": daily_in,
+                "daily_out": daily_out,
+            })
+            logger.info("%s: %s person #%d at %s — %s attire — Day IN=%d OUT=%d",
+                        cam_name, direction, obj_id, ts, attire_color, daily_in, daily_out)
+
+        if events:
+            send_gate_event(events)
+
+        # Throttle to the target processing rate.
+        elapsed = time.monotonic() - loop_start
+        if min_interval > elapsed:
+            time.sleep(min_interval - elapsed)
+
+    if cap is not None:
+        cap.release()
+    logger.info("CP Plus worker stopped for %s (final IN=%d OUT=%d)",
+                cam_name, daily_in, daily_out)
 
 
 # ---------------------------------------------------------------------------
@@ -868,6 +1039,19 @@ def run_gate_counter():
     detector = PersonDetector()
     detector.load()
 
+    # The CP Plus outside gate runs in its own continuous-capture worker
+    # thread(s) so fast passers are never missed (the DVR loop below only
+    # samples once per ~15-20s cycle). Those cameras are skipped in the main
+    # loop to avoid double-counting.
+    cpplus_threads: list[threading.Thread] = []
+    for cam in CPPLUS_CAMERAS:
+        t = threading.Thread(
+            target=run_cpplus_worker, args=(cam,), daemon=True,
+            name=f"cpplus-{cam['name']}",
+        )
+        t.start()
+        cpplus_threads.append(t)
+
     # One tracker per camera (for people) — DVR channels + CP Plus outside gate
     trackers: dict[str, CentroidTracker] = {}
     for cam in HEADCOUNT_CAMERAS:
@@ -941,6 +1125,10 @@ def run_gate_counter():
 
         for cam in HEADCOUNT_CAMERAS:
             cam_name = cam["name"]
+
+            # CP Plus is handled by its dedicated worker thread (see above).
+            if cam.get("type") == "cpplus":
+                continue
 
             frame = capture_camera_frame(cam)
             if frame is None:
