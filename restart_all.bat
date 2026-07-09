@@ -67,7 +67,7 @@ echo.
 
 REM Kill any process holding port 8897 before starting campus agent
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8897 ^| findstr LISTENING') do (
-    echo   Killing stale process on port 8897 (PID %%a)...
+    echo   Killing stale process on port 8897 PID %%a...
     taskkill /F /PID %%a >nul 2>&1
 )
 timeout /t 3 /nobreak >nul
