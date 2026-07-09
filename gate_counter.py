@@ -31,6 +31,14 @@ Cameras:
     Basement Cam 8: DVR 4 (192.168.0.13) Channel 10
     Basement Cam 10: DVR 4 (192.168.0.13) Channel 19
     Basement Electricity: DVR 4 (192.168.0.13) Channel 11
+    ENTRY GATE-OUTSIDE (CP Plus): standalone IP camera 192.168.0.215 (no DVR)
+
+The CP Plus camera (model CP-UNC-VE21ZL4P-VMD) is mounted OUTSIDE the school for
+pedestrian head counting. It is a direct IP camera (Dahua-OEM), captured via the
+Dahua HTTP snapshot CGI with an RTSP fallback. Its head count feeds the same
+cloud reconciliation used for the DVR gate cameras, so unknown faces are
+classified (Parent / Student / Staff / Third-party-Vendor), logged with entry
+time + attire color, and cross-referenced against face-recognition attendance.
 
 All timestamps use IST (Asia/Kolkata, UTC+05:30).
 """
@@ -85,6 +93,57 @@ GATE_CAMERAS = [
     {"channel": 19, "name": "Basement Cam 10",                "dvr_ip": "192.168.0.13"},
     {"channel": 11, "name": "Basement Electricity",           "dvr_ip": "192.168.0.13"},
 ]
+
+# ---------------------------------------------------------------------------
+# Standalone CP Plus IP camera(s) — pedestrian entry OUTSIDE the school gate.
+#
+# Unlike the DVR channels above, these are direct IP cameras (no NVR in front).
+# CP Plus network cameras (e.g. model CP-UNC-VE21ZL4P-VMD) are Dahua-OEM, so we
+# capture frames via the Dahua HTTP snapshot CGI and fall back to RTSP.
+#
+# The camera NAME intentionally contains "ENTRY GATE" so the cloud
+# reconciliation (_classify_visitor) treats it as a main-gate pedestrian entry:
+# unknown faces during school hours are classified as Parents, and its head
+# count is cross-referenced against face-recognition attendance.
+# ---------------------------------------------------------------------------
+
+CPPLUS_CAMERAS = [
+    {
+        "name": os.environ.get("CPPLUS_GATE_NAME", "ENTRY GATE-OUTSIDE (CP Plus)"),
+        "ip": os.environ.get("CPPLUS_GATE_IP", "192.168.0.215"),
+        # Username is case-sensitive on Dahua/CP Plus firmware; alternates are
+        # tried automatically on 401.
+        "user": os.environ.get("CPPLUS_GATE_USER", "admin"),
+        # Password is loaded at runtime (env override → shared DVR password),
+        # never hard-coded here. See _resolve_cpplus_password().
+        "pass": os.environ.get("CPPLUS_GATE_PASS", ""),
+        "type": "cpplus",
+        # Optional per-camera virtual-line override (falls back to LINE_POSITION)
+        "line_position": float(os.environ["CPPLUS_GATE_LINE_POSITION"])
+        if os.environ.get("CPPLUS_GATE_LINE_POSITION")
+        else None,
+    },
+]
+
+# Alternate usernames to retry on 401 (Dahua username is case-sensitive)
+CPPLUS_USER_ALTERNATES = ["admin", "Admin"]
+
+# RTSP sub-stream (lower resolution) is enough for head-count detection
+CPPLUS_RTSP_SUBTYPE = int(os.environ.get("CPPLUS_RTSP_SUBTYPE", "1"))
+
+# Bound HTTP snapshot + RTSP connect/read time so an unreachable camera never
+# blocks the whole poll loop.
+CPPLUS_CONNECT_TIMEOUT_SEC = float(os.environ.get("CPPLUS_CONNECT_TIMEOUT_SEC", "3"))
+CPPLUS_HTTP_TIMEOUT_SEC = float(os.environ.get("CPPLUS_HTTP_TIMEOUT_SEC", "8"))
+CPPLUS_RTSP_TIMEOUT_SEC = int(os.environ.get("CPPLUS_RTSP_TIMEOUT_SEC", "5"))
+
+# Allow disabling the CP Plus outside-gate camera without a code change
+CPPLUS_ENABLED = os.environ.get("CPPLUS_GATE_ENABLED", "1") not in ("0", "false", "False")
+if not CPPLUS_ENABLED:
+    CPPLUS_CAMERAS = []
+
+# All people head-count cameras: DVR channels + standalone CP Plus IP camera(s)
+HEADCOUNT_CAMERAS = GATE_CAMERAS + CPPLUS_CAMERAS
 
 CLOUD_API = os.environ.get(
     "GATE_CLOUD_API",
@@ -197,6 +256,120 @@ def capture_gate_frame(channel: int, dvr_ip: str = "192.168.0.14") -> np.ndarray
         logger.error("Gate frame capture error ch%d: %s", channel, e)
 
     return None
+
+
+def _resolve_cpplus_password(cam: dict) -> str:
+    """Return the password for a CP Plus camera without hard-coding secrets.
+
+    Priority: explicit env-configured value on the camera → the shared password
+    used by the school DVRs (all admin/<same pass>), which is loaded from cloud
+    config / config.json at runtime. Returns "" if nothing is available.
+    """
+    if cam.get("pass"):
+        return cam["pass"]
+    # All school DVRs share one admin password; the outside gate camera uses the
+    # same. Reuse whatever was loaded into DVR_CREDS to avoid committing it.
+    passwords = [c.get("pass", "") for c in DVR_CREDS.values() if c.get("pass")]
+    if passwords:
+        # Most common (they should all be identical)
+        return max(set(passwords), key=passwords.count)
+    return ""
+
+
+def capture_cpplus_frame(cam: dict) -> np.ndarray | None:
+    """Capture a JPEG frame from a standalone CP Plus (Dahua-OEM) IP camera.
+
+    Tries the Dahua HTTP snapshot CGI first (with digest, then basic auth,
+    retrying alternate usernames on 401), then falls back to an RTSP grab.
+    Returns a decoded BGR numpy frame or None.
+    """
+    ip = cam["ip"]
+    password = _resolve_cpplus_password(cam)
+    if not password:
+        logger.warning("CP Plus %s: no password available — skipping", ip)
+        return None
+
+    configured_user = cam.get("user", "admin")
+    users = [configured_user] + [u for u in CPPLUS_USER_ALTERNATES if u != configured_user]
+
+    snapshot_urls = [
+        f"http://{ip}/cgi-bin/snapshot.cgi?channel=1",
+        f"http://{ip}/cgi-bin/snapshot.cgi",
+    ]
+
+    # 1) HTTP snapshot CGI. Use a short connect timeout so an unreachable camera
+    # fails fast, and only retry alternate usernames on an actual 401 (auth
+    # issue) rather than multiplying connect timeouts on network errors.
+    http_timeout = httpx.Timeout(CPPLUS_HTTP_TIMEOUT_SEC, connect=CPPLUS_CONNECT_TIMEOUT_SEC)
+    try:
+        with httpx.Client(timeout=http_timeout) as client:
+            for url in snapshot_urls:
+                for user in users:
+                    resp = client.get(url, auth=httpx.DigestAuth(user, password))
+                    if resp.status_code == 401:
+                        resp = client.get(url, auth=httpx.BasicAuth(user, password))
+                    if (
+                        resp.status_code == 200
+                        and resp.headers.get("content-type", "").startswith("image")
+                    ):
+                        img_array = np.frombuffer(resp.content, dtype=np.uint8)
+                        frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                        if frame is not None:
+                            cam["user"] = user  # remember the working username
+                            return frame
+                    if resp.status_code == 401:
+                        continue  # wrong username — try the next candidate
+                    logger.debug("CP Plus %s: %s HTTP %d", ip, url, resp.status_code)
+                    break  # non-auth HTTP error — no point trying other users
+    except httpx.HTTPError as e:
+        # Connection refused / timeout — camera unreachable via HTTP; try RTSP.
+        logger.debug("CP Plus %s snapshot unreachable: %s", ip, e)
+
+    # 2) RTSP fallback (sub-stream is enough for head-count detection)
+    # Bound the FFmpeg connect/read time so an unreachable camera can never
+    # block the whole poll loop (timeout is in microseconds).
+    timeout_us = str(CPPLUS_RTSP_TIMEOUT_SEC * 1_000_000)
+    prev_ffmpeg_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+    # "stimeout" (older FFmpeg) and "timeout" (newer FFmpeg) are both socket
+    # timeouts in microseconds; set both so the build in use honours one.
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+        f"rtsp_transport;tcp|stimeout;{timeout_us}|timeout;{timeout_us}"
+    )
+    try:
+        for user in users:
+            rtsp_url = (
+                f"rtsp://{user}:{password}@{ip}:554/cam/realmonitor"
+                f"?channel=1&subtype={CPPLUS_RTSP_SUBTYPE}"
+            )
+            cap = None
+            try:
+                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, CPPLUS_RTSP_TIMEOUT_SEC * 1000)
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, CPPLUS_RTSP_TIMEOUT_SEC * 1000)
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    cam["user"] = user
+                    return frame
+            except Exception as e:
+                logger.debug("CP Plus %s RTSP error: %s", ip, e)
+            finally:
+                if cap is not None:
+                    cap.release()
+    finally:
+        if prev_ffmpeg_opts is None:
+            os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+        else:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = prev_ffmpeg_opts
+
+    logger.warning("CP Plus %s: all capture methods failed", ip)
+    return None
+
+
+def capture_camera_frame(cam: dict) -> np.ndarray | None:
+    """Capture a frame from any head-count camera (DVR channel or CP Plus)."""
+    if cam.get("type") == "cpplus":
+        return capture_cpplus_frame(cam)
+    return capture_gate_frame(cam["channel"], cam["dvr_ip"])
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +801,9 @@ def run_gate_counter():
     logger.info("Gate Head Count Counter starting")
     dvr_ips = sorted({c["dvr_ip"] for c in GATE_CAMERAS})
     logger.info("DVRs: %s", ", ".join(dvr_ips))
-    logger.info("Cameras: %s", ", ".join(c["name"] for c in GATE_CAMERAS))
+    logger.info("Cameras: %s", ", ".join(c["name"] for c in HEADCOUNT_CAMERAS))
+    for cam in CPPLUS_CAMERAS:
+        logger.info("CP Plus outside-gate camera: %s @ %s", cam["name"], cam["ip"])
     logger.info("Poll interval: %d seconds", POLL_INTERVAL)
     logger.info("Monitoring: %02d:%02d - %02d:%02d IST",
                 MONITOR_START_HOUR, MONITOR_START_MIN,
@@ -647,9 +822,9 @@ def run_gate_counter():
     detector = PersonDetector()
     detector.load()
 
-    # One tracker per camera (for people)
+    # One tracker per camera (for people) — DVR channels + CP Plus outside gate
     trackers: dict[str, CentroidTracker] = {}
-    for cam in GATE_CAMERAS:
+    for cam in HEADCOUNT_CAMERAS:
         trackers[cam["name"]] = CentroidTracker(
             max_disappeared=MAX_DISAPPEARED,
             max_distance=MAX_DISTANCE,
@@ -664,8 +839,8 @@ def run_gate_counter():
         )
 
     # Daily counters
-    daily_in: dict[str, int] = {c["name"]: 0 for c in GATE_CAMERAS}
-    daily_out: dict[str, int] = {c["name"]: 0 for c in GATE_CAMERAS}
+    daily_in: dict[str, int] = {c["name"]: 0 for c in HEADCOUNT_CAMERAS}
+    daily_out: dict[str, int] = {c["name"]: 0 for c in HEADCOUNT_CAMERAS}
     daily_vehicles_in: dict[str, int] = {n: 0 for n in VEHICLE_CAMERAS}
     daily_vehicles_out: dict[str, int] = {n: 0 for n in VEHICLE_CAMERAS}
     counted_vehicle_ids: dict[str, set[int]] = {n: set() for n in VEHICLE_CAMERAS}
@@ -685,12 +860,12 @@ def run_gate_counter():
                 current_date, today, daily_in, daily_out, daily_vehicles_in,
             )
             current_date = today
-            daily_in = {c["name"]: 0 for c in GATE_CAMERAS}
-            daily_out = {c["name"]: 0 for c in GATE_CAMERAS}
+            daily_in = {c["name"]: 0 for c in HEADCOUNT_CAMERAS}
+            daily_out = {c["name"]: 0 for c in HEADCOUNT_CAMERAS}
             daily_vehicles_in = {n: 0 for n in VEHICLE_CAMERAS}
             daily_vehicles_out = {n: 0 for n in VEHICLE_CAMERAS}
             counted_vehicle_ids = {n: set() for n in VEHICLE_CAMERAS}
-            for cam in GATE_CAMERAS:
+            for cam in HEADCOUNT_CAMERAS:
                 trackers[cam["name"]] = CentroidTracker(
                     max_disappeared=MAX_DISAPPEARED,
                     max_distance=MAX_DISTANCE,
@@ -714,19 +889,17 @@ def run_gate_counter():
 
         poll_count += 1
 
-        for cam in GATE_CAMERAS:
+        for cam in HEADCOUNT_CAMERAS:
             cam_name = cam["name"]
-            channel = cam["channel"]
 
-            dvr_ip = cam["dvr_ip"]
-
-            frame = capture_gate_frame(channel, dvr_ip)
+            frame = capture_camera_frame(cam)
             if frame is None:
                 continue
 
-            # Set virtual line at configured position
+            # Set virtual line at configured position (per-camera override wins)
             frame_h = frame.shape[0]
-            line_y = int(frame_h * LINE_POSITION)
+            cam_line_position = cam.get("line_position") or LINE_POSITION
+            line_y = int(frame_h * cam_line_position)
             trackers[cam_name].set_line_y(line_y)
 
             # Detect people
@@ -919,6 +1092,21 @@ def test_connectivity():
             )
         else:
             logger.error("%s (DVR %s): FAILED — Could not capture frame", cam["name"], dvr_ip)
+
+    # Standalone CP Plus outside-gate camera(s)
+    for cam in CPPLUS_CAMERAS:
+        frame = capture_cpplus_frame(cam)
+        if frame is not None:
+            logger.info(
+                "%s (CP Plus %s): OK — Frame %dx%d (user=%s)",
+                cam["name"], cam["ip"], frame.shape[1], frame.shape[0],
+                cam.get("user"),
+            )
+        else:
+            logger.error(
+                "%s (CP Plus %s): FAILED — Could not capture frame",
+                cam["name"], cam["ip"],
+            )
 
     logger.info("Cloud API: %s", CLOUD_API)
     logger.info("Test complete.")
