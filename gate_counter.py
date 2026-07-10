@@ -129,8 +129,9 @@ CPPLUS_CAMERAS = [
 # Alternate usernames to retry on 401 (Dahua username is case-sensitive)
 CPPLUS_USER_ALTERNATES = ["admin", "Admin"]
 
-# RTSP sub-stream (lower resolution) is enough for head-count detection
-CPPLUS_RTSP_SUBTYPE = int(os.environ.get("CPPLUS_RTSP_SUBTYPE", "1"))
+# The main stream preserves small and overlapping people during crowded periods.
+# Set to 1 only on PCs that cannot sustain the main-stream inference load.
+CPPLUS_RTSP_SUBTYPE = int(os.environ.get("CPPLUS_RTSP_SUBTYPE", "0"))
 
 # Bound HTTP snapshot + RTSP connect/read time so an unreachable camera never
 # blocks the whole poll loop.
@@ -143,6 +144,10 @@ CPPLUS_RTSP_TIMEOUT_SEC = int(os.environ.get("CPPLUS_RTSP_TIMEOUT_SEC", "5"))
 # who cross quickly are never missed. This throttles the worker's processing
 # rate to bound CPU; ~5 FPS gives several detections even for a fast 1-2s pass.
 CPPLUS_TARGET_FPS = float(os.environ.get("CPPLUS_TARGET_FPS", "5"))
+CPPLUS_CONFIDENCE_THRESHOLD = float(
+    os.environ.get("CPPLUS_CONFIDENCE_THRESHOLD", "0.3")
+)
+CPPLUS_LINE_HYSTERESIS = float(os.environ.get("CPPLUS_LINE_HYSTERESIS", "0.04"))
 
 # Direction of travel that counts as ENTERING for the CP Plus outside gate.
 # The CentroidTracker labels a virtual-line crossing "IN" when the person moves
@@ -201,8 +206,7 @@ VEHICLE_CLOUD_API = os.environ.get(
 MAX_DISAPPEARED = 15  # frames before removing a tracked person
 MAX_DISTANCE = 100    # max pixel distance for centroid matching
 
-# Virtual line position (kept for backward compat, but appearance-based
-# counting is now the primary method for people)
+# Default virtual-line position as a fraction of frame height.
 LINE_POSITION = float(os.environ.get("GATE_LINE_POSITION", "0.5"))
 
 # Entry/exit camera classification for direction assignment
@@ -483,13 +487,17 @@ def run_cpplus_worker(cam: dict):
     which misses people who cross the outside gate quickly. This worker keeps a
     persistent RTSP stream (falling back to fast HTTP snapshots if RTSP can't
     open) and processes frames continuously, throttled to CPPLUS_TARGET_FPS, so
-    every person is caught. Each NEW tracked person is counted once
-    (appearance-based) and streamed to the cloud. Runs in its own thread.
+    every person is caught. Each completed line crossing is counted once and
+    streamed to the cloud. Runs in its own thread.
     """
     cam_name = cam["name"]
     detector = PersonDetector()
     detector.load()
-    tracker = CentroidTracker(max_disappeared=MAX_DISAPPEARED, max_distance=MAX_DISTANCE)
+    tracker = CentroidTracker(
+        max_disappeared=MAX_DISAPPEARED,
+        max_distance=MAX_DISTANCE,
+        anchor_y="bottom",
+    )
     # Count each (tracked-person, direction) crossing once so a single person
     # walking through the gate is not counted on every frame.
     counted_crossings: set[tuple[int, str]] = set()
@@ -520,7 +528,11 @@ def run_cpplus_worker(cam: dict):
             daily_in = 0
             daily_out = 0
             counted_crossings = set()
-            tracker = CentroidTracker(max_disappeared=MAX_DISAPPEARED, max_distance=MAX_DISTANCE)
+            tracker = CentroidTracker(
+                max_disappeared=MAX_DISAPPEARED,
+                max_distance=MAX_DISTANCE,
+                anchor_y="bottom",
+            )
 
         loop_start = time.monotonic()
 
@@ -546,12 +558,19 @@ def run_cpplus_worker(cam: dict):
             time.sleep(reconnect_backoff)
             continue
 
-        frame_h = frame.shape[0]
+        frame_h, frame_w = frame.shape[:2]
         line_y = int(frame_h * (cam.get("line_position") or LINE_POSITION))
-        tracker.set_line_y(line_y)
+        tracker.set_line_y(
+            line_y,
+            hysteresis=int(frame_h * CPPLUS_LINE_HYSTERESIS),
+        )
+        tracker.max_distance = max(MAX_DISTANCE, frame_w * MAX_DISTANCE / 640.0)
 
         try:
-            detections = detector.detect(frame)
+            detections = detector.detect(
+                frame,
+                confidence_threshold=CPPLUS_CONFIDENCE_THRESHOLD,
+            )
         except Exception as e:
             logger.error("CP Plus %s: detection error: %s", cam_name, e)
             detections = []
@@ -773,32 +792,44 @@ class CentroidTracker:
     """
 
     def __init__(self, max_disappeared: int = 15, max_distance: float = 100.0,
-                 line_y: int = 0):
+                 line_y: int = 0, anchor_y: str = "centroid"):
         self.next_id = 0
-        self.objects: OrderedDict[int, np.ndarray] = OrderedDict()  # id -> centroid
+        self.objects: OrderedDict[int, np.ndarray] = OrderedDict()  # id -> anchor point
         self.bboxes: dict[int, tuple[int, int, int, int]] = {}  # id -> bbox
         self.disappeared: dict[int, int] = {}
-        self.prev_centroids: dict[int, np.ndarray] = {}  # id -> previous centroid
+        self.stable_sides: dict[int, int] = {}
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
         self.line_y = line_y
+        self.line_hysteresis = 0
+        self.anchor_y = anchor_y
         self.crossings: list[dict] = []  # direction crossings this update
 
-    def set_line_y(self, y: int):
+    def set_line_y(self, y: int, hysteresis: int = 0):
         self.line_y = y
+        self.line_hysteresis = max(0, hysteresis)
+
+    def _line_side(self, y: int) -> int:
+        if y < self.line_y - self.line_hysteresis:
+            return -1
+        if y > self.line_y + self.line_hysteresis:
+            return 1
+        return 0
 
     def register(self, centroid: np.ndarray, bbox: tuple[int, int, int, int]):
         self.objects[self.next_id] = centroid
         self.bboxes[self.next_id] = bbox
         self.disappeared[self.next_id] = 0
-        self.prev_centroids[self.next_id] = centroid.copy()
+        side = self._line_side(int(centroid[1]))
+        if side:
+            self.stable_sides[self.next_id] = side
         self.next_id += 1
 
     def deregister(self, object_id: int):
         del self.objects[object_id]
         del self.bboxes[object_id]
         del self.disappeared[object_id]
-        self.prev_centroids.pop(object_id, None)
+        self.stable_sides.pop(object_id, None)
 
     def update(self, detections: list[tuple[tuple[int, int, int, int], float]]) -> list[dict]:
         """Update tracker with new detections.
@@ -823,7 +854,7 @@ class CentroidTracker:
         for bbox, _conf in detections:
             x1, y1, x2, y2 = bbox
             cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
+            cy = y2 if self.anchor_y == "bottom" else (y1 + y2) // 2
             input_centroids.append(np.array([cx, cy]))
             input_bboxes.append(bbox)
 
@@ -854,26 +885,20 @@ class CentroidTracker:
                     continue
 
                 oid = object_ids[row]
-                self.prev_centroids[oid] = self.objects[oid].copy()
                 self.objects[oid] = input_centroids[col]
                 self.bboxes[oid] = input_bboxes[col]
                 self.disappeared[oid] = 0
 
-                # Check line crossing
-                prev_y = self.prev_centroids[oid][1]
-                curr_y = input_centroids[col][1]
-                if prev_y < self.line_y <= curr_y:
+                previous_side = self.stable_sides.get(oid)
+                current_side = self._line_side(int(input_centroids[col][1]))
+                if current_side and previous_side and current_side != previous_side:
                     self.crossings.append({
                         "id": oid,
-                        "direction": "IN",
+                        "direction": "IN" if current_side > previous_side else "OUT",
                         "bbox": input_bboxes[col],
                     })
-                elif prev_y > self.line_y >= curr_y:
-                    self.crossings.append({
-                        "id": oid,
-                        "direction": "OUT",
-                        "bbox": input_bboxes[col],
-                    })
+                if current_side:
+                    self.stable_sides[oid] = current_side
 
                 used_rows.add(row)
                 used_cols.add(col)
@@ -923,7 +948,11 @@ class PersonDetector:
             logger.error("ultralytics not installed. Run: pip install ultralytics")
             sys.exit(1)
 
-    def detect(self, frame: np.ndarray) -> list[tuple[tuple[int, int, int, int], float]]:
+    def detect(
+        self,
+        frame: np.ndarray,
+        confidence_threshold: float | None = None,
+    ) -> list[tuple[tuple[int, int, int, int], float]]:
         """Detect people in a frame.
 
         Returns:
@@ -934,13 +963,18 @@ class PersonDetector:
 
         results = self.model(frame, verbose=False, classes=[0])  # class 0 = person
         detections = []
+        threshold = (
+            CONFIDENCE_THRESHOLD
+            if confidence_threshold is None
+            else confidence_threshold
+        )
 
         for r in results:
             if r.boxes is None:
                 continue
             for box in r.boxes:
                 conf = float(box.conf[0])
-                if conf < CONFIDENCE_THRESHOLD:
+                if conf < threshold:
                     continue
                 x1, y1, x2, y2 = box.xyxy[0].int().tolist()
                 detections.append(((x1, y1, x2, y2), conf))
