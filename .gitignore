@@ -11,3 +11,4 @@ agent.lock
 # Not tracked so restart scripts (git reset --hard) never overwrite them.
 config.json
 cpplus_replay_state.json
+cpplus_recordings/

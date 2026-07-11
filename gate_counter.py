@@ -52,6 +52,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -150,15 +151,39 @@ CPPLUS_CONFIDENCE_THRESHOLD = float(
 )
 CPPLUS_LINE_HYSTERESIS = float(os.environ.get("CPPLUS_LINE_HYSTERESIS", "0.04"))
 
-# Recount each completed hour from the camera's onboard SD recording. The
-# higher inference size improves small/overlapping person detection; the live
-# stream remains the fallback when recording playback is unavailable.
+# Record the main RTSP stream on the school PC, then recount each completed
+# hour. Onboard SD playback remains a secondary source and live detections are
+# the fallback if local coverage is incomplete.
+CPPLUS_LOCAL_RECORDING_ENABLED = os.environ.get(
+    "CPPLUS_LOCAL_RECORDING_ENABLED", "1",
+) not in ("0", "false", "False", "no", "NO")
+CPPLUS_LOCAL_RECORDING_DIR = Path(
+    os.environ.get(
+        "CPPLUS_LOCAL_RECORDING_DIR",
+        str(Path(__file__).parent / "cpplus_recordings"),
+    )
+)
+CPPLUS_LOCAL_RECORDING_FPS = max(
+    0.1, float(os.environ.get("CPPLUS_LOCAL_RECORDING_FPS", "10")),
+)
+CPPLUS_LOCAL_SEGMENT_MINUTES = max(
+    1, int(os.environ.get("CPPLUS_LOCAL_SEGMENT_MINUTES", "5")),
+)
+CPPLUS_LOCAL_RETENTION_DAYS = max(
+    1, int(os.environ.get("CPPLUS_LOCAL_RETENTION_DAYS", "2")),
+)
+CPPLUS_LOCAL_MIN_FREE_GB = max(
+    0.0, float(os.environ.get("CPPLUS_LOCAL_MIN_FREE_GB", "5")),
+)
+CPPLUS_LOCAL_COVERAGE_TOLERANCE_SECONDS = max(
+    0, int(os.environ.get("CPPLUS_LOCAL_COVERAGE_TOLERANCE_SECONDS", "15")),
+)
 CPPLUS_REPLAY_ENABLED = os.environ.get("CPPLUS_REPLAY_ENABLED", "1") not in (
     "0", "false", "False", "no", "NO",
 )
 CPPLUS_REPLAY_DELAY_MINUTES = int(os.environ.get("CPPLUS_REPLAY_DELAY_MINUTES", "2"))
 CPPLUS_REPLAY_RETRY_MINUTES = int(os.environ.get("CPPLUS_REPLAY_RETRY_MINUTES", "10"))
-CPPLUS_REPLAY_SAMPLE_FPS = float(os.environ.get("CPPLUS_REPLAY_SAMPLE_FPS", "5"))
+CPPLUS_REPLAY_SAMPLE_FPS = float(os.environ.get("CPPLUS_REPLAY_SAMPLE_FPS", "8"))
 CPPLUS_REPLAY_IMAGE_SIZE = int(os.environ.get("CPPLUS_REPLAY_IMAGE_SIZE", "960"))
 CPPLUS_RECORDING_CHANNEL = int(os.environ.get("CPPLUS_RECORDING_CHANNEL", "1"))
 CPPLUS_RECORDING_PORT = int(os.environ.get("CPPLUS_RECORDING_PORT", "80"))
@@ -517,9 +542,6 @@ def run_cpplus_worker(cam: dict):
         max_distance=MAX_DISTANCE,
         anchor_y="bottom",
     )
-    # Count each (tracked-person, direction) crossing once so a single person
-    # walking through the gate is not counted on every frame.
-    counted_crossings: set[tuple[int, str]] = set()
     daily_in = 0
     daily_out = 0
     current_date = datetime.now(IST).strftime("%Y-%m-%d")
@@ -546,7 +568,6 @@ def run_cpplus_worker(cam: dict):
             current_date = today
             daily_in = 0
             daily_out = 0
-            counted_crossings = set()
             tracker = CentroidTracker(
                 max_disappeared=MAX_DISAPPEARED,
                 max_distance=MAX_DISTANCE,
@@ -609,11 +630,6 @@ def run_cpplus_worker(cam: dict):
             else:
                 person_dir = "OUT" if raw_dir == "IN" else "IN"
 
-            key = (cr["id"], person_dir)
-            if key in counted_crossings:
-                continue
-            counted_crossings.add(key)
-
             if person_dir == "IN":
                 daily_in += 1
             else:
@@ -655,6 +671,220 @@ def run_cpplus_worker(cam: dict):
         cap.release()
     logger.info("CP Plus worker stopped for %s (final IN=%d OUT=%d)",
                 cam_name, daily_in, daily_out)
+
+
+def _local_recording_name(start: datetime, end: datetime) -> str:
+    fmt = "%Y%m%dT%H%M%S%f"
+    return f"cpplus_{start.strftime(fmt)}__{end.strftime(fmt)}.mp4"
+
+
+def _parse_local_recording_path(path: Path) -> tuple[datetime, datetime] | None:
+    name = path.name
+    if not name.startswith("cpplus_") or not name.endswith(".mp4"):
+        return None
+    try:
+        start_text, end_text = name[len("cpplus_"):-len(".mp4")].split("__", 1)
+        fmt = "%Y%m%dT%H%M%S%f"
+        return (
+            datetime.strptime(start_text, fmt).replace(tzinfo=IST),
+            datetime.strptime(end_text, fmt).replace(tzinfo=IST),
+        )
+    except (ValueError, TypeError):
+        return None
+
+
+def _cleanup_cpplus_local_recordings(now: datetime) -> None:
+    CPPLUS_LOCAL_RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+    cutoff = now.timestamp() - CPPLUS_LOCAL_RETENTION_DAYS * 24 * 60 * 60
+    for path in CPPLUS_LOCAL_RECORDING_DIR.glob("cpplus_*.mp4"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            logger.warning("Could not clean CP Plus recording %s", path.name)
+    for path in CPPLUS_LOCAL_RECORDING_DIR.glob("*.part.mp4"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _local_recordings_for_hour(
+    hour_start: datetime, hour_end: datetime,
+) -> list[Path] | None:
+    segments: list[tuple[datetime, datetime, Path]] = []
+    for path in CPPLUS_LOCAL_RECORDING_DIR.glob("cpplus_*__*.mp4"):
+        interval = _parse_local_recording_path(path)
+        if interval is None:
+            continue
+        start, end = interval
+        if end > hour_start and start < hour_end:
+            segments.append((start, end, path))
+    segments.sort(key=lambda item: item[0])
+    if not segments:
+        return None
+
+    tolerance = timedelta(seconds=CPPLUS_LOCAL_COVERAGE_TOLERANCE_SECONDS)
+    covered_until = hour_start
+    selected: list[Path] = []
+    for start, end, path in segments:
+        if end <= covered_until:
+            continue
+        if start > covered_until + tolerance:
+            return None
+        selected.append(path)
+        covered_until = max(covered_until, end)
+        if covered_until >= hour_end - tolerance:
+            return selected
+    return None
+
+
+def _finalize_cpplus_local_segment(
+    writer, part_path: Path | None, start: datetime | None, end: datetime,
+) -> None:
+    if writer is not None:
+        writer.release()
+    if part_path is None or start is None or not part_path.exists():
+        return
+    try:
+        if part_path.stat().st_size <= 1024:
+            part_path.unlink(missing_ok=True)
+            return
+        final_path = CPPLUS_LOCAL_RECORDING_DIR / _local_recording_name(start, end)
+        part_path.replace(final_path)
+        logger.info(
+            "CP Plus local recording saved %s-%s (%d bytes)",
+            start.strftime("%H:%M:%S"), end.strftime("%H:%M:%S"),
+            final_path.stat().st_size,
+        )
+    except OSError as exc:
+        logger.warning("Could not finalize CP Plus local recording: %s", exc)
+
+
+def run_cpplus_local_recorder(cam: dict) -> None:
+    CPPLUS_LOCAL_RECORDING_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_cpplus_local_recordings(datetime.now(IST))
+    cap = None
+    writer = None
+    part_path: Path | None = None
+    segment_start: datetime | None = None
+    segment_end: datetime | None = None
+    next_write_at = 0.0
+    next_disk_check_at = 0.0
+    disk_has_space = True
+    logger.info(
+        "CP Plus local recorder started (%.1f FPS, %d-minute segments, %d-day retention)",
+        CPPLUS_LOCAL_RECORDING_FPS, CPPLUS_LOCAL_SEGMENT_MINUTES,
+        CPPLUS_LOCAL_RETENTION_DAYS,
+    )
+
+    try:
+        while running:
+            now = datetime.now(IST)
+            if not is_monitoring_time():
+                _finalize_cpplus_local_segment(writer, part_path, segment_start, now)
+                writer = None
+                part_path = None
+                segment_start = None
+                segment_end = None
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                _cleanup_cpplus_local_recordings(now)
+                time.sleep(30)
+                continue
+
+            monotonic_now = time.monotonic()
+            if monotonic_now >= next_disk_check_at:
+                disk_has_space = shutil.disk_usage(
+                    CPPLUS_LOCAL_RECORDING_DIR,
+                ).free >= CPPLUS_LOCAL_MIN_FREE_GB * 1024 ** 3
+                next_disk_check_at = monotonic_now + 60
+            if not disk_has_space:
+                _finalize_cpplus_local_segment(
+                    writer, part_path, segment_start, now,
+                )
+                writer = None
+                part_path = None
+                segment_start = None
+                segment_end = None
+                logger.error(
+                    "CP Plus local recording paused: less than %.1f GB free",
+                    CPPLUS_LOCAL_MIN_FREE_GB,
+                )
+                _cleanup_cpplus_local_recordings(now)
+                time.sleep(60)
+                continue
+
+            if cap is None or not cap.isOpened():
+                if cap is not None:
+                    cap.release()
+                cap = _open_cpplus_stream(cam)
+                if cap is None:
+                    time.sleep(2)
+                    continue
+
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                _finalize_cpplus_local_segment(
+                    writer, part_path, segment_start, datetime.now(IST),
+                )
+                writer = None
+                part_path = None
+                segment_start = None
+                segment_end = None
+                cap.release()
+                cap = None
+                continue
+
+            now = datetime.now(IST)
+            if segment_end is not None and now >= segment_end:
+                _finalize_cpplus_local_segment(
+                    writer, part_path, segment_start, segment_end,
+                )
+                writer = None
+                part_path = None
+                segment_start = None
+                segment_end = None
+
+            if writer is None:
+                minute = (
+                    now.minute // CPPLUS_LOCAL_SEGMENT_MINUTES
+                ) * CPPLUS_LOCAL_SEGMENT_MINUTES
+                boundary = now.replace(minute=minute, second=0, microsecond=0)
+                segment_end = boundary + timedelta(minutes=CPPLUS_LOCAL_SEGMENT_MINUTES)
+                segment_start = now
+                part_path = CPPLUS_LOCAL_RECORDING_DIR / (
+                    f"cpplus_{now.strftime('%Y%m%dT%H%M%S%f')}.part.mp4"
+                )
+                height, width = frame.shape[:2]
+                writer = cv2.VideoWriter(
+                    str(part_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                    CPPLUS_LOCAL_RECORDING_FPS, (width, height),
+                )
+                if not writer.isOpened():
+                    logger.error("CP Plus local recorder could not open MP4 writer")
+                    writer.release()
+                    writer = None
+                    part_path.unlink(missing_ok=True)
+                    part_path = None
+                    time.sleep(10)
+                    continue
+                next_write_at = time.monotonic()
+
+            monotonic_now = time.monotonic()
+            if monotonic_now >= next_write_at:
+                writer.write(frame)
+                next_write_at = monotonic_now + 1.0 / CPPLUS_LOCAL_RECORDING_FPS
+    except Exception as exc:
+        logger.exception("CP Plus local recorder failed: %s", exc)
+    finally:
+        _finalize_cpplus_local_segment(
+            writer, part_path, segment_start, datetime.now(IST),
+        )
+        if cap is not None:
+            cap.release()
+        logger.info("CP Plus local recorder stopped")
 
 
 def _download_cpplus_recording(
@@ -724,64 +954,70 @@ def _download_cpplus_recording(
     return False
 
 
-def count_cpplus_recording(
-    recording_path: Path, cam: dict, detector: "PersonDetector",
+def count_cpplus_recordings(
+    recording_paths: list[Path], cam: dict, detector: "PersonDetector",
 ) -> tuple[int, int] | None:
-    cap = cv2.VideoCapture(str(recording_path), cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        logger.warning("CP Plus recording could not be decoded: %s", recording_path.name)
-        return None
-
-    source_fps = cap.get(cv2.CAP_PROP_FPS)
-    if not math.isfinite(source_fps) or source_fps <= 0:
-        source_fps = 25.0
-    frame_stride = max(1, round(source_fps / CPPLUS_REPLAY_SAMPLE_FPS))
     tracker = CentroidTracker(
         max_disappeared=MAX_DISAPPEARED,
         max_distance=MAX_DISTANCE,
         anchor_y="bottom",
     )
-    counted_ids: set[int] = set()
-    frame_number = 0
+    in_count = 0
     processed_frames = 0
 
-    try:
-        while running:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                break
-            frame_number += 1
-            if frame_number % frame_stride:
-                continue
+    for recording_path in recording_paths:
+        cap = cv2.VideoCapture(str(recording_path), cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            logger.warning("CP Plus recording could not be decoded: %s", recording_path.name)
+            return None
+        source_fps = cap.get(cv2.CAP_PROP_FPS)
+        if not math.isfinite(source_fps) or source_fps <= 0:
+            source_fps = CPPLUS_LOCAL_RECORDING_FPS
+        frame_stride = max(1, round(source_fps / CPPLUS_REPLAY_SAMPLE_FPS))
+        frame_number = 0
+        try:
+            while running:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                frame_number += 1
+                if frame_number % frame_stride:
+                    continue
 
-            frame_h, frame_w = frame.shape[:2]
-            tracker.set_line_y(
-                int(frame_h * (cam.get("line_position") or LINE_POSITION)),
-                hysteresis=int(frame_h * CPPLUS_LINE_HYSTERESIS),
-            )
-            tracker.max_distance = max(
-                MAX_DISTANCE, frame_w * MAX_DISTANCE / 640.0,
-            )
-            detections = detector.detect(
-                frame,
-                confidence_threshold=CPPLUS_CONFIDENCE_THRESHOLD,
-                image_size=CPPLUS_REPLAY_IMAGE_SIZE,
-            )
-            processed_frames += 1
-            for crossing in tracker.update(detections):
-                raw_direction = crossing["direction"]
-                direction = raw_direction if CPPLUS_IN_TOP_TO_BOTTOM else (
-                    "OUT" if raw_direction == "IN" else "IN"
+                frame_h, frame_w = frame.shape[:2]
+                tracker.set_line_y(
+                    int(frame_h * (cam.get("line_position") or LINE_POSITION)),
+                    hysteresis=int(frame_h * CPPLUS_LINE_HYSTERESIS),
                 )
-                if direction == "IN":
-                    counted_ids.add(crossing["id"])
-    finally:
-        cap.release()
+                tracker.max_distance = max(
+                    MAX_DISTANCE, frame_w * MAX_DISTANCE / 640.0,
+                )
+                detections = detector.detect(
+                    frame,
+                    confidence_threshold=CPPLUS_CONFIDENCE_THRESHOLD,
+                    image_size=CPPLUS_REPLAY_IMAGE_SIZE,
+                )
+                processed_frames += 1
+                for crossing in tracker.update(detections):
+                    raw_direction = crossing["direction"]
+                    direction = raw_direction if CPPLUS_IN_TOP_TO_BOTTOM else (
+                        "OUT" if raw_direction == "IN" else "IN"
+                    )
+                    if direction == "IN":
+                        in_count += 1
+        finally:
+            cap.release()
 
     if processed_frames == 0:
         logger.warning("CP Plus recording contained no decodable frames")
         return None
-    return len(counted_ids), processed_frames
+    return in_count, processed_frames
+
+
+def count_cpplus_recording(
+    recording_path: Path, cam: dict, detector: "PersonDetector",
+) -> tuple[int, int] | None:
+    return count_cpplus_recordings([recording_path], cam, detector)
 
 
 def _load_cpplus_replay_state() -> dict[str, dict]:
@@ -885,18 +1121,28 @@ def run_cpplus_replay_worker(cam: dict) -> None:
             )
             os.close(file_handle)
             recording_path = Path(file_name)
+            local_paths = _local_recordings_for_hour(hour_start, hour_end)
+            source = "school_pc_recording" if local_paths else "camera_recording"
             try:
-                if not _download_cpplus_recording(
-                    cam, hour_start, hour_end, recording_path,
-                ):
-                    retry_after[state_key] = (
-                        time.monotonic() + CPPLUS_REPLAY_RETRY_MINUTES * 60
-                    )
-                    continue
+                replay_paths = local_paths
+                if replay_paths is None:
+                    if not _download_cpplus_recording(
+                        cam, hour_start, hour_end, recording_path,
+                    ):
+                        retry_after[state_key] = (
+                            time.monotonic() + CPPLUS_REPLAY_RETRY_MINUTES * 60
+                        )
+                        logger.warning(
+                            "CP Plus replay unavailable for %s-%s: local coverage incomplete "
+                            "and camera playback failed; live count remains in use",
+                            hour_start.strftime("%H:%M"), hour_end.strftime("%H:%M"),
+                        )
+                        continue
+                    replay_paths = [recording_path]
                 if detector is None:
                     detector = PersonDetector()
                     detector.load()
-                result = count_cpplus_recording(recording_path, cam, detector)
+                result = count_cpplus_recordings(replay_paths, cam, detector)
                 if result is None:
                     retry_after[state_key] = (
                         time.monotonic() + CPPLUS_REPLAY_RETRY_MINUTES * 60
@@ -910,12 +1156,13 @@ def run_cpplus_replay_worker(cam: dict) -> None:
                     "in_count": in_count,
                     "processed_frames": processed_frames,
                     "uploaded": uploaded,
+                    "source": source,
                 }
                 _save_cpplus_replay_state(state)
                 logger.info(
-                    "CP Plus recording recount %s-%s: IN=%d frames=%d uploaded=%s",
+                    "CP Plus recording recount %s-%s: IN=%d frames=%d source=%s uploaded=%s",
                     hour_start.strftime("%H:%M"), hour_end.strftime("%H:%M"),
-                    in_count, processed_frames, uploaded,
+                    in_count, processed_frames, source, uploaded,
                 )
             except Exception as exc:
                 logger.exception("CP Plus recording recount failed: %s", exc)
@@ -1455,6 +1702,13 @@ def run_gate_counter():
         )
         t.start()
         cpplus_threads.append(t)
+        if CPPLUS_LOCAL_RECORDING_ENABLED:
+            recorder_thread = threading.Thread(
+                target=run_cpplus_local_recorder, args=(cam,), daemon=True,
+                name=f"cpplus-recorder-{cam['name']}",
+            )
+            recorder_thread.start()
+            cpplus_threads.append(recorder_thread)
         if CPPLUS_REPLAY_ENABLED:
             replay_thread = threading.Thread(
                 target=run_cpplus_replay_worker, args=(cam,), daemon=True,
