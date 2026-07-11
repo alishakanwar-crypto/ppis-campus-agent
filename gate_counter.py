@@ -54,6 +54,7 @@ import math
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -149,6 +150,20 @@ CPPLUS_CONFIDENCE_THRESHOLD = float(
 )
 CPPLUS_LINE_HYSTERESIS = float(os.environ.get("CPPLUS_LINE_HYSTERESIS", "0.04"))
 
+# Recount each completed hour from the camera's onboard SD recording. The
+# higher inference size improves small/overlapping person detection; the live
+# stream remains the fallback when recording playback is unavailable.
+CPPLUS_REPLAY_ENABLED = os.environ.get("CPPLUS_REPLAY_ENABLED", "1") not in (
+    "0", "false", "False", "no", "NO",
+)
+CPPLUS_REPLAY_DELAY_MINUTES = int(os.environ.get("CPPLUS_REPLAY_DELAY_MINUTES", "2"))
+CPPLUS_REPLAY_RETRY_MINUTES = int(os.environ.get("CPPLUS_REPLAY_RETRY_MINUTES", "10"))
+CPPLUS_REPLAY_SAMPLE_FPS = float(os.environ.get("CPPLUS_REPLAY_SAMPLE_FPS", "5"))
+CPPLUS_REPLAY_IMAGE_SIZE = int(os.environ.get("CPPLUS_REPLAY_IMAGE_SIZE", "960"))
+CPPLUS_RECORDING_CHANNEL = int(os.environ.get("CPPLUS_RECORDING_CHANNEL", "1"))
+CPPLUS_RECORDING_PORT = int(os.environ.get("CPPLUS_RECORDING_PORT", "80"))
+CPPLUS_REPLAY_STATE_FILE = Path(__file__).parent / "cpplus_replay_state.json"
+
 # Direction of travel that counts as ENTERING for the CP Plus outside gate.
 # The CentroidTracker labels a virtual-line crossing "IN" when the person moves
 # top-to-bottom in the frame and "OUT" bottom-to-top. If the camera is mounted
@@ -169,6 +184,10 @@ HEADCOUNT_CAMERAS = GATE_CAMERAS + CPPLUS_CAMERAS
 CLOUD_API = os.environ.get(
     "GATE_CLOUD_API",
     "https://ppis-whatsapp-bot.fly.dev/api/gate/entry",
+)
+CPPLUS_RECOUNT_API = os.environ.get(
+    "CPPLUS_RECOUNT_API",
+    "https://ppis-whatsapp-bot.fly.dev/api/gate/cpplus-hourly-recount",
 )
 
 POLL_INTERVAL = int(os.environ.get("GATE_POLL_SECONDS", "5"))
@@ -638,6 +657,278 @@ def run_cpplus_worker(cam: dict):
                 cam_name, daily_in, daily_out)
 
 
+def _download_cpplus_recording(
+    cam: dict, hour_start: datetime, hour_end: datetime, output_path: Path,
+) -> bool:
+    password = _resolve_cpplus_password(cam)
+    if not password:
+        logger.warning("CP Plus recording replay: no camera password available")
+        return False
+
+    configured_user = cam.get("user", "admin")
+    users = [configured_user] + [
+        user for user in CPPLUS_USER_ALTERNATES if user != configured_user
+    ]
+    url = (
+        f"http://{cam['ip']}:{CPPLUS_RECORDING_PORT}/cgi-bin/loadfile.cgi"
+    )
+    params = {
+        "action": "startLoad",
+        "channel": str(CPPLUS_RECORDING_CHANNEL),
+        "startTime": hour_start.strftime("%Y-%m-%d %H:%M:%S"),
+        "endTime": hour_end.strftime("%Y-%m-%d %H:%M:%S"),
+        "subtype": str(CPPLUS_RTSP_SUBTYPE),
+    }
+    timeout = httpx.Timeout(180.0, connect=CPPLUS_CONNECT_TIMEOUT_SEC)
+
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            for user in users:
+                for auth in (
+                    httpx.DigestAuth(user, password),
+                    httpx.BasicAuth(user, password),
+                ):
+                    with client.stream("GET", url, params=params, auth=auth) as response:
+                        if response.status_code == 401:
+                            continue
+                        if response.status_code != 200:
+                            logger.warning(
+                                "CP Plus recording replay HTTP %d for %s",
+                                response.status_code, hour_start.strftime("%H:%M"),
+                            )
+                            break
+                        size = 0
+                        with output_path.open("wb") as recording:
+                            for chunk in response.iter_bytes():
+                                recording.write(chunk)
+                                size += len(chunk)
+                        if size > 1024:
+                            cam["user"] = user
+                            logger.info(
+                                "CP Plus recording downloaded for %s-%s (%d bytes)",
+                                hour_start.strftime("%H:%M"),
+                                hour_end.strftime("%H:%M"), size,
+                            )
+                            return True
+                        output_path.unlink(missing_ok=True)
+                        logger.warning(
+                            "CP Plus recording replay returned no video for %s-%s",
+                            hour_start.strftime("%H:%M"), hour_end.strftime("%H:%M"),
+                        )
+                        break
+    except (httpx.HTTPError, OSError) as exc:
+        logger.warning(
+            "CP Plus recording download failed for %s-%s: %s",
+            hour_start.strftime("%H:%M"), hour_end.strftime("%H:%M"), exc,
+        )
+    return False
+
+
+def count_cpplus_recording(
+    recording_path: Path, cam: dict, detector: "PersonDetector",
+) -> tuple[int, int] | None:
+    cap = cv2.VideoCapture(str(recording_path), cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        logger.warning("CP Plus recording could not be decoded: %s", recording_path.name)
+        return None
+
+    source_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not math.isfinite(source_fps) or source_fps <= 0:
+        source_fps = 25.0
+    frame_stride = max(1, round(source_fps / CPPLUS_REPLAY_SAMPLE_FPS))
+    tracker = CentroidTracker(
+        max_disappeared=MAX_DISAPPEARED,
+        max_distance=MAX_DISTANCE,
+        anchor_y="bottom",
+    )
+    counted_ids: set[int] = set()
+    frame_number = 0
+    processed_frames = 0
+
+    try:
+        while running:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            frame_number += 1
+            if frame_number % frame_stride:
+                continue
+
+            frame_h, frame_w = frame.shape[:2]
+            tracker.set_line_y(
+                int(frame_h * (cam.get("line_position") or LINE_POSITION)),
+                hysteresis=int(frame_h * CPPLUS_LINE_HYSTERESIS),
+            )
+            tracker.max_distance = max(
+                MAX_DISTANCE, frame_w * MAX_DISTANCE / 640.0,
+            )
+            detections = detector.detect(
+                frame,
+                confidence_threshold=CPPLUS_CONFIDENCE_THRESHOLD,
+                image_size=CPPLUS_REPLAY_IMAGE_SIZE,
+            )
+            processed_frames += 1
+            for crossing in tracker.update(detections):
+                raw_direction = crossing["direction"]
+                direction = raw_direction if CPPLUS_IN_TOP_TO_BOTTOM else (
+                    "OUT" if raw_direction == "IN" else "IN"
+                )
+                if direction == "IN":
+                    counted_ids.add(crossing["id"])
+    finally:
+        cap.release()
+
+    if processed_frames == 0:
+        logger.warning("CP Plus recording contained no decodable frames")
+        return None
+    return len(counted_ids), processed_frames
+
+
+def _load_cpplus_replay_state() -> dict[str, dict]:
+    try:
+        data = json.loads(CPPLUS_REPLAY_STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {
+                str(key): value for key, value in data.items()
+                if isinstance(value, dict)
+            }
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_cpplus_replay_state(state: dict[str, dict]) -> None:
+    temp_path = CPPLUS_REPLAY_STATE_FILE.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(CPPLUS_REPLAY_STATE_FILE)
+
+
+def _agent_secret_headers() -> dict[str, str]:
+    secret = os.environ.get("AGENT_SECRET", "")
+    if not secret:
+        try:
+            config = json.loads(
+                (Path(__file__).parent / "config.json").read_text(encoding="utf-8")
+            )
+            if isinstance(config, dict):
+                secret = str(config.get("agent_secret", ""))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"X-Agent-Secret": secret} if secret else {}
+
+
+def _post_cpplus_recount(
+    hour_start: datetime, hour_end: datetime, in_count: int, processed_frames: int,
+) -> bool:
+    payload = {
+        "date": hour_start.strftime("%Y-%m-%d"),
+        "hour_start": hour_start.strftime("%Y-%m-%d %H:%M:%S"),
+        "hour_end": hour_end.strftime("%Y-%m-%d %H:%M:%S"),
+        "in_count": in_count,
+        "processed_frames": processed_frames,
+    }
+    try:
+        response = httpx.post(
+            CPPLUS_RECOUNT_API,
+            json=payload,
+            headers=_agent_secret_headers(),
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        return True
+    except httpx.HTTPError as exc:
+        logger.warning("CP Plus recording recount upload failed: %s", exc)
+        return False
+
+
+def _completed_replay_hours(now: datetime) -> list[tuple[datetime, datetime]]:
+    day_start = now.replace(
+        hour=MONITOR_START_HOUR, minute=MONITOR_START_MIN, second=0, microsecond=0,
+    )
+    day_end = now.replace(
+        hour=MONITOR_END_HOUR, minute=MONITOR_END_MIN, second=0, microsecond=0,
+    )
+    available_until = min(now - timedelta(minutes=CPPLUS_REPLAY_DELAY_MINUTES), day_end)
+    completed_end = available_until.replace(minute=0, second=0, microsecond=0)
+    hours = []
+    hour_start = day_start
+    while hour_start + timedelta(hours=1) <= completed_end:
+        hours.append((hour_start, hour_start + timedelta(hours=1)))
+        hour_start += timedelta(hours=1)
+    return hours
+
+
+def run_cpplus_replay_worker(cam: dict) -> None:
+    state = _load_cpplus_replay_state()
+    retry_after: dict[str, float] = {}
+    detector: PersonDetector | None = None
+    logger.info("CP Plus onboard-recording replay worker started")
+
+    while running:
+        now = datetime.now(IST)
+        for hour_start, hour_end in _completed_replay_hours(now):
+            state_key = hour_start.strftime("%Y-%m-%d %H:%M:%S")
+            saved = state.get(state_key)
+            if saved:
+                if not saved.get("uploaded") and _post_cpplus_recount(
+                    hour_start, hour_end, int(saved["in_count"]),
+                    int(saved["processed_frames"]),
+                ):
+                    saved["uploaded"] = True
+                    _save_cpplus_replay_state(state)
+                continue
+            if time.monotonic() < retry_after.get(state_key, 0.0):
+                continue
+
+            file_handle, file_name = tempfile.mkstemp(
+                prefix="cpplus_replay_", suffix=".dav",
+            )
+            os.close(file_handle)
+            recording_path = Path(file_name)
+            try:
+                if not _download_cpplus_recording(
+                    cam, hour_start, hour_end, recording_path,
+                ):
+                    retry_after[state_key] = (
+                        time.monotonic() + CPPLUS_REPLAY_RETRY_MINUTES * 60
+                    )
+                    continue
+                if detector is None:
+                    detector = PersonDetector()
+                    detector.load()
+                result = count_cpplus_recording(recording_path, cam, detector)
+                if result is None:
+                    retry_after[state_key] = (
+                        time.monotonic() + CPPLUS_REPLAY_RETRY_MINUTES * 60
+                    )
+                    continue
+                in_count, processed_frames = result
+                uploaded = _post_cpplus_recount(
+                    hour_start, hour_end, in_count, processed_frames,
+                )
+                state[state_key] = {
+                    "in_count": in_count,
+                    "processed_frames": processed_frames,
+                    "uploaded": uploaded,
+                }
+                _save_cpplus_replay_state(state)
+                logger.info(
+                    "CP Plus recording recount %s-%s: IN=%d frames=%d uploaded=%s",
+                    hour_start.strftime("%H:%M"), hour_end.strftime("%H:%M"),
+                    in_count, processed_frames, uploaded,
+                )
+            except Exception as exc:
+                logger.exception("CP Plus recording recount failed: %s", exc)
+                retry_after[state_key] = (
+                    time.monotonic() + CPPLUS_REPLAY_RETRY_MINUTES * 60
+                )
+            finally:
+                recording_path.unlink(missing_ok=True)
+        time.sleep(30)
+
+    logger.info("CP Plus onboard-recording replay worker stopped")
+
+
 # ---------------------------------------------------------------------------
 # Color Extraction
 # ---------------------------------------------------------------------------
@@ -952,6 +1243,7 @@ class PersonDetector:
         self,
         frame: np.ndarray,
         confidence_threshold: float | None = None,
+        image_size: int | None = None,
     ) -> list[tuple[tuple[int, int, int, int], float]]:
         """Detect people in a frame.
 
@@ -961,7 +1253,12 @@ class PersonDetector:
         if self.model is None:
             return []
 
-        results = self.model(frame, verbose=False, classes=[0])  # class 0 = person
+        if image_size is None:
+            results = self.model(frame, verbose=False, classes=[0])
+        else:
+            results = self.model(
+                frame, verbose=False, classes=[0], imgsz=image_size,
+            )
         detections = []
         threshold = (
             CONFIDENCE_THRESHOLD
@@ -1158,6 +1455,13 @@ def run_gate_counter():
         )
         t.start()
         cpplus_threads.append(t)
+        if CPPLUS_REPLAY_ENABLED:
+            replay_thread = threading.Thread(
+                target=run_cpplus_replay_worker, args=(cam,), daemon=True,
+                name=f"cpplus-replay-{cam['name']}",
+            )
+            replay_thread.start()
+            cpplus_threads.append(replay_thread)
 
     # One tracker per camera (for people) — DVR channels + CP Plus outside gate
     trackers: dict[str, CentroidTracker] = {}

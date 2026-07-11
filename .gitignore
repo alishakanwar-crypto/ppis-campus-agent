@@ -7,6 +7,7 @@ attendance_snapshots/
 agent.lock
 .agent_lock
 
-# Per-machine local config (agent_secret, DVR creds, camera mapping).
-# Not tracked so restart scripts (git reset --hard) never overwrite it.
+# Per-machine local config and completed recording-recount state.
+# Not tracked so restart scripts (git reset --hard) never overwrite them.
 config.json
+cpplus_replay_state.json
