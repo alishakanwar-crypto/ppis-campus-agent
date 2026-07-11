@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 import uuid
@@ -130,6 +131,9 @@ HIKVISION_REPLAY_COVERAGE_TOLERANCE_SECONDS = max(
 )
 HIKVISION_REPLAY_MAX_DOWNLOAD_MB = max(
     100, int(os.environ.get("HIKVISION_REPLAY_MAX_DOWNLOAD_MB", "4096")),
+)
+HIKVISION_REPLAY_MIN_FREE_GB = max(
+    1, int(os.environ.get("HIKVISION_REPLAY_MIN_FREE_GB", "5")),
 )
 HIKVISION_REPLAY_CACHE_DIR = Path(__file__).parent / "hikvision_replay_cache"
 HIKVISION_REPLAY_STATE_PATH = Path(__file__).parent / "hikvision_replay_state.json"
@@ -2845,6 +2849,11 @@ class AttendanceEngine:
         ET.SubElement(root, "playbackURI").text = playback_uri
         body = ET.tostring(root, encoding="utf-8", xml_declaration=True)
         max_bytes = HIKVISION_REPLAY_MAX_DOWNLOAD_MB * 1024 * 1024
+        minimum_free_bytes = HIKVISION_REPLAY_MIN_FREE_GB * 1024 ** 3
+        if shutil.disk_usage(destination.parent).free < minimum_free_bytes:
+            raise RuntimeError(
+                f"less than {HIKVISION_REPLAY_MIN_FREE_GB} GB disk space available"
+            )
         written = 0
 
         async with httpx.AsyncClient(
