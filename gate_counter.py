@@ -1215,7 +1215,7 @@ def _completed_replay_hours(now: datetime) -> list[tuple[datetime, datetime]]:
     while hour_start + timedelta(hours=1) <= completed_end:
         hours.append((hour_start, hour_start + timedelta(hours=1)))
         hour_start += timedelta(hours=1)
-    return hours
+    return list(reversed(hours))
 
 
 def run_cpplus_replay_worker(cam: dict) -> None:
