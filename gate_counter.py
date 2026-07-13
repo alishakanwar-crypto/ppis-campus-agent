@@ -189,7 +189,9 @@ CPPLUS_REPLAY_ENABLED = os.environ.get("CPPLUS_REPLAY_ENABLED", "1") not in (
 )
 CPPLUS_REPLAY_DELAY_MINUTES = int(os.environ.get("CPPLUS_REPLAY_DELAY_MINUTES", "2"))
 CPPLUS_REPLAY_RETRY_MINUTES = int(os.environ.get("CPPLUS_REPLAY_RETRY_MINUTES", "10"))
-CPPLUS_REPLAY_SAMPLE_FPS = float(os.environ.get("CPPLUS_REPLAY_SAMPLE_FPS", "8"))
+# Two frames per second retains several observations per walkway crossing while
+# allowing a CPU-only school PC to finish each hour before the next one queues.
+CPPLUS_REPLAY_SAMPLE_FPS = float(os.environ.get("CPPLUS_REPLAY_SAMPLE_FPS", "2"))
 CPPLUS_REPLAY_IMAGE_SIZE = int(os.environ.get("CPPLUS_REPLAY_IMAGE_SIZE", "960"))
 CPPLUS_RECORDING_CHANNEL = int(os.environ.get("CPPLUS_RECORDING_CHANNEL", "1"))
 CPPLUS_RECORDING_PORT = int(os.environ.get("CPPLUS_RECORDING_PORT", "80"))
