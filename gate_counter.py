@@ -61,6 +61,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 import cv2
 import httpx
@@ -906,28 +907,113 @@ def run_cpplus_local_recorder(cam: dict) -> None:
         logger.info("CP Plus local recorder stopped")
 
 
+def _parse_cpplus_recording_paths(response_text: str) -> list[str]:
+    items: dict[int, dict[str, str]] = {}
+    for line in response_text.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or not key.startswith("items["):
+            continue
+        index_end = key.find("]")
+        if index_end < 7 or "." not in key[index_end:]:
+            continue
+        try:
+            index = int(key[6:index_end])
+        except ValueError:
+            continue
+        field = key[index_end + 2:]
+        items.setdefault(index, {})[field] = value.strip()
+    return [
+        item["FilePath"] for _, item in sorted(items.items())
+        if item.get("FilePath")
+    ]
+
+
+def _find_cpplus_recording_paths(
+    client: httpx.Client,
+    base_url: str,
+    auth: httpx.Auth,
+    channel: int,
+    hour_start: datetime,
+    hour_end: datetime,
+) -> list[str]:
+    finder_id = ""
+    try:
+        response = client.get(
+            f"{base_url}/cgi-bin/mediaFileFind.cgi",
+            params={"action": "factory.create"},
+            auth=auth,
+        )
+        if response.status_code != 200 or "=" not in response.text:
+            return []
+        finder_id = response.text.strip().splitlines()[0].partition("=")[2].strip()
+        if not finder_id:
+            return []
+        response = client.get(
+            f"{base_url}/cgi-bin/mediaFileFind.cgi",
+            params={
+                "action": "findFile",
+                "object": finder_id,
+                "condition.Channel": str(channel),
+                "condition.StartTime": hour_start.strftime("%Y-%m-%d %H:%M:%S"),
+                "condition.EndTime": hour_end.strftime("%Y-%m-%d %H:%M:%S"),
+                "condition.Types[0]": "dav",
+                "condition.Types[1]": "mp4",
+            },
+            auth=auth,
+        )
+        if response.status_code != 200 or not response.text.strip().startswith("OK"):
+            return []
+
+        paths: list[str] = []
+        for _ in range(20):
+            response = client.get(
+                f"{base_url}/cgi-bin/mediaFileFind.cgi",
+                params={
+                    "action": "findNextFile",
+                    "object": finder_id,
+                    "count": "100",
+                },
+                auth=auth,
+            )
+            if response.status_code != 200:
+                break
+            batch = _parse_cpplus_recording_paths(response.text)
+            paths.extend(batch)
+            first_line = response.text.strip().splitlines()[0] if response.text.strip() else ""
+            try:
+                found = int(first_line.partition("=")[2])
+            except ValueError:
+                found = len(batch)
+            if found < 100:
+                break
+        return list(dict.fromkeys(paths))
+    finally:
+        if finder_id:
+            for action in ("close", "destroy"):
+                try:
+                    client.get(
+                        f"{base_url}/cgi-bin/mediaFileFind.cgi",
+                        params={"action": action, "object": finder_id},
+                        auth=auth,
+                    )
+                except httpx.HTTPError:
+                    pass
+
+
 def _download_cpplus_recording(
     cam: dict, hour_start: datetime, hour_end: datetime, output_path: Path,
-) -> bool:
+) -> list[Path] | None:
     password = _resolve_cpplus_password(cam)
     if not password:
         logger.warning("CP Plus recording replay: no camera password available")
-        return False
+        return None
 
     configured_user = cam.get("user", "admin")
     users = [configured_user] + [
         user for user in CPPLUS_USER_ALTERNATES if user != configured_user
     ]
-    url = (
-        f"http://{cam['ip']}:{CPPLUS_RECORDING_PORT}/cgi-bin/loadfile.cgi"
-    )
-    params = {
-        "action": "startLoad",
-        "channel": str(CPPLUS_RECORDING_CHANNEL),
-        "startTime": hour_start.strftime("%Y-%m-%d %H:%M:%S"),
-        "endTime": hour_end.strftime("%Y-%m-%d %H:%M:%S"),
-        "subtype": str(CPPLUS_RTSP_SUBTYPE),
-    }
+    channels = list(dict.fromkeys((CPPLUS_RECORDING_CHANNEL, max(0, CPPLUS_RECORDING_CHANNEL - 1))))
+    base_url = f"http://{cam['ip']}:{CPPLUS_RECORDING_PORT}"
     timeout = httpx.Timeout(180.0, connect=CPPLUS_CONNECT_TIMEOUT_SEC)
 
     try:
@@ -937,40 +1023,47 @@ def _download_cpplus_recording(
                     httpx.DigestAuth(user, password),
                     httpx.BasicAuth(user, password),
                 ):
-                    with client.stream("GET", url, params=params, auth=auth) as response:
-                        if response.status_code == 401:
+                    for channel in channels:
+                        paths = _find_cpplus_recording_paths(
+                            client, base_url, auth, channel, hour_start, hour_end,
+                        )
+                        if not paths:
                             continue
-                        if response.status_code != 200:
-                            logger.warning(
-                                "CP Plus recording replay HTTP %d for %s",
-                                response.status_code, hour_start.strftime("%H:%M"),
+                        downloaded: list[Path] = []
+                        for index, camera_path in enumerate(paths):
+                            suffix = Path(camera_path).suffix or ".dav"
+                            target = output_path.with_name(
+                                f"{output_path.stem}_{index:03d}{suffix}"
                             )
-                            break
-                        size = 0
-                        with output_path.open("wb") as recording:
-                            for chunk in response.iter_bytes():
-                                recording.write(chunk)
-                                size += len(chunk)
-                        if size > 1024:
+                            encoded_path = quote(camera_path, safe="/[]@()._-")
+                            url = f"{base_url}/cgi-bin/RPC_Loadfile{encoded_path}"
+                            with client.stream("GET", url, auth=auth) as response:
+                                if response.status_code != 200:
+                                    continue
+                                size = 0
+                                with target.open("wb") as recording:
+                                    for chunk in response.iter_bytes():
+                                        recording.write(chunk)
+                                        size += len(chunk)
+                                if size > 1024:
+                                    downloaded.append(target)
+                                else:
+                                    target.unlink(missing_ok=True)
+                        if downloaded:
                             cam["user"] = user
                             logger.info(
-                                "CP Plus recording downloaded for %s-%s (%d bytes)",
+                                "CP Plus SD recording downloaded for %s-%s "
+                                "(%d file(s), channel %d)",
                                 hour_start.strftime("%H:%M"),
-                                hour_end.strftime("%H:%M"), size,
+                                hour_end.strftime("%H:%M"), len(downloaded), channel,
                             )
-                            return True
-                        output_path.unlink(missing_ok=True)
-                        logger.warning(
-                            "CP Plus recording replay returned no video for %s-%s",
-                            hour_start.strftime("%H:%M"), hour_end.strftime("%H:%M"),
-                        )
-                        break
+                            return downloaded
     except (httpx.HTTPError, OSError) as exc:
         logger.warning(
-            "CP Plus recording download failed for %s-%s: %s",
+            "CP Plus SD recording download failed for %s-%s: %s",
             hour_start.strftime("%H:%M"), hour_end.strftime("%H:%M"), exc,
         )
-    return False
+    return None
 
 
 def count_cpplus_recordings(
@@ -1153,23 +1246,25 @@ def run_cpplus_replay_worker(cam: dict) -> None:
             os.close(file_handle)
             recording_path = Path(file_name)
             local_paths = _local_recordings_for_hour(hour_start, hour_end)
-            source = "school_pc_recording" if local_paths else "camera_recording"
+            downloaded_paths: list[Path] = []
+            source = "camera_sd_recording"
             try:
-                replay_paths = local_paths
-                if replay_paths is None:
-                    if not _download_cpplus_recording(
-                        cam, hour_start, hour_end, recording_path,
-                    ):
-                        retry_after[state_key] = (
-                            time.monotonic() + CPPLUS_REPLAY_RETRY_MINUTES * 60
-                        )
-                        logger.warning(
-                            "CP Plus replay unavailable for %s-%s: local coverage incomplete "
-                            "and camera playback failed; live count remains in use",
-                            hour_start.strftime("%H:%M"), hour_end.strftime("%H:%M"),
-                        )
-                        continue
-                    replay_paths = [recording_path]
+                downloaded_paths = _download_cpplus_recording(
+                    cam, hour_start, hour_end, recording_path,
+                ) or []
+                replay_paths = downloaded_paths or local_paths
+                if not replay_paths:
+                    retry_after[state_key] = (
+                        time.monotonic() + CPPLUS_REPLAY_RETRY_MINUTES * 60
+                    )
+                    logger.warning(
+                        "CP Plus replay unavailable for %s-%s: camera SD playback failed "
+                        "and local coverage is incomplete; live count remains in use",
+                        hour_start.strftime("%H:%M"), hour_end.strftime("%H:%M"),
+                    )
+                    continue
+                if not downloaded_paths:
+                    source = "school_pc_recording"
                 if detector is None:
                     detector = PersonDetector()
                     detector.load()
@@ -1202,6 +1297,8 @@ def run_cpplus_replay_worker(cam: dict) -> None:
                 )
             finally:
                 recording_path.unlink(missing_ok=True)
+                for downloaded_path in downloaded_paths:
+                    downloaded_path.unlink(missing_ok=True)
         time.sleep(30)
 
     logger.info("CP Plus onboard-recording replay worker stopped")
