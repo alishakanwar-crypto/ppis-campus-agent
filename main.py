@@ -518,10 +518,18 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
     # Probe native resolution for highest quality capture
     from attendance_engine import _probe_channel_resolution, _channel_resolution_cache
     try:
-        async with httpx.AsyncClient(timeout=15.0,
-                                     auth=httpx.DigestAuth(user, pwd)) as probe_client:
-            native_res = await _probe_channel_resolution(
-                probe_client, ip, port, channel)
+        cam_key = f"{ip}:{channel}"
+        if cam_key in _channel_resolution_cache:
+            native_res = _channel_resolution_cache[cam_key]
+        else:
+            async with httpx.AsyncClient(
+                timeout=5.0,
+                auth=httpx.DigestAuth(user, pwd),
+            ) as probe_client:
+                native_res = await asyncio.wait_for(
+                    _probe_channel_resolution(probe_client, ip, port, channel),
+                    timeout=5.0,
+                )
         req_w = native_res[0] if native_res else 1920
         req_h = native_res[1] if native_res else 1080
     except Exception:
@@ -533,7 +541,9 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
     logger.info(f"Capturing snapshot from {ip} channel {channel} (stream {stream_channel}) at {req_w}x{req_h}")
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0, connect=3.0)
+        ) as client:
             # Try digest auth first (Hikvision default), then basic
             resp = await client.get(url, auth=httpx.DigestAuth(user, pwd))
             if resp.status_code == 401:
@@ -766,6 +776,19 @@ def find_all_cameras_for_classroom(classroom: str) -> list[tuple[dict, int, str]
 
 ws_connection = None
 ws_task = None
+_snapshot_tasks: set[asyncio.Task] = set()
+_snapshot_request_semaphore = asyncio.Semaphore(
+    max(1, int(os.environ.get("SNAPSHOT_CONCURRENT_REQUESTS", "2")))
+)
+
+
+def _snapshot_task_done(task: asyncio.Task) -> None:
+    _snapshot_tasks.discard(task)
+    try:
+        task.result()
+    except Exception as exc:
+        logger.error("Snapshot request task failed: %s", exc, exc_info=True)
+
 
 async def websocket_client():
     """Persistent WebSocket connection to the cloud bot.
@@ -805,7 +828,11 @@ async def websocket_client():
                             classroom = data.get("classroom", "")
                             request_id = data.get("request_id", "")
                             logger.info(f"Snapshot request for classroom: {classroom} (req: {request_id})")
-                            await handle_snapshot_request(ws, classroom, request_id)
+                            task = asyncio.create_task(
+                                handle_snapshot_request(ws, classroom, request_id)
+                            )
+                            _snapshot_tasks.add(task)
+                            task.add_done_callback(_snapshot_task_done)
 
                         elif msg_type == "ping":
                             await ws.send(json.dumps({"type": "pong"}))
@@ -907,6 +934,29 @@ async def websocket_client():
         ws_backoff = min(ws_backoff * 2, 60)
 
 
+async def _capture_classroom_camera(
+    classroom: str,
+    camera: tuple[dict, int, str],
+) -> tuple[bytes, str, str] | None:
+    dvr, channel, desc = camera
+    snapshot = await capture_snapshot(dvr, channel)
+    if not snapshot:
+        logger.warning(
+            f"Failed to capture from DVR {dvr['ip']} channel {channel} ({desc})"
+        )
+        return None
+
+    ts = int(time.time() * 1000)
+    cam_label = desc.split()[-1] if desc else f"ch{channel}"
+    safe_name = classroom.replace(' ', '_').replace('/', '_').replace('\\', '_')
+    filename = f"{safe_name}_{cam_label}_{ts}.jpg"
+    filepath = SNAPSHOT_DIR / filename
+    with open(filepath, "wb") as file:
+        file.write(snapshot)
+    logger.info(f"Snapshot captured: {filename} ({len(snapshot)} bytes) - {desc}")
+    return snapshot, filename, desc
+
+
 async def handle_snapshot_request(ws, classroom: str, request_id: str):
     """Handle a snapshot request from the cloud bot.
 
@@ -917,6 +967,11 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
       2. snapshot_complete (final message with total count)
     Falls back to legacy single-message format if only 1 image captured.
     """
+    async with _snapshot_request_semaphore:
+        await _handle_snapshot_request(ws, classroom, request_id)
+
+
+async def _handle_snapshot_request(ws, classroom: str, request_id: str):
     all_cameras = find_all_cameras_for_classroom(classroom)
 
     if not all_cameras:
@@ -930,22 +985,11 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
 
     logger.info(f"Capturing from {len(all_cameras)} camera(s) for {classroom}")
 
-    # Capture exactly 2 photos: one from C1, one from C2 (no extras)
-    raw_images = []  # list of (bytes, filename, description)
-    for dvr, channel, desc in all_cameras[:2]:  # Max 2 cameras (C1 + C2)
-        snapshot = await capture_snapshot(dvr, channel)
-        if snapshot:
-            ts = int(time.time())
-            cam_label = desc.split()[-1] if desc else f"ch{channel}"
-            safe_name = classroom.replace(' ', '_').replace('/', '_').replace('\\', '_')
-            filename = f"{safe_name}_{cam_label}_{ts}.jpg"
-            filepath = SNAPSHOT_DIR / filename
-            with open(filepath, "wb") as f:
-                f.write(snapshot)
-            raw_images.append((snapshot, filename, desc))
-            logger.info(f"Snapshot captured: {filename} ({len(snapshot)} bytes) - {desc}")
-        else:
-            logger.warning(f"Failed to capture from DVR {dvr['ip']} channel {channel} ({desc})")
+    results = await asyncio.gather(*(
+        _capture_classroom_camera(classroom, camera)
+        for camera in all_cameras[:2]
+    ))
+    raw_images = [result for result in results if result is not None]
 
     if not raw_images:
         await ws.send(json.dumps({
