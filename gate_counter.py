@@ -143,13 +143,19 @@ CPPLUS_RTSP_TIMEOUT_SEC = int(os.environ.get("CPPLUS_RTSP_TIMEOUT_SEC", "5"))
 
 # The CP Plus outside gate is head-counted by its own dedicated worker thread
 # that reads a continuous stream (not the slow ~15-20s DVR poll cycle) so people
-# who cross quickly are never missed. This throttles the worker's processing
-# rate to bound CPU; ~5 FPS gives several detections even for a fast 1-2s pass.
+# who cross quickly are sampled more reliably. This throttles the worker's
+# processing rate to bound CPU; ~5 FPS gives several frames for a 1-2s pass.
 CPPLUS_TARGET_FPS = float(os.environ.get("CPPLUS_TARGET_FPS", "5"))
 CPPLUS_CONFIDENCE_THRESHOLD = float(
-    os.environ.get("CPPLUS_CONFIDENCE_THRESHOLD", "0.3")
+    os.environ.get("CPPLUS_CONFIDENCE_THRESHOLD", "0.25")
 )
 CPPLUS_LINE_HYSTERESIS = float(os.environ.get("CPPLUS_LINE_HYSTERESIS", "0.04"))
+CPPLUS_TRACK_MAX_GAP_SECONDS = float(
+    os.environ.get("CPPLUS_TRACK_MAX_GAP_SECONDS", "5")
+)
+CPPLUS_LINE_AXIS = os.environ.get("CPPLUS_LINE_AXIS", "vertical").strip().lower()
+if CPPLUS_LINE_AXIS not in {"horizontal", "vertical"}:
+    CPPLUS_LINE_AXIS = "vertical"
 
 # Record the main RTSP stream on the school PC, then recount each completed
 # hour. Onboard SD playback remains a secondary source and live detections are
@@ -183,18 +189,22 @@ CPPLUS_REPLAY_ENABLED = os.environ.get("CPPLUS_REPLAY_ENABLED", "1") not in (
 )
 CPPLUS_REPLAY_DELAY_MINUTES = int(os.environ.get("CPPLUS_REPLAY_DELAY_MINUTES", "2"))
 CPPLUS_REPLAY_RETRY_MINUTES = int(os.environ.get("CPPLUS_REPLAY_RETRY_MINUTES", "10"))
-CPPLUS_REPLAY_SAMPLE_FPS = float(os.environ.get("CPPLUS_REPLAY_SAMPLE_FPS", "8"))
+# Two frames per second retains several observations per walkway crossing while
+# allowing a CPU-only school PC to finish each hour before the next one queues.
+CPPLUS_REPLAY_SAMPLE_FPS = float(os.environ.get("CPPLUS_REPLAY_SAMPLE_FPS", "2"))
 CPPLUS_REPLAY_IMAGE_SIZE = int(os.environ.get("CPPLUS_REPLAY_IMAGE_SIZE", "960"))
 CPPLUS_RECORDING_CHANNEL = int(os.environ.get("CPPLUS_RECORDING_CHANNEL", "1"))
 CPPLUS_RECORDING_PORT = int(os.environ.get("CPPLUS_RECORDING_PORT", "80"))
 CPPLUS_REPLAY_STATE_FILE = Path(__file__).parent / "cpplus_replay_state.json"
 
-# Direction of travel that counts as ENTERING for the CP Plus outside gate.
-# The CentroidTracker labels a virtual-line crossing "IN" when the person moves
-# top-to-bottom in the frame and "OUT" bottom-to-top. If the camera is mounted
-# so that people ENTER the school moving up the frame instead, set
-# CPPLUS_IN_TOP_TO_BOTTOM=0 to swap IN/OUT — no code change needed.
+# Campus side of the CP Plus entry-zone boundary. Tracks may approach the
+# boundary horizontally, vertically, or diagonally; only outside-to-campus
+# transitions are IN. The supplied recording places the campus side on the
+# right of a vertical boundary.
 CPPLUS_IN_TOP_TO_BOTTOM = os.environ.get("CPPLUS_IN_TOP_TO_BOTTOM", "1") not in (
+    "0", "false", "False", "no", "NO",
+)
+CPPLUS_IN_LEFT_TO_RIGHT = os.environ.get("CPPLUS_IN_LEFT_TO_RIGHT", "1") not in (
     "0", "false", "False", "no", "NO",
 )
 
@@ -250,7 +260,7 @@ VEHICLE_CLOUD_API = os.environ.get(
 MAX_DISAPPEARED = 15  # frames before removing a tracked person
 MAX_DISTANCE = 100    # max pixel distance for centroid matching
 
-# Default virtual-line position as a fraction of frame height.
+# Default virtual-line position as a fraction of the selected frame axis.
 LINE_POSITION = float(os.environ.get("GATE_LINE_POSITION", "0.5"))
 
 # Entry/exit camera classification for direction assignment
@@ -538,9 +548,13 @@ def run_cpplus_worker(cam: dict):
     detector = PersonDetector()
     detector.load()
     tracker = CentroidTracker(
-        max_disappeared=MAX_DISAPPEARED,
+        max_disappeared=max(
+            MAX_DISAPPEARED,
+            int(CPPLUS_TARGET_FPS * CPPLUS_TRACK_MAX_GAP_SECONDS),
+        ),
         max_distance=MAX_DISTANCE,
         anchor_y="bottom",
+        line_axis=CPPLUS_LINE_AXIS,
     )
     daily_in = 0
     daily_out = 0
@@ -569,9 +583,13 @@ def run_cpplus_worker(cam: dict):
             daily_in = 0
             daily_out = 0
             tracker = CentroidTracker(
-                max_disappeared=MAX_DISAPPEARED,
+                max_disappeared=max(
+                    MAX_DISAPPEARED,
+                    int(CPPLUS_TARGET_FPS * CPPLUS_TRACK_MAX_GAP_SECONDS),
+                ),
                 max_distance=MAX_DISTANCE,
                 anchor_y="bottom",
+                line_axis=CPPLUS_LINE_AXIS,
             )
 
         loop_start = time.monotonic()
@@ -599,10 +617,10 @@ def run_cpplus_worker(cam: dict):
             continue
 
         frame_h, frame_w = frame.shape[:2]
-        line_y = int(frame_h * (cam.get("line_position") or LINE_POSITION))
-        tracker.set_line_y(
-            line_y,
-            hysteresis=int(frame_h * CPPLUS_LINE_HYSTERESIS),
+        line_dimension = frame_w if CPPLUS_LINE_AXIS == "vertical" else frame_h
+        tracker.set_line(
+            int(line_dimension * (cam.get("line_position") or LINE_POSITION)),
+            hysteresis=int(line_dimension * CPPLUS_LINE_HYSTERESIS),
         )
         tracker.max_distance = max(MAX_DISTANCE, frame_w * MAX_DISTANCE / 640.0)
 
@@ -614,18 +632,19 @@ def run_cpplus_worker(cam: dict):
         except Exception as e:
             logger.error("CP Plus %s: detection error: %s", cam_name, e)
             detections = []
-        # Directional counting: the tracker reports each virtual-line crossing
-        # with a raw direction (top-to-bottom = "IN", bottom-to-top = "OUT").
-        # We map that to the real ENTER/EXIT direction via CPPLUS_IN_TOP_TO_BOTTOM
-        # so people leaving the school are recorded as OUT (and deducted from
-        # the head-count), not miscounted as another entry.
+        # Raw IN means negative-to-positive across the selected line axis.
         crossings = tracker.update(detections)
 
         events: list[dict] = []
         now = datetime.now(IST)
         for cr in crossings:
-            raw_dir = cr["direction"]  # "IN" = top->bottom, "OUT" = bottom->top
-            if CPPLUS_IN_TOP_TO_BOTTOM:
+            raw_dir = cr["direction"]
+            positive_direction_is_in = (
+                CPPLUS_IN_LEFT_TO_RIGHT
+                if CPPLUS_LINE_AXIS == "vertical"
+                else CPPLUS_IN_TOP_TO_BOTTOM
+            )
+            if positive_direction_is_in:
                 person_dir = raw_dir
             else:
                 person_dir = "OUT" if raw_dir == "IN" else "IN"
@@ -958,9 +977,13 @@ def count_cpplus_recordings(
     recording_paths: list[Path], cam: dict, detector: "PersonDetector",
 ) -> tuple[int, int] | None:
     tracker = CentroidTracker(
-        max_disappeared=MAX_DISAPPEARED,
+        max_disappeared=max(
+            MAX_DISAPPEARED,
+            int(CPPLUS_REPLAY_SAMPLE_FPS * CPPLUS_TRACK_MAX_GAP_SECONDS),
+        ),
         max_distance=MAX_DISTANCE,
         anchor_y="bottom",
+        line_axis=CPPLUS_LINE_AXIS,
     )
     in_count = 0
     processed_frames = 0
@@ -985,9 +1008,12 @@ def count_cpplus_recordings(
                     continue
 
                 frame_h, frame_w = frame.shape[:2]
-                tracker.set_line_y(
-                    int(frame_h * (cam.get("line_position") or LINE_POSITION)),
-                    hysteresis=int(frame_h * CPPLUS_LINE_HYSTERESIS),
+                line_dimension = (
+                    frame_w if CPPLUS_LINE_AXIS == "vertical" else frame_h
+                )
+                tracker.set_line(
+                    int(line_dimension * (cam.get("line_position") or LINE_POSITION)),
+                    hysteresis=int(line_dimension * CPPLUS_LINE_HYSTERESIS),
                 )
                 tracker.max_distance = max(
                     MAX_DISTANCE, frame_w * MAX_DISTANCE / 640.0,
@@ -1000,7 +1026,12 @@ def count_cpplus_recordings(
                 processed_frames += 1
                 for crossing in tracker.update(detections):
                     raw_direction = crossing["direction"]
-                    direction = raw_direction if CPPLUS_IN_TOP_TO_BOTTOM else (
+                    positive_direction_is_in = (
+                        CPPLUS_IN_LEFT_TO_RIGHT
+                        if CPPLUS_LINE_AXIS == "vertical"
+                        else CPPLUS_IN_TOP_TO_BOTTOM
+                    )
+                    direction = raw_direction if positive_direction_is_in else (
                         "OUT" if raw_direction == "IN" else "IN"
                     )
                     if direction == "IN":
@@ -1323,14 +1354,11 @@ def snapshot_vehicle_jpeg(frame: np.ndarray, bbox: tuple[int, int, int, int],
 # ---------------------------------------------------------------------------
 
 class CentroidTracker:
-    """Track people across frames using centroid matching.
-
-    Detects when a tracked person crosses a virtual horizontal line,
-    recording the crossing direction (IN = top-to-bottom, OUT = bottom-to-top).
-    """
+    """Track people and detect crossings of a horizontal or vertical line."""
 
     def __init__(self, max_disappeared: int = 15, max_distance: float = 100.0,
-                 line_y: int = 0, anchor_y: str = "centroid"):
+                 line_y: int = 0, anchor_y: str = "centroid",
+                 line_axis: str = "horizontal"):
         self.next_id = 0
         self.objects: OrderedDict[int, np.ndarray] = OrderedDict()  # id -> anchor point
         self.bboxes: dict[int, tuple[int, int, int, int]] = {}  # id -> bbox
@@ -1341,16 +1369,24 @@ class CentroidTracker:
         self.line_y = line_y
         self.line_hysteresis = 0
         self.anchor_y = anchor_y
+        self.line_axis = line_axis
         self.crossings: list[dict] = []  # direction crossings this update
 
-    def set_line_y(self, y: int, hysteresis: int = 0):
-        self.line_y = y
+    def set_line(self, coordinate: int, hysteresis: int = 0):
+        self.line_y = coordinate
         self.line_hysteresis = max(0, hysteresis)
 
-    def _line_side(self, y: int) -> int:
-        if y < self.line_y - self.line_hysteresis:
+    def set_line_y(self, y: int, hysteresis: int = 0):
+        self.line_axis = "horizontal"
+        self.set_line(y, hysteresis)
+
+    def _line_coordinate(self, point: np.ndarray) -> int:
+        return int(point[0] if self.line_axis == "vertical" else point[1])
+
+    def _line_side(self, coordinate: int) -> int:
+        if coordinate < self.line_y - self.line_hysteresis:
             return -1
-        if y > self.line_y + self.line_hysteresis:
+        if coordinate > self.line_y + self.line_hysteresis:
             return 1
         return 0
 
@@ -1358,7 +1394,7 @@ class CentroidTracker:
         self.objects[self.next_id] = centroid
         self.bboxes[self.next_id] = bbox
         self.disappeared[self.next_id] = 0
-        side = self._line_side(int(centroid[1]))
+        side = self._line_side(self._line_coordinate(centroid))
         if side:
             self.stable_sides[self.next_id] = side
         self.next_id += 1
@@ -1428,7 +1464,9 @@ class CentroidTracker:
                 self.disappeared[oid] = 0
 
                 previous_side = self.stable_sides.get(oid)
-                current_side = self._line_side(int(input_centroids[col][1]))
+                current_side = self._line_side(
+                    self._line_coordinate(input_centroids[col])
+                )
                 if current_side and previous_side and current_side != previous_side:
                     self.crossings.append({
                         "id": oid,
@@ -1500,18 +1538,21 @@ class PersonDetector:
         if self.model is None:
             return []
 
-        if image_size is None:
-            results = self.model(frame, verbose=False, classes=[0])
-        else:
-            results = self.model(
-                frame, verbose=False, classes=[0], imgsz=image_size,
-            )
-        detections = []
         threshold = (
             CONFIDENCE_THRESHOLD
             if confidence_threshold is None
             else confidence_threshold
         )
+        if image_size is None:
+            results = self.model(
+                frame, verbose=False, classes=[0], conf=threshold,
+            )
+        else:
+            results = self.model(
+                frame, verbose=False, classes=[0], conf=threshold,
+                imgsz=image_size,
+            )
+        detections = []
 
         for r in results:
             if r.boxes is None:
