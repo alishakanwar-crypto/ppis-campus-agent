@@ -58,6 +58,12 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
         self.assertEqual(client.get.call_args_list[-2].kwargs["params"]["action"], "close")
         self.assertEqual(client.get.call_args_list[-1].kwargs["params"]["action"], "destroy")
 
+    def test_prioritizes_latest_completed_hour(self):
+        hours = gate_counter._completed_replay_hours(datetime(2026, 7, 13, 13, 41))
+
+        self.assertEqual(hours[0], (datetime(2026, 7, 13, 12), datetime(2026, 7, 13, 13)))
+        self.assertEqual(hours[-1], (datetime(2026, 7, 13, 6), datetime(2026, 7, 13, 7)))
+
 
 if __name__ == "__main__":
     unittest.main()
