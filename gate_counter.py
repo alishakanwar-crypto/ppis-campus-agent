@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -907,6 +908,233 @@ def run_cpplus_local_recorder(cam: dict) -> None:
         logger.info("CP Plus local recorder stopped")
 
 
+def _cpplus_rpc_login(
+    client: httpx.Client, base_url: str, user: str, password: str,
+) -> str | None:
+    challenge = client.post(
+        f"{base_url}/RPC2_Login",
+        json={
+            "method": "global.login",
+            "params": {
+                "userName": user,
+                "password": "",
+                "clientType": "Web3.0",
+                "loginType": "Direct",
+            },
+            "id": 1,
+        },
+    )
+    if challenge.status_code != 200:
+        return None
+    try:
+        challenge_data = challenge.json()
+    except ValueError:
+        return None
+    params = challenge_data.get("params") or {}
+    session = challenge_data.get("session")
+    realm = params.get("realm")
+    random = params.get("random")
+    if session is None or not realm or not random:
+        return None
+
+    password_hash = hashlib.md5(
+        f"{user}:{realm}:{password}".encode("utf-8")
+    ).hexdigest().upper()
+    response_hash = hashlib.md5(
+        f"{user}:{random}:{password_hash}".encode("utf-8")
+    ).hexdigest().upper()
+    response = client.post(
+        f"{base_url}/RPC2_Login",
+        json={
+            "method": "global.login",
+            "params": {
+                "userName": user,
+                "password": response_hash,
+                "clientType": "Web3.0",
+                "loginType": "Direct",
+                "authorityType": "Default",
+                "passwordType": "Default",
+                "realm": realm,
+                "random": random,
+            },
+            "id": 2,
+            "session": session,
+        },
+        headers={"Cookie": f"DhWebClientSessionID={session}"},
+    )
+    if response.status_code != 200:
+        return None
+    try:
+        response_data = response.json()
+    except ValueError:
+        return None
+    if response_data.get("result") is not True:
+        return None
+    return str(response_data.get("session", session))
+
+
+def _cpplus_rpc_call(
+    client: httpx.Client,
+    base_url: str,
+    session: str,
+    method: str,
+    params: dict | None = None,
+    object_id: object | None = None,
+) -> object | None:
+    payload: dict[str, object] = {
+        "method": method,
+        "params": params,
+        "id": 3,
+        "session": session,
+    }
+    if object_id is not None:
+        payload["object"] = object_id
+    response = client.post(
+        f"{base_url}/RPC2",
+        json=payload,
+        headers={"Cookie": f"DhWebClientSessionID={session}"},
+    )
+    if response.status_code != 200:
+        return None
+    try:
+        response_data = response.json()
+    except ValueError:
+        return None
+    result = response_data.get("result")
+    if result is False or result is None:
+        return None
+    response_params = response_data.get("params")
+    if response_params:
+        return response_params
+    return result
+
+
+def _find_cpplus_rpc_recording_paths(
+    client: httpx.Client,
+    base_url: str,
+    session: str,
+    channel: int,
+    hour_start: datetime,
+    hour_end: datetime,
+) -> list[str]:
+    finder = _cpplus_rpc_call(
+        client, base_url, session, "mediaFileFind.factory.create",
+    )
+    if isinstance(finder, dict):
+        finder = finder.get("instanceID") or finder.get("object")
+    if finder is None:
+        return []
+
+    try:
+        started = _cpplus_rpc_call(
+            client,
+            base_url,
+            session,
+            "mediaFileFind.findFile",
+            {
+                "condition": {
+                    "Channel": channel,
+                    "Types": ["dav", "mp4"],
+                    "Order": "Ascent",
+                    "Flags": ["Timing", "Event", "Manual", "Marker"],
+                    "StartTime": hour_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    "EndTime": hour_end.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            },
+            finder,
+        )
+        if started is None:
+            return []
+
+        paths: list[str] = []
+        for _ in range(20):
+            batch = _cpplus_rpc_call(
+                client,
+                base_url,
+                session,
+                "mediaFileFind.findNextFile",
+                {"count": 100},
+                finder,
+            )
+            infos = batch.get("infos", []) if isinstance(batch, dict) else []
+            paths.extend(
+                str(info["FilePath"]) for info in infos if info.get("FilePath")
+            )
+            if len(infos) < 100:
+                break
+        return list(dict.fromkeys(paths))
+    finally:
+        _cpplus_rpc_call(
+            client, base_url, session, "mediaFileFind.close", {}, finder,
+        )
+        _cpplus_rpc_call(
+            client, base_url, session, "mediaFileFind.destroy", {}, finder,
+        )
+
+
+def _download_cpplus_rpc_recordings(
+    client: httpx.Client,
+    base_url: str,
+    user: str,
+    password: str,
+    channels: list[int],
+    hour_start: datetime,
+    hour_end: datetime,
+    output_path: Path,
+) -> list[Path] | None:
+    session = _cpplus_rpc_login(client, base_url, user, password)
+    if session is None:
+        return None
+
+    headers = {"Cookie": f"DhWebClientSessionID={session}"}
+    try:
+        for channel in channels:
+            paths = _find_cpplus_rpc_recording_paths(
+                client, base_url, session, channel, hour_start, hour_end,
+            )
+            if not paths:
+                continue
+            downloaded: list[Path] = []
+            for index, camera_path in enumerate(paths):
+                suffix = Path(camera_path).suffix or ".dav"
+                target = output_path.with_name(
+                    f"{output_path.stem}_{index:03d}{suffix}"
+                )
+                encoded_path = quote(camera_path, safe="/[]@()._-")
+                for loadfile_path in ("/RPC_Loadfile", "/RPC2_Loadfile"):
+                    with client.stream(
+                        "GET", f"{base_url}{loadfile_path}{encoded_path}",
+                        headers=headers,
+                    ) as response:
+                        if response.status_code != 200:
+                            continue
+                        size = 0
+                        with target.open("wb") as recording:
+                            for chunk in response.iter_bytes():
+                                recording.write(chunk)
+                                size += len(chunk)
+                        if size > 1024:
+                            downloaded.append(target)
+                            break
+                        target.unlink(missing_ok=True)
+            if downloaded:
+                logger.info(
+                    "CP Plus SD recording downloaded through camera playback "
+                    "session for %s-%s (%d file(s), channel %d)",
+                    hour_start.strftime("%H:%M"),
+                    hour_end.strftime("%H:%M"), len(downloaded), channel,
+                )
+                return downloaded
+        return None
+    finally:
+        try:
+            _cpplus_rpc_call(
+                client, base_url, session, "global.logout", {},
+            )
+        except httpx.HTTPError:
+            pass
+
+
 def _parse_cpplus_recording_paths(response_text: str) -> list[str]:
     items: dict[int, dict[str, str]] = {}
     for line in response_text.splitlines():
@@ -1019,6 +1247,28 @@ def _download_cpplus_recording(
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             for user in users:
+                try:
+                    downloaded = _download_cpplus_rpc_recordings(
+                        client,
+                        base_url,
+                        user,
+                        password,
+                        channels,
+                        hour_start,
+                        hour_end,
+                        output_path,
+                    )
+                except (httpx.HTTPError, OSError) as exc:
+                    logger.warning(
+                        "CP Plus camera playback session failed for %s-%s: %s",
+                        hour_start.strftime("%H:%M"),
+                        hour_end.strftime("%H:%M"), exc,
+                    )
+                    downloaded = None
+                if downloaded:
+                    cam["user"] = user
+                    return downloaded
+
                 for auth in (
                     httpx.DigestAuth(user, password),
                     httpx.BasicAuth(user, password),
@@ -1178,7 +1428,11 @@ def _agent_secret_headers() -> dict[str, str]:
 
 
 def _post_cpplus_recount(
-    hour_start: datetime, hour_end: datetime, in_count: int, processed_frames: int,
+    hour_start: datetime,
+    hour_end: datetime,
+    in_count: int,
+    processed_frames: int,
+    source: str,
 ) -> bool:
     payload = {
         "date": hour_start.strftime("%Y-%m-%d"),
@@ -1186,6 +1440,7 @@ def _post_cpplus_recount(
         "hour_end": hour_end.strftime("%Y-%m-%d %H:%M:%S"),
         "in_count": in_count,
         "processed_frames": processed_frames,
+        "source": source,
     }
     try:
         response = httpx.post(
@@ -1231,8 +1486,11 @@ def run_cpplus_replay_worker(cam: dict) -> None:
             saved = state.get(state_key)
             if saved:
                 if not saved.get("uploaded") and _post_cpplus_recount(
-                    hour_start, hour_end, int(saved["in_count"]),
+                    hour_start,
+                    hour_end,
+                    int(saved["in_count"]),
                     int(saved["processed_frames"]),
+                    str(saved.get("source", "school_pc_recording")),
                 ):
                     saved["uploaded"] = True
                     _save_cpplus_replay_state(state)
@@ -1276,7 +1534,7 @@ def run_cpplus_replay_worker(cam: dict) -> None:
                     continue
                 in_count, processed_frames = result
                 uploaded = _post_cpplus_recount(
-                    hour_start, hour_end, in_count, processed_frames,
+                    hour_start, hour_end, in_count, processed_frames, source,
                 )
                 state[state_key] = {
                     "in_count": in_count,
