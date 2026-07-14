@@ -1,4 +1,5 @@
 import hashlib
+import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,44 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
         )
         self.assertEqual(
             rpc_call.call_args_list[-1].args[3], "mediaFileFind.destroy",
+        )
+
+    def test_resumes_interrupted_rpc_download_with_range(self):
+        first = Mock(
+            status_code=206,
+            headers={"content-range": "bytes 0-1023/2048"},
+        )
+
+        def interrupted_bytes():
+            yield b"a" * 1024
+            raise gate_counter.httpx.RemoteProtocolError("camera closed stream")
+
+        first.iter_bytes.return_value = interrupted_bytes()
+        second = Mock(
+            status_code=206,
+            headers={"content-range": "bytes 1024-2047/2048"},
+        )
+        second.iter_bytes.return_value = iter([b"b" * 1024])
+        first_context = Mock()
+        first_context.__enter__ = Mock(return_value=first)
+        first_context.__exit__ = Mock(return_value=False)
+        second_context = Mock()
+        second_context.__enter__ = Mock(return_value=second)
+        second_context.__exit__ = Mock(return_value=False)
+        client = Mock()
+        client.stream.side_effect = [first_context, second_context]
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "recording.dav"
+            downloaded = gate_counter._download_cpplus_rpc_file(
+                client, "http://camera/RPC_Loadfile/file", {}, target,
+            )
+
+            self.assertTrue(downloaded)
+            self.assertEqual(target.read_bytes(), b"a" * 1024 + b"b" * 1024)
+        self.assertEqual(
+            client.stream.call_args_list[1].kwargs["headers"]["Range"],
+            "bytes=1024-8389631",
         )
 
     @patch("gate_counter._cpplus_rpc_call")
