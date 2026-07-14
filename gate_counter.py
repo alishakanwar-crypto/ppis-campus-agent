@@ -1087,44 +1087,52 @@ def _download_cpplus_rpc_recordings(
         return None
 
     headers = {"Cookie": f"DhWebClientSessionID={session}"}
-    for channel in channels:
-        paths = _find_cpplus_rpc_recording_paths(
-            client, base_url, session, channel, hour_start, hour_end,
-        )
-        if not paths:
-            continue
-        downloaded: list[Path] = []
-        for index, camera_path in enumerate(paths):
-            suffix = Path(camera_path).suffix or ".dav"
-            target = output_path.with_name(
-                f"{output_path.stem}_{index:03d}{suffix}"
+    try:
+        for channel in channels:
+            paths = _find_cpplus_rpc_recording_paths(
+                client, base_url, session, channel, hour_start, hour_end,
             )
-            encoded_path = quote(camera_path, safe="/[]@()._-")
-            for loadfile_path in ("/RPC_Loadfile", "/RPC2_Loadfile"):
-                with client.stream(
-                    "GET", f"{base_url}{loadfile_path}{encoded_path}",
-                    headers=headers,
-                ) as response:
-                    if response.status_code != 200:
-                        continue
-                    size = 0
-                    with target.open("wb") as recording:
-                        for chunk in response.iter_bytes():
-                            recording.write(chunk)
-                            size += len(chunk)
-                    if size > 1024:
-                        downloaded.append(target)
-                        break
-                    target.unlink(missing_ok=True)
-        if downloaded:
-            logger.info(
-                "CP Plus SD recording downloaded through camera playback "
-                "session for %s-%s (%d file(s), channel %d)",
-                hour_start.strftime("%H:%M"),
-                hour_end.strftime("%H:%M"), len(downloaded), channel,
+            if not paths:
+                continue
+            downloaded: list[Path] = []
+            for index, camera_path in enumerate(paths):
+                suffix = Path(camera_path).suffix or ".dav"
+                target = output_path.with_name(
+                    f"{output_path.stem}_{index:03d}{suffix}"
+                )
+                encoded_path = quote(camera_path, safe="/[]@()._-")
+                for loadfile_path in ("/RPC_Loadfile", "/RPC2_Loadfile"):
+                    with client.stream(
+                        "GET", f"{base_url}{loadfile_path}{encoded_path}",
+                        headers=headers,
+                    ) as response:
+                        if response.status_code != 200:
+                            continue
+                        size = 0
+                        with target.open("wb") as recording:
+                            for chunk in response.iter_bytes():
+                                recording.write(chunk)
+                                size += len(chunk)
+                        if size > 1024:
+                            downloaded.append(target)
+                            break
+                        target.unlink(missing_ok=True)
+            if downloaded:
+                logger.info(
+                    "CP Plus SD recording downloaded through camera playback "
+                    "session for %s-%s (%d file(s), channel %d)",
+                    hour_start.strftime("%H:%M"),
+                    hour_end.strftime("%H:%M"), len(downloaded), channel,
+                )
+                return downloaded
+        return None
+    finally:
+        try:
+            _cpplus_rpc_call(
+                client, base_url, session, "global.logout", {},
             )
-            return downloaded
-    return None
+        except httpx.HTTPError:
+            pass
 
 
 def _parse_cpplus_recording_paths(response_text: str) -> list[str]:

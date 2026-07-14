@@ -71,6 +71,24 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
             rpc_call.call_args_list[-1].args[3], "mediaFileFind.destroy",
         )
 
+    @patch("gate_counter._cpplus_rpc_call")
+    @patch("gate_counter._find_cpplus_rpc_recording_paths", return_value=[])
+    @patch("gate_counter._cpplus_rpc_login", return_value="session")
+    def test_logs_out_camera_rpc_session(self, login, find_paths, rpc_call):
+        result = gate_counter._download_cpplus_rpc_recordings(
+            Mock(),
+            "http://camera",
+            "admin",
+            "secret",
+            [0],
+            datetime(2026, 7, 14, 7),
+            datetime(2026, 7, 14, 8),
+            Path("recording.dav"),
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(rpc_call.call_args.args[3], "global.logout")
+
     @patch("gate_counter.httpx.Client")
     @patch("gate_counter._download_cpplus_rpc_recordings")
     def test_prefers_rpc_playback_session_before_legacy_cgi(
