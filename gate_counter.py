@@ -60,6 +60,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -1077,6 +1078,7 @@ def _download_cpplus_rpc_file(
     url: str,
     headers: dict[str, str],
     target: Path,
+    keepalive: Callable[[], object | None] | None = None,
 ) -> bool:
     target.unlink(missing_ok=True)
     expected_total: int | None = None
@@ -1084,6 +1086,8 @@ def _download_cpplus_rpc_file(
     chunk_size = 8 * 1024 * 1024
 
     for _ in range(512):
+        if keepalive is not None:
+            keepalive()
         offset = target.stat().st_size if target.exists() else 0
         request_offset = offset
         request_headers = {
@@ -1135,6 +1139,57 @@ def _download_cpplus_rpc_file(
     return False
 
 
+def _cpplus_recording_path_interval(
+    camera_path: str,
+    recording_date: datetime,
+) -> tuple[datetime, datetime] | None:
+    time_range = Path(camera_path).name.split("[", 1)[0]
+    parts = time_range.split("-", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        start_time = datetime.strptime(parts[0], "%H.%M.%S").time()
+        end_time = datetime.strptime(parts[1], "%H.%M.%S").time()
+    except ValueError:
+        return None
+    start = datetime.combine(
+        recording_date.date(), start_time, tzinfo=recording_date.tzinfo,
+    )
+    end = datetime.combine(
+        recording_date.date(), end_time, tzinfo=recording_date.tzinfo,
+    )
+    if end <= start:
+        end += timedelta(days=1)
+    return start, end
+
+
+def _cpplus_recordings_cover_hour(
+    camera_paths: list[str],
+    hour_start: datetime,
+    hour_end: datetime,
+) -> bool:
+    intervals = [
+        interval
+        for camera_path in camera_paths
+        if (interval := _cpplus_recording_path_interval(
+            camera_path, hour_start,
+        )) is not None
+    ]
+    if len(intervals) != len(camera_paths):
+        return False
+    cursor = hour_start
+    tolerance = timedelta(seconds=CPPLUS_LOCAL_COVERAGE_TOLERANCE_SECONDS)
+    for start, end in sorted(intervals):
+        if end <= cursor:
+            continue
+        if start > cursor + tolerance:
+            return False
+        cursor = max(cursor, end)
+        if cursor >= hour_end - tolerance:
+            return True
+    return False
+
+
 def _download_cpplus_rpc_recordings(
     client: httpx.Client,
     base_url: str,
@@ -1158,6 +1213,7 @@ def _download_cpplus_rpc_recordings(
             if not paths:
                 continue
             downloaded: list[Path] = []
+            downloaded_camera_paths: list[str] = []
             for index, camera_path in enumerate(paths):
                 suffix = Path(camera_path).suffix or ".dav"
                 target = output_path.with_name(
@@ -1170,10 +1226,20 @@ def _download_cpplus_rpc_recordings(
                         f"{base_url}{loadfile_path}{encoded_path}",
                         headers,
                         target,
+                        keepalive=lambda: _cpplus_rpc_call(
+                            client,
+                            base_url,
+                            session,
+                            "global.keepAlive",
+                            {"timeout": 300, "active": True},
+                        ),
                     ):
                         downloaded.append(target)
+                        downloaded_camera_paths.append(camera_path)
                         break
-            if downloaded:
+            if downloaded and _cpplus_recordings_cover_hour(
+                downloaded_camera_paths, hour_start, hour_end,
+            ):
                 logger.info(
                     "CP Plus SD recording downloaded through camera playback "
                     "session for %s-%s (%d file(s), channel %d)",
@@ -1181,6 +1247,15 @@ def _download_cpplus_rpc_recordings(
                     hour_end.strftime("%H:%M"), len(downloaded), channel,
                 )
                 return downloaded
+            for downloaded_path in downloaded:
+                downloaded_path.unlink(missing_ok=True)
+            if downloaded:
+                logger.warning(
+                    "CP Plus camera playback files did not cover the complete "
+                    "hour %s-%s; trying fallback recording",
+                    hour_start.strftime("%H:%M"),
+                    hour_end.strftime("%H:%M"),
+                )
         return None
     finally:
         try:
