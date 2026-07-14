@@ -96,11 +96,16 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
         second_context.__exit__ = Mock(return_value=False)
         client = Mock()
         client.stream.side_effect = [first_context, second_context]
+        keepalive = Mock()
 
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "recording.dav"
             downloaded = gate_counter._download_cpplus_rpc_file(
-                client, "http://camera/RPC_Loadfile/file", {}, target,
+                client,
+                "http://camera/RPC_Loadfile/file",
+                {},
+                target,
+                keepalive=keepalive,
             )
 
             self.assertTrue(downloaded)
@@ -109,6 +114,57 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
             client.stream.call_args_list[1].kwargs["headers"]["Range"],
             "bytes=1024-8389631",
         )
+        self.assertEqual(keepalive.call_count, 2)
+
+    def test_requires_downloaded_segments_to_cover_complete_hour(self):
+        hour_start = datetime(2026, 7, 14, 8)
+        hour_end = datetime(2026, 7, 14, 9)
+        complete_paths = [
+            f"/mnt/sd/08/{start}-{end}[M][0@0][0].dav"
+            for start, end in (
+                ("07.59.59", "08.07.00"),
+                ("08.07.00", "08.15.00"),
+                ("08.15.00", "08.23.00"),
+                ("08.23.00", "08.31.00"),
+                ("08.31.00", "08.39.00"),
+                ("08.39.00", "08.47.00"),
+                ("08.47.00", "08.55.00"),
+                ("08.55.00", "09.03.00"),
+            )
+        ]
+
+        self.assertTrue(gate_counter._cpplus_recordings_cover_hour(
+            complete_paths, hour_start, hour_end,
+        ))
+        self.assertFalse(gate_counter._cpplus_recordings_cover_hour(
+            complete_paths[:2], hour_start, hour_end,
+        ))
+
+    @patch("gate_counter._download_cpplus_rpc_file", return_value=True)
+    @patch("gate_counter._cpplus_rpc_call")
+    @patch("gate_counter._find_cpplus_rpc_recording_paths")
+    @patch("gate_counter._cpplus_rpc_login", return_value="session")
+    def test_rejects_incomplete_camera_hour(
+        self, login, find_paths, rpc_call, download_file,
+    ):
+        find_paths.return_value = [
+            "/mnt/sd/08/07.59.59-08.07.00[M][0@0][0].dav",
+            "/mnt/sd/08/08.07.00-08.15.00[M][0@0][0].dav",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            result = gate_counter._download_cpplus_rpc_recordings(
+                Mock(),
+                "http://camera",
+                "admin",
+                "secret",
+                [0],
+                datetime(2026, 7, 14, 8),
+                datetime(2026, 7, 14, 9),
+                Path(directory) / "recording.dav",
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(download_file.call_count, 2)
 
     @patch("gate_counter._cpplus_rpc_call")
     @patch("gate_counter._find_cpplus_rpc_recording_paths", return_value=[])
