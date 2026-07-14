@@ -1072,6 +1072,69 @@ def _find_cpplus_rpc_recording_paths(
         )
 
 
+def _download_cpplus_rpc_file(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    target: Path,
+) -> bool:
+    target.unlink(missing_ok=True)
+    expected_total: int | None = None
+    stalled_attempts = 0
+    chunk_size = 8 * 1024 * 1024
+
+    for _ in range(512):
+        offset = target.stat().st_size if target.exists() else 0
+        request_offset = offset
+        request_headers = {
+            **headers,
+            "Range": f"bytes={offset}-{offset + chunk_size - 1}",
+        }
+        response_completed = False
+        try:
+            with client.stream("GET", url, headers=request_headers) as response:
+                if response.status_code == 416 and offset > 1024:
+                    return True
+                if response.status_code not in (200, 206):
+                    target.unlink(missing_ok=True)
+                    return False
+
+                append = response.status_code == 206 and offset > 0
+                if not append:
+                    offset = 0
+                content_range = response.headers.get("content-range", "")
+                _, separator, total_text = content_range.rpartition("/")
+                if separator and total_text.isdigit():
+                    expected_total = int(total_text)
+                elif response.status_code == 200:
+                    content_length = response.headers.get("content-length", "")
+                    if content_length.isdigit():
+                        expected_total = int(content_length)
+
+                with target.open("ab" if append else "wb") as recording:
+                    for chunk in response.iter_bytes():
+                        recording.write(chunk)
+                response_completed = True
+        except httpx.HTTPError:
+            pass
+
+        downloaded_size = target.stat().st_size if target.exists() else 0
+        if expected_total is not None and downloaded_size >= expected_total:
+            return downloaded_size > 1024
+        if response_completed and expected_total is None:
+            return downloaded_size > 1024
+        if downloaded_size > request_offset:
+            stalled_attempts = 0
+        else:
+            stalled_attempts += 1
+            if stalled_attempts >= 3:
+                target.unlink(missing_ok=True)
+                return False
+
+    target.unlink(missing_ok=True)
+    return False
+
+
 def _download_cpplus_rpc_recordings(
     client: httpx.Client,
     base_url: str,
@@ -1102,21 +1165,14 @@ def _download_cpplus_rpc_recordings(
                 )
                 encoded_path = quote(camera_path, safe="/[]@()._-")
                 for loadfile_path in ("/RPC_Loadfile", "/RPC2_Loadfile"):
-                    with client.stream(
-                        "GET", f"{base_url}{loadfile_path}{encoded_path}",
-                        headers=headers,
-                    ) as response:
-                        if response.status_code != 200:
-                            continue
-                        size = 0
-                        with target.open("wb") as recording:
-                            for chunk in response.iter_bytes():
-                                recording.write(chunk)
-                                size += len(chunk)
-                        if size > 1024:
-                            downloaded.append(target)
-                            break
-                        target.unlink(missing_ok=True)
+                    if _download_cpplus_rpc_file(
+                        client,
+                        f"{base_url}{loadfile_path}{encoded_path}",
+                        headers,
+                        target,
+                    ):
+                        downloaded.append(target)
+                        break
             if downloaded:
                 logger.info(
                     "CP Plus SD recording downloaded through camera playback "
