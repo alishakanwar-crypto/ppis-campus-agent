@@ -1751,13 +1751,18 @@ def run_cpplus_replay_worker(cam: dict) -> None:
                     0,
                     "camera_native_counter",
                 )
-                state[state_key] = {
-                    "in_count": native_count,
-                    "processed_frames": 0,
-                    "uploaded": uploaded,
-                    "source": "camera_native_counter",
-                }
-                _save_cpplus_replay_state(state)
+                if uploaded:
+                    state[state_key] = {
+                        "in_count": native_count,
+                        "processed_frames": 0,
+                        "uploaded": True,
+                        "source": "camera_native_counter",
+                    }
+                    _save_cpplus_replay_state(state)
+                else:
+                    retry_after[state_key] = (
+                        time.monotonic() + CPPLUS_REPLAY_RETRY_MINUTES * 60
+                    )
                 logger.info(
                     "CP Plus native people count %s-%s: IN=%d uploaded=%s",
                     hour_start.strftime("%H:%M"),
