@@ -1,11 +1,113 @@
+import hashlib
 import unittest
 from datetime import datetime
-from unittest.mock import Mock
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import gate_counter
 
 
 class CPPlusSDPlaybackTests(unittest.TestCase):
+    def test_logs_into_camera_rpc_playback_session(self):
+        challenge = Mock(status_code=200)
+        challenge.json.return_value = {
+            "session": 42,
+            "params": {"realm": "Login to CP Plus", "random": "nonce"},
+        }
+        success = Mock(status_code=200)
+        success.json.return_value = {"result": True, "session": 43}
+        client = Mock()
+        client.post.side_effect = [challenge, success]
+
+        session = gate_counter._cpplus_rpc_login(
+            client, "http://camera", "admin", "secret",
+        )
+
+        first_hash = hashlib.md5(
+            b"admin:Login to CP Plus:secret"
+        ).hexdigest().upper()
+        expected = hashlib.md5(
+            f"admin:nonce:{first_hash}".encode()
+        ).hexdigest().upper()
+        self.assertEqual(session, "43")
+        login_request = client.post.call_args_list[1]
+        self.assertEqual(login_request.kwargs["json"]["params"]["password"], expected)
+        self.assertEqual(
+            login_request.kwargs["headers"]["Cookie"],
+            "DhWebClientSessionID=42",
+        )
+
+    @patch("gate_counter._cpplus_rpc_call")
+    def test_finds_recordings_through_rpc_playback_session(self, rpc_call):
+        rpc_call.side_effect = [
+            {"instanceID": 42},
+            True,
+            {"infos": [
+                {"FilePath": "/mnt/sd/a.dav"},
+                {"FilePath": "/mnt/sd/b.mp4"},
+            ]},
+            True,
+            True,
+        ]
+        client = Mock()
+
+        paths = gate_counter._find_cpplus_rpc_recording_paths(
+            client,
+            "http://camera",
+            "session",
+            0,
+            datetime(2026, 7, 14, 7),
+            datetime(2026, 7, 14, 8),
+        )
+
+        self.assertEqual(paths, ["/mnt/sd/a.dav", "/mnt/sd/b.mp4"])
+        find_params = rpc_call.call_args_list[1].args[4]
+        self.assertEqual(find_params["condition"]["Channel"], 0)
+        self.assertEqual(find_params["condition"]["Types"], ["dav", "mp4"])
+        self.assertEqual(
+            rpc_call.call_args_list[-2].args[3], "mediaFileFind.close",
+        )
+        self.assertEqual(
+            rpc_call.call_args_list[-1].args[3], "mediaFileFind.destroy",
+        )
+
+    @patch("gate_counter.httpx.Client")
+    @patch("gate_counter._download_cpplus_rpc_recordings")
+    def test_prefers_rpc_playback_session_before_legacy_cgi(
+        self, rpc_download, client_class,
+    ):
+        expected = [Path("recording.dav")]
+        rpc_download.return_value = expected
+        client_class.return_value.__enter__.return_value = Mock()
+        cam = {"ip": "camera", "user": "admin", "pass": "secret"}
+
+        result = gate_counter._download_cpplus_recording(
+            cam,
+            datetime(2026, 7, 14, 7),
+            datetime(2026, 7, 14, 8),
+            Path("recording.dav"),
+        )
+
+        self.assertEqual(result, expected)
+        rpc_download.assert_called_once()
+
+    @patch("gate_counter.httpx.post")
+    def test_uploads_recording_source_with_recount(self, post):
+        post.return_value.raise_for_status.return_value = None
+
+        uploaded = gate_counter._post_cpplus_recount(
+            datetime(2026, 7, 14, 7),
+            datetime(2026, 7, 14, 8),
+            12,
+            7200,
+            "camera_sd_recording",
+        )
+
+        self.assertTrue(uploaded)
+        self.assertEqual(
+            post.call_args.kwargs["json"]["source"], "camera_sd_recording",
+        )
+
     def test_parses_dahua_file_find_response(self):
         response = "\r\n".join((
             "found=2",
