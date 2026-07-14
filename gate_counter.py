@@ -196,6 +196,9 @@ CPPLUS_REPLAY_RETRY_MINUTES = int(os.environ.get("CPPLUS_REPLAY_RETRY_MINUTES", 
 # allowing a CPU-only school PC to finish each hour before the next one queues.
 CPPLUS_REPLAY_SAMPLE_FPS = float(os.environ.get("CPPLUS_REPLAY_SAMPLE_FPS", "2"))
 CPPLUS_REPLAY_IMAGE_SIZE = int(os.environ.get("CPPLUS_REPLAY_IMAGE_SIZE", "960"))
+CPPLUS_SD_REPLAY_ENABLED = os.environ.get(
+    "CPPLUS_SD_REPLAY_ENABLED", "0"
+).lower() in ("1", "true", "yes")
 CPPLUS_RECORDING_CHANNEL = int(os.environ.get("CPPLUS_RECORDING_CHANNEL", "1"))
 CPPLUS_RECORDING_PORT = int(os.environ.get("CPPLUS_RECORDING_PORT", "80"))
 CPPLUS_REPLAY_STATE_FILE = Path(__file__).parent / "cpplus_replay_state.json"
@@ -1010,6 +1013,114 @@ def _cpplus_rpc_call(
     return result
 
 
+def _cpplus_native_hourly_count(
+    client: httpx.Client,
+    base_url: str,
+    session: str,
+    hour_start: datetime,
+    hour_end: datetime,
+) -> int | None:
+    server = _cpplus_rpc_call(
+        client,
+        base_url,
+        session,
+        "videoStatServer.factory.instance",
+        {"channel": 0},
+    )
+    if isinstance(server, dict):
+        server = server.get("instanceID") or server.get("object")
+    if server is None:
+        return None
+
+    token: object | None = None
+    try:
+        search = _cpplus_rpc_call(
+            client,
+            base_url,
+            session,
+            "videoStatServer.startFind",
+            {
+                "condition": {
+                    "StartTime": hour_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    "EndTime": hour_end.strftime("%Y-%m-%d %H:%M:%S"),
+                    "Granularity": "Hour",
+                    "RuleType": "NumberStat",
+                    "PtzPresetId": 0,
+                    "AreaID": [1],
+                },
+            },
+            server,
+        )
+        if not isinstance(search, dict):
+            return None
+        token = search.get("token")
+        total_count = search.get("totalCount")
+        if token is None or not isinstance(total_count, int) or total_count <= 0:
+            return None
+
+        results = _cpplus_rpc_call(
+            client,
+            base_url,
+            session,
+            "videoStatServer.doFind",
+            {"token": token, "beginNumber": 0, "count": total_count},
+            server,
+        )
+        infos = results.get("info", []) if isinstance(results, dict) else []
+        if isinstance(infos, dict):
+            infos = [infos]
+        counts = [
+            info.get("EnteredSubtotal")
+            for info in infos
+            if isinstance(info, dict)
+            and info.get("RuleName", "NumberStat") == "NumberStat"
+            and info.get("StartTime") == hour_start.strftime("%Y-%m-%d %H:%M:%S")
+        ]
+        if not counts or any(not isinstance(count, int) for count in counts):
+            return None
+        return sum(counts)
+    finally:
+        if token is not None:
+            _cpplus_rpc_call(
+                client,
+                base_url,
+                session,
+                "videoStatServer.stopFind",
+                {"token": token},
+                server,
+            )
+
+
+def _fetch_cpplus_native_hourly_count(
+    cam: dict,
+    hour_start: datetime,
+    hour_end: datetime,
+) -> int | None:
+    password = _resolve_cpplus_password(cam)
+    if not password:
+        return None
+    base_url = f"http://{cam['ip']}:{CPPLUS_RECORDING_PORT}"
+    timeout = httpx.Timeout(15.0, connect=CPPLUS_CONNECT_TIMEOUT_SEC)
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            session = _cpplus_rpc_login(
+                client, base_url, str(cam.get("user", "admin")), password,
+            )
+            if session is None:
+                return None
+            try:
+                return _cpplus_native_hourly_count(
+                    client, base_url, session, hour_start, hour_end,
+                )
+            finally:
+                _cpplus_rpc_call(
+                    client, base_url, session, "global.logout", {},
+                )
+    except httpx.HTTPError as exc:
+        logger.warning("CP Plus native people-count query failed: %s", exc)
+        return None
+
+
 def _find_cpplus_rpc_recording_paths(
     client: httpx.Client,
     base_url: str,
@@ -1629,6 +1740,33 @@ def run_cpplus_replay_worker(cam: dict) -> None:
             if time.monotonic() < retry_after.get(state_key, 0.0):
                 continue
 
+            native_count = _fetch_cpplus_native_hourly_count(
+                cam, hour_start, hour_end,
+            )
+            if native_count is not None:
+                uploaded = _post_cpplus_recount(
+                    hour_start,
+                    hour_end,
+                    native_count,
+                    0,
+                    "camera_native_counter",
+                )
+                state[state_key] = {
+                    "in_count": native_count,
+                    "processed_frames": 0,
+                    "uploaded": uploaded,
+                    "source": "camera_native_counter",
+                }
+                _save_cpplus_replay_state(state)
+                logger.info(
+                    "CP Plus native people count %s-%s: IN=%d uploaded=%s",
+                    hour_start.strftime("%H:%M"),
+                    hour_end.strftime("%H:%M"),
+                    native_count,
+                    uploaded,
+                )
+                continue
+
             file_handle, file_name = tempfile.mkstemp(
                 prefix="cpplus_replay_", suffix=".dav",
             )
@@ -1638,9 +1776,10 @@ def run_cpplus_replay_worker(cam: dict) -> None:
             downloaded_paths: list[Path] = []
             source = "camera_sd_recording"
             try:
-                downloaded_paths = _download_cpplus_recording(
-                    cam, hour_start, hour_end, recording_path,
-                ) or []
+                if CPPLUS_SD_REPLAY_ENABLED:
+                    downloaded_paths = _download_cpplus_recording(
+                        cam, hour_start, hour_end, recording_path,
+                    ) or []
                 replay_paths = downloaded_paths or local_paths
                 if not replay_paths:
                     retry_after[state_key] = (

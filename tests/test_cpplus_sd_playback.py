@@ -72,6 +72,65 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
             rpc_call.call_args_list[-1].args[3], "mediaFileFind.destroy",
         )
 
+    @patch("gate_counter._cpplus_rpc_call")
+    def test_reads_hourly_count_from_camera_people_counter(self, rpc_call):
+        rpc_call.side_effect = [
+            {"instanceID": 17},
+            {"token": 23, "totalCount": 1},
+            {
+                "info": [
+                    {
+                        "StartTime": "2026-07-14 07:00:00",
+                        "EndTime": "2026-07-14 07:59:59",
+                        "RuleName": "NumberStat",
+                        "EnteredSubtotal": 31,
+                        "ExitedSubtotal": 4,
+                    },
+                ],
+            },
+            True,
+        ]
+
+        count = gate_counter._cpplus_native_hourly_count(
+            Mock(),
+            "http://camera",
+            "session",
+            datetime(2026, 7, 14, 7),
+            datetime(2026, 7, 14, 8),
+        )
+
+        self.assertEqual(count, 31)
+        self.assertEqual(
+            rpc_call.call_args_list[1].args[3],
+            "videoStatServer.startFind",
+        )
+        self.assertEqual(
+            rpc_call.call_args_list[-1].args[3],
+            "videoStatServer.stopFind",
+        )
+
+    @patch("gate_counter._cpplus_rpc_call")
+    def test_rejects_missing_camera_people_count_statistics(self, rpc_call):
+        rpc_call.side_effect = [
+            {"instanceID": 17},
+            {"token": 23, "totalCount": 0},
+            True,
+        ]
+
+        count = gate_counter._cpplus_native_hourly_count(
+            Mock(),
+            "http://camera",
+            "session",
+            datetime(2026, 7, 14, 7),
+            datetime(2026, 7, 14, 8),
+        )
+
+        self.assertIsNone(count)
+        self.assertEqual(
+            rpc_call.call_args_list[-1].args[3],
+            "videoStatServer.stopFind",
+        )
+
     def test_resumes_interrupted_rpc_download_with_range(self):
         first = Mock(
             status_code=206,
