@@ -332,6 +332,42 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
         self.assertEqual(client.get.call_args_list[-2].kwargs["params"]["action"], "close")
         self.assertEqual(client.get.call_args_list[-1].kwargs["params"]["action"], "destroy")
 
+    def test_replays_recording_when_native_recount_upload_is_rejected(self):
+        hour_start = datetime(2026, 7, 14, 7)
+        hour_end = datetime(2026, 7, 14, 8)
+        original_running = gate_counter.running
+        gate_counter.running = True
+
+        def stop_worker(_seconds):
+            gate_counter.running = False
+
+        try:
+            with (
+                patch("gate_counter._load_cpplus_replay_state", return_value={}),
+                patch(
+                    "gate_counter._completed_replay_hours",
+                    return_value=[(hour_start, hour_end)],
+                ),
+                patch("gate_counter._fetch_cpplus_native_hourly_count", return_value=4),
+                patch("gate_counter._post_cpplus_recount", side_effect=[False, True]) as post,
+                patch(
+                    "gate_counter._local_recordings_for_hour",
+                    return_value=[Path("recording.mp4")],
+                ),
+                patch("gate_counter.count_cpplus_recordings", return_value=(31, 7200)) as count,
+                patch("gate_counter.PersonDetector"),
+                patch("gate_counter._save_cpplus_replay_state"),
+                patch("gate_counter.time.sleep", side_effect=stop_worker),
+            ):
+                gate_counter.run_cpplus_replay_worker({"name": "CP Plus"})
+        finally:
+            gate_counter.running = original_running
+
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args_list[0].args[-1], "camera_native_counter")
+        self.assertEqual(post.call_args_list[1].args[-1], "school_pc_recording")
+        count.assert_called_once()
+
     def test_prioritizes_latest_completed_hour(self):
         hours = gate_counter._completed_replay_hours(datetime(2026, 7, 13, 13, 41))
 
