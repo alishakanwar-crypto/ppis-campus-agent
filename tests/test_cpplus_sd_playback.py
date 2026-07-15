@@ -109,6 +109,68 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
             "videoStatServer.stopFind",
         )
 
+    def test_parses_live_camera_people_count_summary(self):
+        response = "\r\n".join((
+            "summary.Channel=0",
+            "summary.EnteredSubtotal.Hour=7",
+            "summary.EnteredSubtotal.Today=31",
+            "summary.ExitedSubtotal.Today=4",
+            "summary.RuleName=NumberStat",
+        ))
+
+        self.assertEqual(
+            gate_counter._parse_cpplus_native_summary(response),
+            (31, 4),
+        )
+
+    def test_live_camera_summary_produces_completed_hour_delta(self):
+        state, completed = gate_counter._cpplus_native_summary_transition(
+            {},
+            datetime(2026, 7, 15, 13, 58, tzinfo=gate_counter.IST),
+            20,
+        )
+        self.assertIsNone(completed)
+        self.assertFalse(state["complete"])
+
+        state, completed = gate_counter._cpplus_native_summary_transition(
+            state,
+            datetime(2026, 7, 15, 14, 0, 2, tzinfo=gate_counter.IST),
+            20,
+        )
+        self.assertIsNone(completed)
+        self.assertTrue(state["complete"])
+
+        state, completed = gate_counter._cpplus_native_summary_transition(
+            state,
+            datetime(2026, 7, 15, 15, 0, 2, tzinfo=gate_counter.IST),
+            27,
+        )
+        self.assertEqual(
+            completed,
+            (
+                datetime(2026, 7, 15, 14, tzinfo=gate_counter.IST),
+                datetime(2026, 7, 15, 15, tzinfo=gate_counter.IST),
+                7,
+            ),
+        )
+
+    def test_live_camera_summary_rejects_late_boundary_sample(self):
+        state = {
+            "date": "2026-07-15",
+            "hour_start": "2026-07-15 14:00:00",
+            "entered_today": 20,
+            "complete": True,
+        }
+
+        state, completed = gate_counter._cpplus_native_summary_transition(
+            state,
+            datetime(2026, 7, 15, 15, 1, tzinfo=gate_counter.IST),
+            27,
+        )
+
+        self.assertIsNone(completed)
+        self.assertFalse(state["complete"])
+
     @patch("gate_counter._cpplus_rpc_call")
     def test_rejects_missing_camera_people_count_statistics(self, rpc_call):
         rpc_call.side_effect = [

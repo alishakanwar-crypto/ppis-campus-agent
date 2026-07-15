@@ -202,6 +202,15 @@ CPPLUS_SD_REPLAY_ENABLED = os.environ.get(
 CPPLUS_RECORDING_CHANNEL = int(os.environ.get("CPPLUS_RECORDING_CHANNEL", "1"))
 CPPLUS_RECORDING_PORT = int(os.environ.get("CPPLUS_RECORDING_PORT", "80"))
 CPPLUS_REPLAY_STATE_FILE = Path(__file__).parent / "cpplus_replay_state.json"
+CPPLUS_NATIVE_SUMMARY_ENABLED = os.environ.get(
+    "CPPLUS_NATIVE_SUMMARY_ENABLED", "1",
+).lower() not in ("0", "false", "no")
+CPPLUS_NATIVE_SUMMARY_POLL_SECONDS = max(
+    1.0, float(os.environ.get("CPPLUS_NATIVE_SUMMARY_POLL_SECONDS", "2")),
+)
+CPPLUS_NATIVE_SUMMARY_STATE_FILE = (
+    Path(__file__).parent / "cpplus_native_summary_state.json"
+)
 
 # Campus side of the CP Plus entry-zone boundary. Tracks may approach the
 # boundary horizontally, vertically, or diagonally; only outside-to-campus
@@ -1119,6 +1128,145 @@ def _fetch_cpplus_native_hourly_count(
     except httpx.HTTPError as exc:
         logger.warning("CP Plus native people-count query failed: %s", exc)
         return None
+
+
+def _parse_cpplus_native_summary(response_text: str) -> tuple[int, int] | None:
+    values = {}
+    for line in response_text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key.strip()] = value.strip()
+    if values.get("summary.RuleName") != "NumberStat":
+        return None
+    try:
+        return (
+            int(values["summary.EnteredSubtotal.Today"]),
+            int(values["summary.ExitedSubtotal.Today"]),
+        )
+    except (KeyError, ValueError):
+        return None
+
+
+def _fetch_cpplus_native_summary(cam: dict) -> tuple[int, int] | None:
+    password = _resolve_cpplus_password(cam)
+    if not password:
+        return None
+    base_url = f"http://{cam['ip']}:{CPPLUS_RECORDING_PORT}"
+    users = list(dict.fromkeys((str(cam.get("user", "admin")), *CPPLUS_USER_ALTERNATES)))
+    timeout = httpx.Timeout(CPPLUS_HTTP_TIMEOUT_SEC, connect=CPPLUS_CONNECT_TIMEOUT_SEC)
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            for user in users:
+                for auth in (
+                    httpx.DigestAuth(user, password),
+                    httpx.BasicAuth(user, password),
+                ):
+                    response = client.get(
+                        f"{base_url}/cgi-bin/videoStatServer.cgi",
+                        params={"action": "getSummary", "channel": "0"},
+                        auth=auth,
+                    )
+                    if response.status_code != 200:
+                        continue
+                    summary = _parse_cpplus_native_summary(response.text)
+                    if summary is not None:
+                        cam["user"] = user
+                        return summary
+    except httpx.HTTPError as exc:
+        logger.warning("CP Plus native summary query failed: %s", exc)
+    return None
+
+
+def _load_cpplus_native_summary_state() -> dict:
+    try:
+        state = json.loads(
+            CPPLUS_NATIVE_SUMMARY_STATE_FILE.read_text(encoding="utf-8")
+        )
+        return state if isinstance(state, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_cpplus_native_summary_state(state: dict) -> None:
+    temp_path = CPPLUS_NATIVE_SUMMARY_STATE_FILE.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+    temp_path.replace(CPPLUS_NATIVE_SUMMARY_STATE_FILE)
+
+
+def _cpplus_native_summary_transition(
+    state: dict, now: datetime, entered_today: int,
+) -> tuple[dict, tuple[datetime, datetime, int] | None]:
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    current_key = current_hour.strftime("%Y-%m-%d %H:%M:%S")
+    date = now.strftime("%Y-%m-%d")
+    within_boundary = now.minute == 0 and now.second <= 10
+
+    if state.get("date") == date and state.get("hour_start") == current_key:
+        return state, None
+
+    completed = None
+    previous_key = state.get("hour_start")
+    if state.get("date") == date and isinstance(previous_key, str):
+        try:
+            previous_hour = datetime.strptime(
+                previous_key, "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=IST)
+            baseline = int(state["entered_today"])
+        except (KeyError, TypeError, ValueError):
+            previous_hour = None
+            baseline = 0
+        if (
+            previous_hour is not None
+            and state.get("complete") is True
+            and current_hour - previous_hour == timedelta(hours=1)
+            and within_boundary
+            and entered_today >= baseline
+        ):
+            completed = (
+                previous_hour,
+                current_hour,
+                entered_today - baseline,
+            )
+
+    next_state = {
+        "date": date,
+        "hour_start": current_key,
+        "entered_today": entered_today,
+        "complete": within_boundary,
+    }
+    return next_state, completed
+
+
+def run_cpplus_native_summary_worker(cam: dict) -> None:
+    state = _load_cpplus_native_summary_state()
+    logger.info("CP Plus live native-summary worker started")
+    while running:
+        now = datetime.now(IST)
+        summary = _fetch_cpplus_native_summary(cam)
+        if summary is not None:
+            next_state, completed = _cpplus_native_summary_transition(
+                state, now, summary[0],
+            )
+            if next_state != state:
+                state = next_state
+                _save_cpplus_native_summary_state(state)
+            if completed is not None:
+                hour_start, hour_end, in_count = completed
+                uploaded = _post_cpplus_recount(
+                    hour_start,
+                    hour_end,
+                    in_count,
+                    0,
+                    "camera_native_counter",
+                )
+                logger.info(
+                    "CP Plus live native count %s-%s: IN=%d uploaded=%s",
+                    hour_start.strftime("%H:%M"),
+                    hour_end.strftime("%H:%M"),
+                    in_count,
+                    uploaded,
+                )
+        time.sleep(CPPLUS_NATIVE_SUMMARY_POLL_SECONDS)
 
 
 def _find_cpplus_rpc_recording_paths(
@@ -2381,6 +2529,13 @@ def run_gate_counter():
             )
             recorder_thread.start()
             cpplus_threads.append(recorder_thread)
+        if CPPLUS_NATIVE_SUMMARY_ENABLED:
+            native_thread = threading.Thread(
+                target=run_cpplus_native_summary_worker, args=(cam,), daemon=True,
+                name=f"cpplus-native-{cam['name']}",
+            )
+            native_thread.start()
+            cpplus_threads.append(native_thread)
         if CPPLUS_REPLAY_ENABLED:
             replay_thread = threading.Thread(
                 target=run_cpplus_replay_worker, args=(cam,), daemon=True,
