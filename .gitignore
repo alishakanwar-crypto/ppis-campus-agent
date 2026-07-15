@@ -7,8 +7,9 @@ attendance_snapshots/
 agent.lock
 .agent_lock
 
-# Per-machine local config and completed recording-recount state.
+# Per-machine local config and persistent counter state.
 # Not tracked so restart scripts (git reset --hard) never overwrite them.
 config.json
 cpplus_replay_state.json
+cpplus_native_summary_state.json
 cpplus_recordings/
