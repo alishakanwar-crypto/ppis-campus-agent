@@ -1751,6 +1751,13 @@ def run_cpplus_replay_worker(cam: dict) -> None:
                     0,
                     "camera_native_counter",
                 )
+                logger.info(
+                    "CP Plus native people count %s-%s: IN=%d uploaded=%s",
+                    hour_start.strftime("%H:%M"),
+                    hour_end.strftime("%H:%M"),
+                    native_count,
+                    uploaded,
+                )
                 if uploaded:
                     state[state_key] = {
                         "in_count": native_count,
@@ -1759,18 +1766,12 @@ def run_cpplus_replay_worker(cam: dict) -> None:
                         "source": "camera_native_counter",
                     }
                     _save_cpplus_replay_state(state)
-                else:
-                    retry_after[state_key] = (
-                        time.monotonic() + CPPLUS_REPLAY_RETRY_MINUTES * 60
-                    )
-                logger.info(
-                    "CP Plus native people count %s-%s: IN=%d uploaded=%s",
+                    continue
+                logger.warning(
+                    "CP Plus native count was rejected; trying recording recount for %s-%s",
                     hour_start.strftime("%H:%M"),
                     hour_end.strftime("%H:%M"),
-                    native_count,
-                    uploaded,
                 )
-                continue
 
             file_handle, file_name = tempfile.mkstemp(
                 prefix="cpplus_replay_", suffix=".dav",
