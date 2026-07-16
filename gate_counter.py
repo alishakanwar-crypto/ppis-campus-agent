@@ -16,6 +16,7 @@ Usage:
 Cameras:
     ENTRY GATE-1: DVR 3 (192.168.0.14) Channel 20
     ENTRY GATE-2: DVR 3 (192.168.0.14) Channel 16
+    GALLERY MID: DVR 1 (192.168.0.11) Channel 17
     Reception C1: DVR 2 (192.168.0.12) Channel 54
     Reception C2: DVR 2 (192.168.0.12) Channel 55
     Reception C3: DVR 2 (192.168.0.12) Channel 53
@@ -82,6 +83,7 @@ DVR_CREDS: dict[str, dict[str, str]] = {}
 GATE_CAMERAS = [
     {"channel": 20, "name": "ENTRY GATE-1",    "dvr_ip": "192.168.0.14"},
     {"channel": 16, "name": "ENTRY GATE-2",    "dvr_ip": "192.168.0.14"},
+    {"channel": 17, "name": "GALLERY MID",     "dvr_ip": "192.168.0.11"},
     {"channel": 54, "name": "Reception C1",    "dvr_ip": "192.168.0.12"},
     {"channel": 55, "name": "Reception C2",    "dvr_ip": "192.168.0.12"},
     {"channel": 53, "name": "Reception C3",    "dvr_ip": "192.168.0.12"},
