@@ -12,4 +12,5 @@ agent.lock
 config.json
 cpplus_replay_state.json
 cpplus_native_summary_state.json
+cpplus_native_summary_pending.json
 cpplus_recordings/

@@ -120,7 +120,7 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
 
         self.assertEqual(
             gate_counter._parse_cpplus_native_summary(response),
-            (31, 4),
+            (31, 4, 7),
         )
 
     def test_live_camera_summary_produces_completed_hour_delta(self):
@@ -170,6 +170,103 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
 
         self.assertIsNone(completed)
         self.assertFalse(state["complete"])
+
+    def test_missed_boundary_poll_still_completes_hour(self):
+        # First sample lands cleanly at the top of the hour: baseline is valid.
+        state, completed = gate_counter._cpplus_native_summary_transition(
+            {},
+            datetime(2026, 7, 15, 14, 0, 5, tzinfo=gate_counter.IST),
+            20,
+            0,
+        )
+        self.assertIsNone(completed)
+        self.assertTrue(state["complete"])
+
+        # Intra-hour poll records the running end value for the hour.
+        state, completed = gate_counter._cpplus_native_summary_transition(
+            state,
+            datetime(2026, 7, 15, 14, 42, tzinfo=gate_counter.IST),
+            25,
+            5,
+        )
+        self.assertIsNone(completed)
+        self.assertEqual(state["entered_end"], 25)
+
+        # The 15:00:00-10 boundary poll is missed; the first sample of the new
+        # hour arrives late, yet the camera's current-hour subtotal reconstructs
+        # the exact 14:00-15:00 boundary and keeps the new baseline valid.
+        state, completed = gate_counter._cpplus_native_summary_transition(
+            state,
+            datetime(2026, 7, 15, 15, 0, 40, tzinfo=gate_counter.IST),
+            27,
+            2,
+        )
+        self.assertEqual(
+            completed,
+            (
+                datetime(2026, 7, 15, 14, tzinfo=gate_counter.IST),
+                datetime(2026, 7, 15, 15, tzinfo=gate_counter.IST),
+                5,
+            ),
+        )
+        self.assertTrue(state["complete"])
+        self.assertEqual(state["entered_today"], 25)
+
+        state, completed = gate_counter._cpplus_native_summary_transition(
+            state,
+            datetime(2026, 7, 15, 16, 1, tzinfo=gate_counter.IST),
+            33,
+            0,
+        )
+        self.assertEqual(
+            completed,
+            (
+                datetime(2026, 7, 15, 15, tzinfo=gate_counter.IST),
+                datetime(2026, 7, 15, 16, tzinfo=gate_counter.IST),
+                8,
+            ),
+        )
+
+    def test_pending_queue_dedupes_and_retries_failed_upload(self):
+        hour_start = datetime(2026, 7, 15, 14, tzinfo=gate_counter.IST)
+        hour_end = datetime(2026, 7, 15, 15, tzinfo=gate_counter.IST)
+
+        pending = gate_counter._queue_cpplus_native_pending(
+            [], hour_start, hour_end, 5,
+        )
+        # Re-queuing the same hour must not create a duplicate entry.
+        pending = gate_counter._queue_cpplus_native_pending(
+            pending, hour_start, hour_end, 6,
+        )
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["in_count"], 6)
+
+        with patch("gate_counter._post_cpplus_recount", return_value=False):
+            remaining = gate_counter._flush_cpplus_native_pending(pending)
+        self.assertEqual(remaining, pending)
+
+        with patch(
+            "gate_counter._post_cpplus_recount", return_value=True,
+        ) as post:
+            remaining = gate_counter._flush_cpplus_native_pending(pending)
+        self.assertEqual(remaining, [])
+        self.assertEqual(post.call_args.args[4], "camera_native_counter")
+
+    def test_pending_queue_round_trips_through_state_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pending.json"
+            with patch.object(
+                gate_counter, "CPPLUS_NATIVE_SUMMARY_PENDING_FILE", path,
+            ):
+                entry = [{
+                    "hour_start": "2026-07-15 14:00:00",
+                    "hour_end": "2026-07-15 15:00:00",
+                    "in_count": 5,
+                }]
+                gate_counter._save_cpplus_native_summary_pending(entry)
+                self.assertEqual(
+                    gate_counter._load_cpplus_native_summary_pending(), entry,
+                )
 
     @patch("gate_counter._cpplus_rpc_call")
     def test_rejects_missing_camera_people_count_statistics(self, rpc_call):
