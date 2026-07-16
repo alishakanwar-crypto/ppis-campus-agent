@@ -15,11 +15,15 @@ from __future__ import annotations
 import asyncio
 import gc
 import io
+import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
+import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
@@ -115,6 +119,25 @@ OPEN_HOUSE_STUDENT_START_HOUR = 8
 OPEN_HOUSE_STUDENT_START_MIN = 15
 OPEN_HOUSE_STUDENT_END_HOUR = 12
 OPEN_HOUSE_STUDENT_END_MIN = 0
+
+HIKVISION_RECORDING_REPLAY_ENABLED = os.environ.get(
+    "HIKVISION_RECORDING_REPLAY_ENABLED", "1",
+).lower() not in {"0", "false", "no"}
+HIKVISION_REPLAY_SAMPLE_SECONDS = max(
+    1.0, float(os.environ.get("HIKVISION_REPLAY_SAMPLE_SECONDS", "10")),
+)
+HIKVISION_REPLAY_COVERAGE_TOLERANCE_SECONDS = max(
+    0, int(os.environ.get("HIKVISION_REPLAY_COVERAGE_TOLERANCE_SECONDS", "60")),
+)
+HIKVISION_REPLAY_MAX_DOWNLOAD_MB = max(
+    100, int(os.environ.get("HIKVISION_REPLAY_MAX_DOWNLOAD_MB", "4096")),
+)
+HIKVISION_REPLAY_MIN_FREE_GB = max(
+    1, int(os.environ.get("HIKVISION_REPLAY_MIN_FREE_GB", "5")),
+)
+HIKVISION_REPLAY_CACHE_DIR = Path(__file__).parent / "hikvision_replay_cache"
+HIKVISION_REPLAY_STATE_PATH = Path(__file__).parent / "hikvision_replay_state.json"
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def _is_open_house_today() -> bool:
@@ -517,6 +540,30 @@ class AttendanceEngine:
         self.whatsapp_phone = ""
         self._task: asyncio.Task | None = None
         self._classwise_task: asyncio.Task | None = None
+        self._recording_replay_task: asyncio.Task | None = None
+        self._recording_replay_attempt_date = ""
+        self._recording_replay_status: dict = {
+            "state": "not_started",
+            "date": "",
+            "coverage_complete": False,
+            "cameras_total": 0,
+            "cameras_complete": 0,
+            "processed_frames": 0,
+            "attendance_backfilled": 0,
+            "error": "",
+        }
+        saved_replay_status = self._load_recording_replay_status()
+        if saved_replay_status:
+            self._recording_replay_status.update(saved_replay_status)
+            self._recording_replay_attempt_date = str(
+                saved_replay_status.get("date", ""))
+            if self._recording_replay_status["state"] in {"scheduled", "running"}:
+                self._recording_replay_status.update({
+                    "state": "failed",
+                    "coverage_complete": False,
+                    "error": "Replay was interrupted; absence was not finalized",
+                })
+                self._persist_recording_replay_status()
         self._background_tasks: set[asyncio.Task] = set()
         # Persistent HTTP clients per DVR IP for connection pooling
         self._dvr_clients: dict[str, httpx.AsyncClient] = {}
@@ -853,7 +900,8 @@ class AttendanceEngine:
     def recognize_faces_in_image(self, image_bytes: bytes,
                                  camera_source: str = "",
                                  faces_subset: dict | None = None,
-                                 insightface_subset: dict | None = None) -> list[dict]:
+                                 insightface_subset: dict | None = None,
+                                 observed_at: float | None = None) -> list[dict]:
         """Detect and recognize faces in a single image.
 
         Args:
@@ -872,21 +920,23 @@ class AttendanceEngine:
         if self.use_insightface and self._insightface_app:
             results = self._recognize_insightface(
                 enhanced_bytes, camera_source, faces_subset,
-                insightface_subset)
+                insightface_subset, observed_at)
             # Fallback: only if InsightFace detected ZERO faces (returns None),
             # try legacy HOG detector which catches distant faces better.
             # If InsightFace detected faces but couldn't match (returns []),
             # don't fall back — InsightFace already handled it.
             if results is None and face_recognition is not None:
                 return self._recognize_legacy(
-                    enhanced_bytes, camera_source, faces_subset)
+                    enhanced_bytes, camera_source, faces_subset, observed_at)
             return results or []
 
-        return self._recognize_legacy(enhanced_bytes, camera_source, faces_subset)
+        return self._recognize_legacy(
+            enhanced_bytes, camera_source, faces_subset, observed_at)
 
     def _recognize_legacy(self, image_bytes: bytes,
                           camera_source: str = "",
-                          faces_subset: dict | None = None) -> list[dict]:
+                          faces_subset: dict | None = None,
+                          observed_at: float | None = None) -> list[dict]:
         """Detect and recognize faces using the legacy face_recognition library."""
         if face_recognition is None:
             self.add_debug_log("error", "face_recognition library not available")
@@ -1018,10 +1068,11 @@ class AttendanceEngine:
                         camera_source=camera_source,
                         embedding=encoding,
                         face_size=(face_w, face_h),
+                        observed_at=observed_at,
                     )
                     if result:
                         results.append(result)
-                elif confidence >= self.review_threshold:
+                elif confidence >= self.review_threshold and observed_at is None:
                     self.add_debug_log("manual_review",
                                        f"Confidence {confidence:.1%} in review band "
                                        f"({self.review_threshold:.0%}-{effective_min:.0%})",
@@ -1040,7 +1091,7 @@ class AttendanceEngine:
                                        person_id=person_id,
                                        confidence=confidence)
             else:
-                if not self.test_mode:
+                if not self.test_mode and observed_at is None:
                     self.add_debug_log("face_unknown",
                                        f"Unregistered face in {camera_source}",
                                        confidence=0.0)
@@ -1140,7 +1191,8 @@ class AttendanceEngine:
     def _recognize_insightface(self, image_bytes: bytes,
                                 camera_source: str = "",
                                 legacy_subset: dict | None = None,
-                                insightface_subset: dict | None = None) -> list[dict]:
+                                insightface_subset: dict | None = None,
+                                observed_at: float | None = None) -> list[dict]:
         """Detect and recognize faces using InsightFace (ArcFace).
 
         Uses RetinaFace for detection and ArcFace for recognition.
@@ -1244,6 +1296,7 @@ class AttendanceEngine:
                         camera_source=camera_source,
                         embedding=embedding,
                         face_size=(int(face_w), int(face_h)),
+                        observed_at=observed_at,
                     )
                     if result:
                         results.append(result)
@@ -1254,7 +1307,7 @@ class AttendanceEngine:
                                        person_id=person_id,
                                        confidence=confidence)
             else:
-                if not self.test_mode:
+                if not self.test_mode and observed_at is None:
                     self.add_debug_log("face_unknown",
                                        f"Unregistered face in {camera_source} [InsightFace]",
                                        confidence=0.0)
@@ -1344,7 +1397,8 @@ class AttendanceEngine:
         """
         return dt.weekday() == 6  # 6=Sunday
 
-    def _is_within_attendance_window(self, person_id: str = "") -> bool:
+    def _is_within_attendance_window(self, person_id: str = "",
+                                     observed_datetime: datetime | None = None) -> bool:
         """Check if the current IST time is within the attendance window.
 
         Uses a shorter window (7:00-8:00) for teachers vs students (7:00-9:30).
@@ -1352,7 +1406,7 @@ class AttendanceEngine:
         """
         from datetime import timezone, timedelta as _td
         _ist = timezone(_td(hours=5, minutes=30))
-        now = datetime.now(_ist)
+        now = observed_datetime or datetime.now(_ist)
 
         # Block attendance on Sundays (school open on Saturdays)
         if self._is_off_day(now):
@@ -1432,28 +1486,41 @@ class AttendanceEngine:
                          embedding: np.ndarray | None = None,
                          face_size: tuple[int, int] | None = None,
                          face_position: tuple[int, int] | None = None,
-                         face_crop_bytes: bytes | None = None) -> int:
-        """Record a face sighting and return how many recent sightings exist."""
-        now = time.time()
-        if person_id not in self._sightings:
-            self._sightings[person_id] = []
-        self._sightings[person_id].append({
-            "time": now,
-            "camera": camera_source,
+                         face_crop_bytes: bytes | None = None,
+                         observed_at: float | None = None) -> int:
+        """Record a face sighting and return how many nearby sightings exist."""
+        event_time = observed_at if observed_at is not None else time.time()
+        normalized_camera = camera_source.replace(" [recording]", "")
+        sightings = self._sightings.setdefault(person_id, [])
+
+        for sighting in sightings:
+            same_camera = sighting["camera"] == normalized_camera
+            if same_camera and abs(sighting["time"] - event_time) <= 2:
+                return len([
+                    s for s in sightings
+                    if abs(s["time"] - event_time) <= self.sighting_window
+                ])
+
+        sightings.append({
+            "time": event_time,
+            "camera": normalized_camera,
             "confidence": confidence,
             "embedding": embedding,
             "face_size": face_size,
             "face_position": face_position,
             "face_crop_bytes": face_crop_bytes,
         })
-        # Prune old sightings outside the window
-        cutoff = now - self.sighting_window
-        self._sightings[person_id] = [
-            s for s in self._sightings[person_id] if s["time"] >= cutoff
+        sightings.sort(key=lambda s: s["time"])
+        nearby = [
+            s for s in sightings
+            if abs(s["time"] - event_time) <= self.sighting_window
         ]
-        return len(self._sightings[person_id])
+        if observed_at is None:
+            sightings[:] = nearby
+        return len(nearby)
 
-    def _check_anti_spoof(self, person_id: str, name: str) -> bool:
+    def _check_anti_spoof(self, person_id: str, name: str,
+                          observed_at: float | None = None) -> bool:
         """Advanced liveness detection: verify the face is a live person.
 
         Returns True if the sightings appear to be from a REAL live person,
@@ -1472,7 +1539,11 @@ class AttendanceEngine:
         - Logged as a security event
         - Snapshot saved for review
         """
-        sightings = self._sightings.get(person_id, [])
+        event_time = observed_at if observed_at is not None else time.time()
+        sightings = [
+            sighting for sighting in self._sightings.get(person_id, [])
+            if abs(sighting["time"] - event_time) <= self.sighting_window
+        ]
         if len(sightings) < 2:
             return True  # Not enough data to check, allow
 
@@ -1684,7 +1755,8 @@ class AttendanceEngine:
                             face_location: tuple,
                             camera_source: str,
                             embedding: np.ndarray | None = None,
-                            face_size: tuple[int, int] | None = None) -> dict | None:
+                            face_size: tuple[int, int] | None = None,
+                            observed_at: float | None = None) -> dict | None:
         """Process an attendance detection with multi-layer verification.
 
         All checks must pass before marking attendance:
@@ -1696,6 +1768,10 @@ class AttendanceEngine:
         CHECK 6: Anti-spoofing / liveness checks
         """
         now = time.time()
+        event_datetime = (
+            datetime.fromtimestamp(observed_at, IST)
+            if observed_at is not None else datetime.now(IST)
+        )
         is_teacher = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
 
         # --- Teacher attendance handled by TrueFace 3000 device ---
@@ -1724,7 +1800,7 @@ class AttendanceEngine:
             return None
 
         # --- CHECK 3: Time window ---
-        if not self._is_within_attendance_window(person_id):
+        if not self._is_within_attendance_window(person_id, event_datetime):
             return None
 
         # --- Daily dedup: one entry per student per day ---
@@ -1768,6 +1844,7 @@ class AttendanceEngine:
             embedding=embedding, face_size=face_size,
             face_position=face_position,
             face_crop_bytes=face_crop_bytes,
+            observed_at=observed_at,
         )
         if sighting_count < required_sightings:
             self.add_debug_log("awaiting_confirmation",
@@ -1784,17 +1861,24 @@ class AttendanceEngine:
         self.entry_validated[person_id] = date.today().isoformat()
 
         # --- CHECK 6: Anti-spoofing ---
-        if not self._check_anti_spoof(person_id, name):
+        if not self._check_anti_spoof(person_id, name, observed_at):
             self.add_debug_log("spoof_rejected",
                                f"{name} blocked by anti-spoof check — "
                                f"resetting sightings",
                                person_id=person_id,
                                confidence=confidence)
-            self._sightings.pop(person_id, None)
+            self._sightings[person_id] = [
+                sighting for sighting in self._sightings.get(person_id, [])
+                if abs(sighting["time"] - (observed_at or now)) > self.sighting_window
+            ]
             return None
 
         # --- Compute average confidence from all sightings ---
-        sightings = self._sightings.get(person_id, [])
+        event_time = observed_at if observed_at is not None else now
+        sightings = [
+            sighting for sighting in self._sightings.get(person_id, [])
+            if abs(sighting["time"] - event_time) <= self.sighting_window
+        ]
         avg_confidence = confidence
         if sightings:
             confs = [s["confidence"] for s in sightings if s.get("confidence")]
@@ -1819,7 +1903,7 @@ class AttendanceEngine:
             return None
 
         # Save snapshot of the detected face
-        ts = int(now)
+        ts = int(observed_at if observed_at is not None else now)
         snapshot_filename = f"attendance_{person_id}_{ts}.jpg"
         snapshot_path = ATTENDANCE_SNAPSHOTS_DIR / snapshot_filename
         with open(snapshot_path, "wb") as f:
@@ -1833,13 +1917,12 @@ class AttendanceEngine:
             confidence=confidence,
             snapshot_path=str(snapshot_path),
             camera_source=camera_source,
+            logged_at=event_datetime.isoformat() if observed_at is not None else None,
         )
 
         self.last_attendance[person_id] = now
         self._mark_daily(person_id)
-        from datetime import timezone, timedelta as _td
-        _ist = timezone(_td(hours=5, minutes=30))
-        time_str = datetime.now(_ist).strftime("%I:%M %p")
+        time_str = event_datetime.strftime("%I:%M %p")
 
         self.add_debug_log("attendance_marked",
                            f"{name} marked Present at {time_str} "
@@ -1856,6 +1939,7 @@ class AttendanceEngine:
             "time": time_str,
             "snapshot": snapshot_filename,
             "camera_source": camera_source,
+            "logged_at": event_datetime.isoformat(),
         }
 
         # Schedule async tasks from thread pool using stored event loop
@@ -2191,7 +2275,7 @@ class AttendanceEngine:
                 "confidence": record.get("confidence", 0),
                 "notification_sent": bool(parent_phones),
                 "parent_phones": parent_phones,
-                "logged_at": datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat(),
+                "logged_at": record.get("logged_at") or datetime.now(IST).isoformat(),
             }]
         }
         try:
@@ -2622,6 +2706,412 @@ class AttendanceEngine:
 
         return cameras
 
+    @staticmethod
+    def _load_recording_replay_status() -> dict:
+        try:
+            data = json.loads(HIKVISION_REPLAY_STATE_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _persist_recording_replay_status(self) -> None:
+        try:
+            temporary_path = HIKVISION_REPLAY_STATE_PATH.with_suffix(".tmp")
+            temporary_path.write_text(
+                json.dumps(self._recording_replay_status, sort_keys=True),
+                encoding="utf-8",
+            )
+            temporary_path.replace(HIKVISION_REPLAY_STATE_PATH)
+        except OSError as error:
+            logger.warning(f"Could not persist Hikvision replay status: {error}")
+
+    @staticmethod
+    def _parse_hikvision_time(value: str) -> datetime | None:
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(IST)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _recording_coverage_complete(segments: list[dict], start: datetime,
+                                     end: datetime) -> bool:
+        intervals = sorted(
+            (max(segment["start"], start), min(segment["end"], end))
+            for segment in segments
+            if segment["end"] > start and segment["start"] < end
+        )
+        if not intervals:
+            return False
+        tolerance = timedelta(seconds=HIKVISION_REPLAY_COVERAGE_TOLERANCE_SECONDS)
+        covered_until = intervals[0][1]
+        if intervals[0][0] - start > tolerance:
+            return False
+        for interval_start, interval_end in intervals[1:]:
+            if interval_start - covered_until > tolerance:
+                return False
+            covered_until = max(covered_until, interval_end)
+        return end - covered_until <= tolerance
+
+    @classmethod
+    def _parse_hikvision_search_response(
+        cls, content: bytes,
+    ) -> tuple[str, list[dict]]:
+        root = ET.fromstring(content)
+        segments: list[dict] = []
+        response_state = ""
+        for element in root.iter():
+            local_name = element.tag.rsplit("}", 1)[-1]
+            if local_name == "responseStatusStrg" and element.text:
+                response_state = element.text.strip().upper()
+            if local_name != "searchMatchItem":
+                continue
+            values: dict[str, str] = {}
+            for child in element.iter():
+                child_name = child.tag.rsplit("}", 1)[-1]
+                if child.text:
+                    values[child_name] = child.text.strip()
+            segment_start = cls._parse_hikvision_time(
+                values.get("startTime", ""))
+            segment_end = cls._parse_hikvision_time(
+                values.get("endTime", ""))
+            playback_uri = values.get("playbackURI", "")
+            if segment_start and segment_end and playback_uri:
+                segments.append({
+                    "start": segment_start,
+                    "end": segment_end,
+                    "playback_uri": playback_uri,
+                })
+        return response_state, segments
+
+    async def _search_hikvision_recordings(self, camera: dict,
+                                            start: datetime,
+                                            end: datetime) -> list[dict]:
+        dvr = camera["dvr"]
+        track_id = camera["channel"] * 100 + 1
+        start_utc = start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_utc = end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = f"http://{dvr['ip']}:{dvr.get('port', 80)}/ISAPI/ContentMgmt/search"
+        segments: list[dict] = []
+        position = 0
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
+        ) as client:
+            for _ in range(10):
+                search_id = str(uuid.uuid4()).upper()
+                body = (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<CMSearchDescription>'
+                    f'<searchID>{search_id}</searchID>'
+                    f'<trackList><trackID>{track_id}</trackID></trackList>'
+                    '<timeSpanList><timeSpan>'
+                    f'<startTime>{start_utc}</startTime>'
+                    f'<endTime>{end_utc}</endTime>'
+                    '</timeSpan></timeSpanList>'
+                    '<maxResults>200</maxResults>'
+                    f'<searchResultPostion>{position}</searchResultPostion>'
+                    '</CMSearchDescription>'
+                )
+                response = await client.post(
+                    url, content=body,
+                    headers={"Content-Type": "application/xml"},
+                )
+                response.raise_for_status()
+                response_state, page_segments = (
+                    self._parse_hikvision_search_response(response.content)
+                )
+                segments.extend(page_segments)
+                if response_state != "MORE" or not page_segments:
+                    break
+                position += len(page_segments)
+
+        unique: dict[str, dict] = {}
+        for segment in segments:
+            unique[segment["playback_uri"]] = segment
+        return sorted(unique.values(), key=lambda segment: segment["start"])
+
+    async def _download_hikvision_recording(self, camera: dict,
+                                             playback_uri: str,
+                                             destination: Path) -> None:
+        dvr = camera["dvr"]
+        url = f"http://{dvr['ip']}:{dvr.get('port', 80)}/ISAPI/ContentMgmt/download"
+        root = ET.Element(
+            "downloadRequest",
+            {"version": "1.0", "xmlns": "http://urn:selfextension:psiaext-ver10-xsd"},
+        )
+        ET.SubElement(root, "playbackURI").text = playback_uri
+        body = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        max_bytes = HIKVISION_REPLAY_MAX_DOWNLOAD_MB * 1024 * 1024
+        minimum_free_bytes = HIKVISION_REPLAY_MIN_FREE_GB * 1024 ** 3
+        if shutil.disk_usage(destination.parent).free < minimum_free_bytes:
+            raise RuntimeError(
+                f"less than {HIKVISION_REPLAY_MIN_FREE_GB} GB disk space available"
+            )
+        written = 0
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0, connect=10.0),
+            auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
+        ) as client:
+            async with client.stream(
+                "POST", url, content=body,
+                headers={"Content-Type": "application/xml"},
+            ) as response:
+                response.raise_for_status()
+                with destination.open("wb") as output:
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise RuntimeError(
+                                f"recording exceeded {HIKVISION_REPLAY_MAX_DOWNLOAD_MB} MB limit"
+                            )
+                        output.write(chunk)
+        if written == 0:
+            raise RuntimeError("DVR returned an empty recording")
+
+    def _process_hikvision_recording(self, recording_path: Path,
+                                      camera: dict, segment_start: datetime,
+                                      replay_start: datetime, replay_end: datetime,
+                                      faces_subset: dict | None,
+                                      insightface_subset: dict | None) -> int:
+        if cv2 is None:
+            raise RuntimeError("OpenCV is unavailable")
+        capture = cv2.VideoCapture(str(recording_path))
+        if not capture.isOpened():
+            capture.release()
+            raise RuntimeError("downloaded recording could not be decoded")
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0 or fps > 120:
+            fps = 25.0
+        sample_every = max(1, int(round(fps * HIKVISION_REPLAY_SAMPLE_SECONDS)))
+        frame_index = 0
+        processed = 0
+        try:
+            while self.classwise_running:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if frame_index % sample_every == 0:
+                    observed_datetime = (
+                        segment_start + timedelta(seconds=frame_index / fps)
+                    )
+                    if observed_datetime < replay_start:
+                        frame_index += 1
+                        continue
+                    if observed_datetime > replay_end:
+                        break
+                    encoded, jpeg = cv2.imencode(
+                        ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92],
+                    )
+                    if encoded:
+                        self.recognize_faces_in_image(
+                            jpeg.tobytes(),
+                            camera_source=f"{camera['label']} [recording]",
+                            faces_subset=faces_subset,
+                            insightface_subset=insightface_subset,
+                            observed_at=observed_datetime.timestamp(),
+                        )
+                        processed += 1
+                frame_index += 1
+        finally:
+            capture.release()
+        return processed
+
+    async def _run_hikvision_recording_replay(self,
+                                               classroom_cameras: list[dict],
+                                               replay_date: date) -> None:
+        window = _get_student_phase_window()
+        window_start = datetime(
+            replay_date.year, replay_date.month, replay_date.day,
+            window[0], window[1], tzinfo=IST,
+        )
+        window_end = datetime(
+            replay_date.year, replay_date.month, replay_date.day,
+            window[2], window[3], tzinfo=IST,
+        )
+
+        def has_unmarked_students(camera: dict) -> bool:
+            grade = camera.get("grade")
+            person_ids = set(self._grade_face_cache.get(grade, {}))
+            person_ids.update(self._grade_face_cache_insightface.get(grade, {}))
+            return any(
+                not self._is_already_marked_today(person_id)
+                for person_id in person_ids
+            )
+
+        cameras = [
+            camera for camera in classroom_cameras
+            if camera.get("grade") and has_unmarked_students(camera)
+        ]
+        self._recording_replay_status = {
+            "state": "running",
+            "date": replay_date.isoformat(),
+            "coverage_complete": False,
+            "cameras_total": len(cameras),
+            "cameras_complete": 0,
+            "processed_frames": 0,
+            "attendance_backfilled": 0,
+            "error": "",
+        }
+        self._persist_recording_replay_status()
+        marked_before = sum(
+            1 for marked_date in self.daily_marked.values()
+            if marked_date == replay_date.isoformat()
+        )
+        HIKVISION_REPLAY_CACHE_DIR.mkdir(exist_ok=True)
+        replay_errors: list[str] = []
+        cameras_complete = 0
+        processed_frames = 0
+        self.add_debug_log(
+            "recording_replay_started",
+            f"Hikvision replay started for {window_start.strftime('%H:%M')}-"
+            f"{window_end.strftime('%H:%M')} IST across {len(cameras)} classroom cameras",
+        )
+
+        try:
+            for camera_index, camera in enumerate(cameras):
+                if not self.classwise_running:
+                    raise asyncio.CancelledError
+                try:
+                    grade = camera["grade"]
+                    grade_faces = {
+                        person_id: person_data
+                        for person_id, person_data
+                        in self._grade_face_cache.get(grade, {}).items()
+                        if not self._is_already_marked_today(person_id)
+                    }
+                    grade_faces_if = {
+                        person_id: person_data
+                        for person_id, person_data
+                        in self._grade_face_cache_insightface.get(grade, {}).items()
+                        if not self._is_already_marked_today(person_id)
+                    }
+                    if not grade_faces and not grade_faces_if:
+                        cameras_complete += 1
+                        continue
+
+                    segments = await self._search_hikvision_recordings(
+                        camera, window_start, window_end)
+                    coverage_complete = self._recording_coverage_complete(
+                        segments, window_start, window_end)
+                    if coverage_complete:
+                        cameras_complete += 1
+                    else:
+                        replay_errors.append(f"{camera['label']}: incomplete coverage")
+
+                    for segment_index, segment in enumerate(segments):
+                        recording_path = HIKVISION_REPLAY_CACHE_DIR / (
+                            f"replay_{camera_index}_{segment_index}.media"
+                        )
+                        try:
+                            await self._download_hikvision_recording(
+                                camera, segment["playback_uri"], recording_path)
+                            loop = asyncio.get_running_loop()
+                            processed_frames += await loop.run_in_executor(
+                                None,
+                                self._process_hikvision_recording,
+                                recording_path,
+                                camera,
+                                segment["start"],
+                                window_start,
+                                window_end,
+                                grade_faces or None,
+                                grade_faces_if or None,
+                            )
+                        finally:
+                            recording_path.unlink(missing_ok=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    replay_errors.append(f"{camera['label']}: {type(error).__name__}")
+                    self.add_debug_log(
+                        "recording_replay_camera_error",
+                        f"{camera['label']} replay failed: {type(error).__name__}: {error}",
+                    )
+                self._recording_replay_status.update({
+                    "cameras_complete": cameras_complete,
+                    "processed_frames": processed_frames,
+                })
+
+            marked_after = sum(
+                1 for marked_date in self.daily_marked.values()
+                if marked_date == replay_date.isoformat()
+            )
+            complete = cameras_complete == len(cameras) and not replay_errors
+            state = "completed" if complete else "incomplete"
+            self._recording_replay_status.update({
+                "state": state,
+                "coverage_complete": complete,
+                "cameras_complete": cameras_complete,
+                "processed_frames": processed_frames,
+                "attendance_backfilled": max(0, marked_after - marked_before),
+                "error": "; ".join(replay_errors[:10]),
+            })
+            self._persist_recording_replay_status()
+            self.add_debug_log(
+                f"recording_replay_{state}",
+                f"Hikvision replay {state}: {cameras_complete}/{len(cameras)} cameras "
+                f"covered, {processed_frames} frames processed, "
+                f"{max(0, marked_after - marked_before)} attendance records backfilled. "
+                f"Absence {'may now be finalized' if complete else 'was not finalized'}.",
+            )
+        except asyncio.CancelledError:
+            self._recording_replay_status.update({
+                "state": "cancelled",
+                "coverage_complete": False,
+                "error": "Replay was cancelled; absence was not finalized",
+            })
+            self._persist_recording_replay_status()
+            raise
+        except Exception as error:
+            self._recording_replay_status.update({
+                "state": "failed",
+                "coverage_complete": False,
+                "error": f"{type(error).__name__}: {error}",
+            })
+            self._persist_recording_replay_status()
+            self.add_debug_log(
+                "recording_replay_failed",
+                f"Hikvision replay failed; absence was not finalized: "
+                f"{type(error).__name__}: {error}",
+            )
+
+    def _start_hikvision_recording_replay_if_due(
+        self, now: datetime, classroom_cameras: list[dict],
+    ) -> None:
+        if (not HIKVISION_RECORDING_REPLAY_ENABLED or now.weekday() >= 5
+                or self.test_mode or FORCE_RENOTIFY_TEST):
+            return
+        window = _get_student_phase_window()
+        window_end = now.replace(
+            hour=window[2], minute=window[3], second=0, microsecond=0,
+        )
+        today = now.date().isoformat()
+        if now < window_end or self._recording_replay_attempt_date == today:
+            return
+        self._recording_replay_attempt_date = today
+        self._recording_replay_status.update({
+            "state": "scheduled",
+            "date": today,
+            "coverage_complete": False,
+            "error": "",
+        })
+        self._persist_recording_replay_status()
+        self._recording_replay_task = asyncio.create_task(
+            self._run_hikvision_recording_replay(classroom_cameras, now.date())
+        )
+        self._background_tasks.add(self._recording_replay_task)
+        self._recording_replay_task.add_done_callback(
+            self._background_tasks.discard
+        )
+
     async def classwise_monitoring_loop(self, dvrs: list[dict],
                                          camera_mapping: dict):
         """Multi-camera classroom-wise attendance monitoring.
@@ -2808,6 +3298,10 @@ class AttendanceEngine:
                     # Test mode: both phases always active
                     in_teacher_phase = True
                     in_student_phase = True
+
+                self._start_hikvision_recording_replay_if_due(
+                    _now_phase, student_phase_cams_classroom,
+                )
 
                 if not in_teacher_phase and not in_student_phase:
                     # Check if a meal window is active — run meal snapshot
@@ -3083,6 +3577,8 @@ class AttendanceEngine:
             self._task.cancel()
         if self._classwise_task and not self._classwise_task.done():
             self._classwise_task.cancel()
+        if self._recording_replay_task and not self._recording_replay_task.done():
+            self._recording_replay_task.cancel()
         # Close persistent DVR HTTP clients
         for client in self._dvr_clients.values():
             if not client.is_closed:
@@ -3128,6 +3624,7 @@ class AttendanceEngine:
                 1 for d in self.entry_validated.values()
                 if d == date.today().isoformat()
             ),
+            "recording_replay": self._recording_replay_status.copy(),
             "multi_layer_checks": [
                 "high_confidence_match",
                 "authorized_camera",

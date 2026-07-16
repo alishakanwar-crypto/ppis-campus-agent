@@ -457,15 +457,25 @@ def delete_person_faces(person_id: str) -> int:
 # ---------------------------------------------------------------------------
 
 def log_attendance(person_id: str, name: str, status: str, confidence: float,
-                   snapshot_path: str, camera_source: str) -> int:
+                   snapshot_path: str, camera_source: str,
+                   logged_at: str | None = None) -> int:
     conn = get_conn()
     try:
-        cursor = conn.execute(
-            "INSERT INTO attendance_log "
-            "(person_id, name, status, confidence, snapshot_path, camera_source) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (person_id, name, status, confidence, snapshot_path, camera_source),
-        )
+        if logged_at is None:
+            cursor = conn.execute(
+                "INSERT INTO attendance_log "
+                "(person_id, name, status, confidence, snapshot_path, camera_source) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (person_id, name, status, confidence, snapshot_path, camera_source),
+            )
+        else:
+            cursor = conn.execute(
+                "INSERT INTO attendance_log "
+                "(person_id, name, status, confidence, snapshot_path, "
+                "camera_source, logged_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (person_id, name, status, confidence, snapshot_path,
+                 camera_source, logged_at),
+            )
         conn.commit()
         return cursor.lastrowid
     finally:

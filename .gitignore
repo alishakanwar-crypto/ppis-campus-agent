@@ -13,3 +13,6 @@ config.json
 cpplus_replay_state.json
 cpplus_native_summary_state.json
 cpplus_recordings/
+hikvision_replay_cache/
+hikvision_replay_state.json
+hikvision_replay_state.tmp
