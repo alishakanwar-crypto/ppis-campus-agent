@@ -213,6 +213,9 @@ CPPLUS_NATIVE_SUMMARY_POLL_SECONDS = max(
 CPPLUS_NATIVE_SUMMARY_STATE_FILE = (
     Path(__file__).parent / "cpplus_native_summary_state.json"
 )
+CPPLUS_NATIVE_SUMMARY_PENDING_FILE = (
+    Path(__file__).parent / "cpplus_native_summary_pending.json"
+)
 
 # Campus side of the CP Plus entry-zone boundary. Tracks may approach the
 # boundary horizontally, vertically, or diagonally; only outside-to-campus
@@ -1132,7 +1135,9 @@ def _fetch_cpplus_native_hourly_count(
         return None
 
 
-def _parse_cpplus_native_summary(response_text: str) -> tuple[int, int] | None:
+def _parse_cpplus_native_summary(
+    response_text: str,
+) -> tuple[int, int, int | None] | None:
     values = {}
     for line in response_text.splitlines():
         key, separator, value = line.partition("=")
@@ -1141,15 +1146,19 @@ def _parse_cpplus_native_summary(response_text: str) -> tuple[int, int] | None:
     if values.get("summary.RuleName") != "NumberStat":
         return None
     try:
+        entered_hour = values.get("summary.EnteredSubtotal.Hour")
         return (
             int(values["summary.EnteredSubtotal.Today"]),
             int(values["summary.ExitedSubtotal.Today"]),
+            int(entered_hour) if entered_hour is not None else None,
         )
     except (KeyError, ValueError):
         return None
 
 
-def _fetch_cpplus_native_summary(cam: dict) -> tuple[int, int] | None:
+def _fetch_cpplus_native_summary(
+    cam: dict,
+) -> tuple[int, int, int | None] | None:
     password = _resolve_cpplus_password(cam)
     if not password:
         return None
@@ -1195,16 +1204,99 @@ def _save_cpplus_native_summary_state(state: dict) -> None:
     temp_path.replace(CPPLUS_NATIVE_SUMMARY_STATE_FILE)
 
 
+def _load_cpplus_native_summary_pending() -> list[dict]:
+    try:
+        pending = json.loads(
+            CPPLUS_NATIVE_SUMMARY_PENDING_FILE.read_text(encoding="utf-8")
+        )
+        if not isinstance(pending, list):
+            return []
+        return [item for item in pending if isinstance(item, dict)]
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _save_cpplus_native_summary_pending(pending: list[dict]) -> None:
+    temp_path = CPPLUS_NATIVE_SUMMARY_PENDING_FILE.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(pending, sort_keys=True), encoding="utf-8")
+    temp_path.replace(CPPLUS_NATIVE_SUMMARY_PENDING_FILE)
+
+
+def _queue_cpplus_native_pending(
+    pending: list[dict], hour_start: datetime, hour_end: datetime, in_count: int,
+) -> list[dict]:
+    """Record a completed hour that still needs uploading, de-duplicated by
+    hour_start so retries stay idempotent against the backend upsert."""
+    key = hour_start.strftime("%Y-%m-%d %H:%M:%S")
+    entry = {
+        "hour_start": key,
+        "hour_end": hour_end.strftime("%Y-%m-%d %H:%M:%S"),
+        "in_count": in_count,
+    }
+    updated = [item for item in pending if item.get("hour_start") != key]
+    updated.append(entry)
+    return updated
+
+
+def _flush_cpplus_native_pending(pending: list[dict]) -> list[dict]:
+    """Retry every queued completed hour; keep only the ones that still fail."""
+    remaining = []
+    for item in pending:
+        try:
+            hour_start = datetime.strptime(
+                item["hour_start"], "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=IST)
+            hour_end = datetime.strptime(
+                item["hour_end"], "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=IST)
+            in_count = int(item["in_count"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        uploaded = _post_cpplus_recount(
+            hour_start, hour_end, in_count, 0, "camera_native_counter",
+        )
+        logger.info(
+            "CP Plus live native count %s-%s: IN=%d uploaded=%s",
+            hour_start.strftime("%H:%M"),
+            hour_end.strftime("%H:%M"),
+            in_count,
+            uploaded,
+        )
+        if not uploaded:
+            remaining.append(item)
+    return remaining
+
+
 def _cpplus_native_summary_transition(
-    state: dict, now: datetime, entered_today: int,
+    state: dict,
+    now: datetime,
+    entered_today: int,
+    entered_hour: int | None = None,
 ) -> tuple[dict, tuple[datetime, datetime, int] | None]:
     current_hour = now.replace(minute=0, second=0, microsecond=0)
     current_key = current_hour.strftime("%Y-%m-%d %H:%M:%S")
     date = now.strftime("%Y-%m-%d")
     within_boundary = now.minute == 0 and now.second <= 10
 
+    valid_hour_subtotal = (
+        entered_hour is not None
+        and 0 <= entered_hour <= entered_today
+    )
+    # The camera's current-hour subtotal gives the exact cumulative value at the
+    # hour boundary even when the first successful poll arrives late.
+    hour_baseline = (
+        entered_today - entered_hour
+        if valid_hour_subtotal and entered_hour is not None
+        else entered_today
+    )
+
     if state.get("date") == date and state.get("hour_start") == current_key:
-        return state, None
+        updated = dict(state)
+        updated["entered_end"] = entered_today
+        if valid_hour_subtotal:
+            updated["entered_today"] = hour_baseline
+            updated["complete"] = True
+        return (state if updated == state else updated), None
 
     completed = None
     previous_key = state.get("hour_start")
@@ -1217,57 +1309,60 @@ def _cpplus_native_summary_transition(
         except (KeyError, TypeError, ValueError):
             previous_hour = None
             baseline = 0
+        exact_end = valid_hour_subtotal or within_boundary
+        end_value = hour_baseline if valid_hour_subtotal else entered_today
         if (
             previous_hour is not None
             and state.get("complete") is True
             and current_hour - previous_hour == timedelta(hours=1)
-            and within_boundary
-            and entered_today >= baseline
+            and exact_end
+            and end_value >= baseline
         ):
             completed = (
                 previous_hour,
                 current_hour,
-                entered_today - baseline,
+                end_value - baseline,
             )
 
     next_state = {
         "date": date,
         "hour_start": current_key,
-        "entered_today": entered_today,
-        "complete": within_boundary,
+        "entered_today": hour_baseline,
+        "entered_end": entered_today,
+        "complete": valid_hour_subtotal or within_boundary,
     }
     return next_state, completed
 
 
 def run_cpplus_native_summary_worker(cam: dict) -> None:
     state = _load_cpplus_native_summary_state()
+    pending = _load_cpplus_native_summary_pending()
     logger.info("CP Plus live native-summary worker started")
     while running:
         now = datetime.now(IST)
         summary = _fetch_cpplus_native_summary(cam)
         if summary is not None:
             next_state, completed = _cpplus_native_summary_transition(
-                state, now, summary[0],
+                state, now, summary[0], summary[2],
             )
+            if completed is not None:
+                hour_start, hour_end, in_count = completed
+                pending = _queue_cpplus_native_pending(
+                    pending, hour_start, hour_end, in_count,
+                )
+                # Persist the completed interval before advancing state. A crash
+                # between these writes can only re-queue the same idempotent hour.
+                _save_cpplus_native_summary_pending(pending)
             if next_state != state:
                 state = next_state
                 _save_cpplus_native_summary_state(state)
-            if completed is not None:
-                hour_start, hour_end, in_count = completed
-                uploaded = _post_cpplus_recount(
-                    hour_start,
-                    hour_end,
-                    in_count,
-                    0,
-                    "camera_native_counter",
-                )
-                logger.info(
-                    "CP Plus live native count %s-%s: IN=%d uploaded=%s",
-                    hour_start.strftime("%H:%M"),
-                    hour_end.strftime("%H:%M"),
-                    in_count,
-                    uploaded,
-                )
+        # Always attempt to drain any completed hour that has not been accepted
+        # yet, so a transient upload failure is retried instead of lost.
+        if pending:
+            remaining = _flush_cpplus_native_pending(pending)
+            if remaining != pending:
+                pending = remaining
+                _save_cpplus_native_summary_pending(pending)
         time.sleep(CPPLUS_NATIVE_SUMMARY_POLL_SECONDS)
 
 
