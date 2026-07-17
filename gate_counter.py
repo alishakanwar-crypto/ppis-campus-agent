@@ -65,6 +65,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 
 import cv2
 import httpx
@@ -275,6 +276,16 @@ VEHICLE_CLOUD_API = os.environ.get(
     "GATE_VEHICLE_API",
     "https://ppis-whatsapp-bot.fly.dev/api/gate/vehicle-entry",
 )
+
+CANDIDATE_BOUNDARY_API = os.environ.get(
+    "GATE_CANDIDATE_BOUNDARY_API",
+    "https://ppis-whatsapp-bot.fly.dev/api/gate/candidate-boundary-event",
+)
+CANDIDATE_BOUNDARY_CAMERAS = {
+    "ENTRY GATE-1": "C2",
+    "ENTRY GATE-2": "C2",
+    "Basement Main Gate": "C4",
+}
 
 # Tracker settings
 MAX_DISAPPEARED = 15  # frames before removing a tracked person
@@ -2511,6 +2522,60 @@ def send_vehicle_event(events: list[dict]) -> bool:
     return False
 
 
+def _build_candidate_boundary_event(
+    camera: str,
+    raw_direction: str,
+    line_position: float,
+    timestamp: datetime,
+) -> dict:
+    if camera not in CANDIDATE_BOUNDARY_CAMERAS:
+        raise ValueError("Unknown candidate boundary camera")
+    if raw_direction not in {"IN", "OUT"} or not 0 < line_position < 1:
+        raise ValueError("Invalid candidate boundary crossing")
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=IST)
+    image_direction = (
+        "TOP_TO_BOTTOM" if raw_direction == "IN" else "BOTTOM_TO_TOP"
+    )
+    return {
+        "event_id": uuid4().hex,
+        "timestamp": timestamp.astimezone(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        "boundary": CANDIDATE_BOUNDARY_CAMERAS[camera],
+        "camera": camera,
+        "image_direction": image_direction,
+        "line_position": line_position,
+    }
+
+
+def send_candidate_boundary_events(events: list[dict]) -> bool:
+    """Send audit-only candidate crossings without changing headcount."""
+    if not events:
+        return True
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.post(
+                CANDIDATE_BOUNDARY_API,
+                json=events,
+                headers=_agent_secret_headers(),
+            )
+            if response.status_code == 200:
+                logger.info(
+                    "Sent %d candidate boundary event(s) to cloud — OK",
+                    len(events),
+                )
+                return True
+            logger.warning(
+                "Candidate boundary API returned %d: %s",
+                response.status_code,
+                response.text[:200],
+            )
+    except Exception as exc:
+        logger.error("Candidate boundary API error: %s", exc)
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # DVR Password Loader
 # ---------------------------------------------------------------------------
@@ -2670,6 +2735,7 @@ def run_gate_counter():
     poll_count = 0
     pending_events: list[dict] = []
     pending_vehicle_events: list[dict] = []
+    pending_candidate_boundary_events: list[dict] = []
 
     while running:
         now = datetime.now(IST)
@@ -2733,7 +2799,22 @@ def run_gate_counter():
             detections = detector.detect(frame)
 
             # Update tracker (maintains person identity across frames)
-            trackers[cam_name].update(detections)
+            crossings = trackers[cam_name].update(detections)
+            if cam_name in CANDIDATE_BOUNDARY_CAMERAS:
+                for crossing in crossings:
+                    event = _build_candidate_boundary_event(
+                        cam_name,
+                        crossing["direction"],
+                        cam_line_position,
+                        now,
+                    )
+                    pending_candidate_boundary_events.append(event)
+                    logger.info(
+                        "%s %s audit crossing: %s",
+                        event["boundary"],
+                        cam_name,
+                        event["image_direction"],
+                    )
 
             # Appearance-based counting: count NEW people on first detection
             # (replaces line-crossing which fails with 5-second snapshot gaps)
@@ -2878,6 +2959,11 @@ def run_gate_counter():
             ok = send_vehicle_event(pending_vehicle_events)
             if ok:
                 pending_vehicle_events = []
+
+        if pending_candidate_boundary_events:
+            ok = send_candidate_boundary_events(pending_candidate_boundary_events)
+            if ok:
+                pending_candidate_boundary_events = []
 
         # Periodic status log
         if poll_count % 60 == 0:  # Every ~5 minutes
