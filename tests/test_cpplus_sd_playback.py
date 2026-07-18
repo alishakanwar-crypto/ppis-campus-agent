@@ -527,6 +527,41 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
         self.assertEqual(post.call_args_list[1].args[-1], "school_pc_recording")
         count.assert_called_once()
 
+    def test_retries_pending_native_history_before_expensive_replay(self):
+        hour_start = datetime(2026, 7, 14, 7, tzinfo=gate_counter.IST)
+        hour_end = datetime(2026, 7, 14, 8, tzinfo=gate_counter.IST)
+        original_running = gate_counter.running
+        gate_counter.running = True
+
+        def stop_worker(_seconds):
+            gate_counter.running = False
+
+        try:
+            with (
+                patch("gate_counter._load_cpplus_replay_state", return_value={}),
+                patch(
+                    "gate_counter._completed_replay_hours",
+                    return_value=[(hour_start, hour_end)],
+                ),
+                patch(
+                    "gate_counter._fetch_cpplus_native_hourly_count",
+                    return_value=None,
+                ),
+                patch(
+                    "gate_counter._cpplus_native_history_grace_open",
+                    return_value=True,
+                ),
+                patch("gate_counter._local_recordings_for_hour") as local_recordings,
+                patch("gate_counter._post_cpplus_recount") as post,
+                patch("gate_counter.time.sleep", side_effect=stop_worker),
+            ):
+                gate_counter.run_cpplus_replay_worker({"name": "CP Plus"})
+        finally:
+            gate_counter.running = original_running
+
+        local_recordings.assert_not_called()
+        post.assert_not_called()
+
     def test_segment_worker_uploads_completed_hour_as_non_additive_check(self):
         hour_start = datetime(2026, 7, 14, 7, tzinfo=gate_counter.IST)
         hour_end = datetime(2026, 7, 14, 8, tzinfo=gate_counter.IST)

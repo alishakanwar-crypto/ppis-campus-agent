@@ -195,6 +195,12 @@ CPPLUS_REPLAY_ENABLED = os.environ.get("CPPLUS_REPLAY_ENABLED", "1") not in (
 )
 CPPLUS_REPLAY_DELAY_MINUTES = int(os.environ.get("CPPLUS_REPLAY_DELAY_MINUTES", "2"))
 CPPLUS_REPLAY_RETRY_MINUTES = int(os.environ.get("CPPLUS_REPLAY_RETRY_MINUTES", "10"))
+CPPLUS_NATIVE_HISTORY_GRACE_MINUTES = max(
+    0, int(os.environ.get("CPPLUS_NATIVE_HISTORY_GRACE_MINUTES", "60")),
+)
+CPPLUS_NATIVE_HISTORY_RETRY_SECONDS = max(
+    1.0, float(os.environ.get("CPPLUS_NATIVE_HISTORY_RETRY_SECONDS", "60")),
+)
 # Two frames per second retains several observations per walkway crossing while
 # allowing a CPU-only school PC to finish each hour before the next one queues.
 CPPLUS_REPLAY_SAMPLE_FPS = float(os.environ.get("CPPLUS_REPLAY_SAMPLE_FPS", "2"))
@@ -2006,6 +2012,14 @@ def _completed_replay_hours(now: datetime) -> list[tuple[datetime, datetime]]:
     return list(reversed(hours))
 
 
+def _cpplus_native_history_grace_open(
+    now: datetime, hour_end: datetime,
+) -> bool:
+    return now < hour_end + timedelta(
+        minutes=CPPLUS_NATIVE_HISTORY_GRACE_MINUTES,
+    )
+
+
 def run_cpplus_replay_worker(cam: dict) -> None:
     state = _load_cpplus_replay_state()
     retry_after: dict[str, float] = {}
@@ -2063,6 +2077,16 @@ def run_cpplus_replay_worker(cam: dict) -> None:
                     hour_start.strftime("%H:%M"),
                     hour_end.strftime("%H:%M"),
                 )
+            elif _cpplus_native_history_grace_open(now, hour_end):
+                retry_after[state_key] = (
+                    time.monotonic() + CPPLUS_NATIVE_HISTORY_RETRY_SECONDS
+                )
+                logger.info(
+                    "CP Plus native history pending for %s-%s; retrying before replay",
+                    hour_start.strftime("%H:%M"),
+                    hour_end.strftime("%H:%M"),
+                )
+                continue
 
             file_handle, file_name = tempfile.mkstemp(
                 prefix="cpplus_replay_", suffix=".dav",
