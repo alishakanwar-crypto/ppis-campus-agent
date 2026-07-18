@@ -2187,15 +2187,14 @@ def _segment_replay_hours(now: datetime) -> list[tuple[datetime, datetime]]:
     )
     if now < day_start:
         return []
-    latest = min(now, day_end - timedelta(microseconds=1)).replace(
+    current_start = min(now, day_end - timedelta(microseconds=1)).replace(
         minute=0, second=0, microsecond=0,
     )
-    hours = []
-    hour_start = day_start
-    while hour_start <= latest:
-        hours.append((hour_start, hour_start + timedelta(hours=1)))
-        hour_start += timedelta(hours=1)
-    return list(reversed(hours))
+    hours = [(current_start, current_start + timedelta(hours=1))]
+    previous_start = current_start - timedelta(hours=1)
+    if previous_start >= day_start:
+        hours.append((previous_start, current_start))
+    return hours
 
 
 def run_cpplus_segment_replay_worker(cam: dict) -> None:
