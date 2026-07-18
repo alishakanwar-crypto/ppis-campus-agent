@@ -527,6 +527,99 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
         self.assertEqual(post.call_args_list[1].args[-1], "school_pc_recording")
         count.assert_called_once()
 
+    def test_segment_worker_uploads_completed_hour_as_non_additive_check(self):
+        hour_start = datetime(2026, 7, 14, 7, tzinfo=gate_counter.IST)
+        hour_end = datetime(2026, 7, 14, 8, tzinfo=gate_counter.IST)
+        original_running = gate_counter.running
+        gate_counter.running = True
+
+        def stop_worker(_seconds):
+            gate_counter.running = False
+
+        midpoint = datetime(2026, 7, 14, 7, 30, tzinfo=gate_counter.IST)
+        tracker = Mock()
+        try:
+            with (
+                patch("gate_counter._load_cpplus_segment_replay_state", return_value={}),
+                patch(
+                    "gate_counter._segment_replay_hours",
+                    return_value=[(hour_start, hour_end)],
+                ),
+                patch(
+                    "gate_counter._local_recording_segments_for_hour",
+                    return_value=[
+                        (hour_start, midpoint, Path("first.mp4")),
+                        (midpoint, hour_end, Path("second.mp4")),
+                    ],
+                ),
+                patch(
+                    "gate_counter._build_cpplus_replay_tracker",
+                    return_value=tracker,
+                ),
+                patch(
+                    "gate_counter._count_cpplus_recording_paths_with_tracker",
+                    side_effect=[(14, 3600), (15, 3600)],
+                ) as count,
+                patch("gate_counter._post_cpplus_recount", return_value=True) as post,
+                patch("gate_counter.PersonDetector"),
+                patch("gate_counter._save_cpplus_segment_replay_state") as save,
+                patch("gate_counter.time.sleep", side_effect=stop_worker),
+            ):
+                gate_counter.run_cpplus_segment_replay_worker({"name": "CP Plus"})
+        finally:
+            gate_counter.running = original_running
+
+        self.assertEqual(count.call_count, 2)
+        self.assertIs(count.call_args_list[0].args[3], tracker)
+        self.assertIs(count.call_args_list[1].args[3], tracker)
+        self.assertEqual(post.call_args.args[2], 29)
+        self.assertEqual(post.call_args.args[3], 7200)
+        self.assertEqual(post.call_args.args[4], "school_pc_segment_recording")
+        save.assert_called_once()
+
+    def test_segment_worker_does_not_upload_hour_with_recording_gap(self):
+        hour_start = datetime(2026, 7, 14, 7, tzinfo=gate_counter.IST)
+        first_end = datetime(2026, 7, 14, 7, 20, tzinfo=gate_counter.IST)
+        second_start = datetime(2026, 7, 14, 7, 30, tzinfo=gate_counter.IST)
+        hour_end = datetime(2026, 7, 14, 8, tzinfo=gate_counter.IST)
+        original_running = gate_counter.running
+        gate_counter.running = True
+
+        def stop_worker(_seconds):
+            gate_counter.running = False
+
+        try:
+            with (
+                patch("gate_counter._load_cpplus_segment_replay_state", return_value={}),
+                patch(
+                    "gate_counter._segment_replay_hours",
+                    return_value=[(hour_start, hour_end)],
+                ),
+                patch(
+                    "gate_counter._local_recording_segments_for_hour",
+                    return_value=[
+                        (hour_start, first_end, Path("first.mp4")),
+                        (second_start, hour_end, Path("second.mp4")),
+                    ],
+                ),
+                patch("gate_counter._build_cpplus_replay_tracker"),
+                patch(
+                    "gate_counter._count_cpplus_recording_paths_with_tracker",
+                    return_value=(14, 2400),
+                ) as count,
+                patch("gate_counter._post_cpplus_recount") as post,
+                patch("gate_counter.PersonDetector"),
+                patch("gate_counter._save_cpplus_segment_replay_state") as save,
+                patch("gate_counter.time.sleep", side_effect=stop_worker),
+            ):
+                gate_counter.run_cpplus_segment_replay_worker({"name": "CP Plus"})
+        finally:
+            gate_counter.running = original_running
+
+        count.assert_called_once()
+        post.assert_not_called()
+        save.assert_not_called()
+
     def test_prioritizes_latest_completed_hour(self):
         hours = gate_counter._completed_replay_hours(datetime(2026, 7, 13, 13, 41))
 

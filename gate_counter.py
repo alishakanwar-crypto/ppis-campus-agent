@@ -205,6 +205,15 @@ CPPLUS_SD_REPLAY_ENABLED = os.environ.get(
 CPPLUS_RECORDING_CHANNEL = int(os.environ.get("CPPLUS_RECORDING_CHANNEL", "1"))
 CPPLUS_RECORDING_PORT = int(os.environ.get("CPPLUS_RECORDING_PORT", "80"))
 CPPLUS_REPLAY_STATE_FILE = Path(__file__).parent / "cpplus_replay_state.json"
+CPPLUS_SEGMENT_REPLAY_ENABLED = os.environ.get(
+    "CPPLUS_SEGMENT_REPLAY_ENABLED", "1",
+).lower() not in ("0", "false", "no")
+CPPLUS_SEGMENT_REPLAY_POLL_SECONDS = max(
+    2.0, float(os.environ.get("CPPLUS_SEGMENT_REPLAY_POLL_SECONDS", "10")),
+)
+CPPLUS_SEGMENT_REPLAY_STATE_FILE = (
+    Path(__file__).parent / "cpplus_segment_replay_state.json"
+)
 CPPLUS_NATIVE_SUMMARY_ENABLED = os.environ.get(
     "CPPLUS_NATIVE_SUMMARY_ENABLED", "1",
 ).lower() not in ("0", "false", "no")
@@ -759,10 +768,10 @@ def _cleanup_cpplus_local_recordings(now: datetime) -> None:
             pass
 
 
-def _local_recordings_for_hour(
+def _local_recording_segments_for_hour(
     hour_start: datetime, hour_end: datetime,
-) -> list[Path] | None:
-    segments: list[tuple[datetime, datetime, Path]] = []
+) -> list[tuple[datetime, datetime, Path]]:
+    segments = []
     for path in CPPLUS_LOCAL_RECORDING_DIR.glob("cpplus_*__*.mp4"):
         interval = _parse_local_recording_path(path)
         if interval is None:
@@ -770,7 +779,13 @@ def _local_recordings_for_hour(
         start, end = interval
         if end > hour_start and start < hour_end:
             segments.append((start, end, path))
-    segments.sort(key=lambda item: item[0])
+    return sorted(segments, key=lambda item: item[0])
+
+
+def _local_recordings_for_hour(
+    hour_start: datetime, hour_end: datetime,
+) -> list[Path] | None:
+    segments = _local_recording_segments_for_hour(hour_start, hour_end)
     if not segments:
         return None
 
@@ -1814,10 +1829,8 @@ def _download_cpplus_recording(
     return None
 
 
-def count_cpplus_recordings(
-    recording_paths: list[Path], cam: dict, detector: "PersonDetector",
-) -> tuple[int, int] | None:
-    tracker = CentroidTracker(
+def _build_cpplus_replay_tracker() -> CentroidTracker:
+    return CentroidTracker(
         max_disappeared=max(
             MAX_DISAPPEARED,
             int(CPPLUS_REPLAY_SAMPLE_FPS * CPPLUS_TRACK_MAX_GAP_SECONDS),
@@ -1826,6 +1839,15 @@ def count_cpplus_recordings(
         anchor_y="bottom",
         line_axis=CPPLUS_LINE_AXIS,
     )
+
+
+def _count_cpplus_recording_paths_with_tracker(
+    recording_paths: list[Path],
+    cam: dict,
+    detector: "PersonDetector",
+    tracker: CentroidTracker,
+    recording_windows: dict[str, tuple[float, float]] | None = None,
+) -> tuple[int, int] | None:
     in_count = 0
     processed_frames = 0
 
@@ -1839,12 +1861,17 @@ def count_cpplus_recordings(
             source_fps = CPPLUS_LOCAL_RECORDING_FPS
         frame_stride = max(1, round(source_fps / CPPLUS_REPLAY_SAMPLE_FPS))
         frame_number = 0
+        window = (recording_windows or {}).get(str(recording_path))
         try:
             while running:
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     break
                 frame_number += 1
+                frame_seconds = frame_number / source_fps
+                if window is not None and frame_seconds >= window[1]:
+                    break
+                count_crossings = window is None or frame_seconds >= window[0]
                 if frame_number % frame_stride:
                     continue
 
@@ -1875,7 +1902,7 @@ def count_cpplus_recordings(
                     direction = raw_direction if positive_direction_is_in else (
                         "OUT" if raw_direction == "IN" else "IN"
                     )
-                    if direction == "IN":
+                    if direction == "IN" and count_crossings:
                         in_count += 1
         finally:
             cap.release()
@@ -1884,6 +1911,14 @@ def count_cpplus_recordings(
         logger.warning("CP Plus recording contained no decodable frames")
         return None
     return in_count, processed_frames
+
+
+def count_cpplus_recordings(
+    recording_paths: list[Path], cam: dict, detector: "PersonDetector",
+) -> tuple[int, int] | None:
+    return _count_cpplus_recording_paths_with_tracker(
+        recording_paths, cam, detector, _build_cpplus_replay_tracker(),
+    )
 
 
 def count_cpplus_recording(
@@ -2092,6 +2127,151 @@ def run_cpplus_replay_worker(cam: dict) -> None:
         time.sleep(30)
 
     logger.info("CP Plus onboard-recording replay worker stopped")
+
+
+def _load_cpplus_segment_replay_state() -> dict[str, dict]:
+    try:
+        data = json.loads(
+            CPPLUS_SEGMENT_REPLAY_STATE_FILE.read_text(encoding="utf-8")
+        )
+        if isinstance(data, dict):
+            return {
+                str(key): value for key, value in data.items()
+                if isinstance(value, dict)
+            }
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_cpplus_segment_replay_state(state: dict[str, dict]) -> None:
+    temp_path = CPPLUS_SEGMENT_REPLAY_STATE_FILE.with_suffix(".tmp")
+    temp_path.write_text(
+        json.dumps(state, indent=2, sort_keys=True), encoding="utf-8",
+    )
+    temp_path.replace(CPPLUS_SEGMENT_REPLAY_STATE_FILE)
+
+
+def _segment_replay_hours(now: datetime) -> list[tuple[datetime, datetime]]:
+    day_start = now.replace(
+        hour=MONITOR_START_HOUR, minute=MONITOR_START_MIN,
+        second=0, microsecond=0,
+    )
+    day_end = now.replace(
+        hour=MONITOR_END_HOUR, minute=MONITOR_END_MIN,
+        second=0, microsecond=0,
+    )
+    if now < day_start:
+        return []
+    latest = min(now, day_end - timedelta(microseconds=1)).replace(
+        minute=0, second=0, microsecond=0,
+    )
+    hours = []
+    hour_start = day_start
+    while hour_start <= latest:
+        hours.append((hour_start, hour_start + timedelta(hours=1)))
+        hour_start += timedelta(hours=1)
+    return list(reversed(hours))
+
+
+def run_cpplus_segment_replay_worker(cam: dict) -> None:
+    state = _load_cpplus_segment_replay_state()
+    accumulators: dict[str, dict] = {}
+    detector: PersonDetector | None = None
+    tolerance = timedelta(seconds=CPPLUS_LOCAL_COVERAGE_TOLERANCE_SECONDS)
+    logger.info("CP Plus five-minute segment replay worker started")
+
+    while running:
+        now = datetime.now(IST)
+        for hour_start, hour_end in _segment_replay_hours(now):
+            state_key = hour_start.strftime("%Y-%m-%d %H:%M:%S")
+            saved = state.get(state_key)
+            if saved is not None:
+                if not saved.get("uploaded") and _post_cpplus_recount(
+                    hour_start,
+                    hour_end,
+                    int(saved["in_count"]),
+                    int(saved["processed_frames"]),
+                    "school_pc_segment_recording",
+                ):
+                    saved["uploaded"] = True
+                    _save_cpplus_segment_replay_state(state)
+                continue
+
+            accumulator = accumulators.setdefault(
+                state_key,
+                {
+                    "tracker": _build_cpplus_replay_tracker(),
+                    "processed_paths": set(),
+                    "covered_until": hour_start,
+                    "in_count": 0,
+                    "processed_frames": 0,
+                },
+            )
+            segments = _local_recording_segments_for_hour(hour_start, hour_end)
+            for start, end, path in segments:
+                path_key = str(path)
+                if path_key in accumulator["processed_paths"]:
+                    continue
+                if start > accumulator["covered_until"] + tolerance:
+                    break
+                if detector is None:
+                    detector = PersonDetector()
+                    detector.load()
+                window_start = max(0.0, (hour_start - start).total_seconds())
+                window_end = min(
+                    (end - start).total_seconds(),
+                    (hour_end - start).total_seconds(),
+                )
+                result = _count_cpplus_recording_paths_with_tracker(
+                    [path],
+                    cam,
+                    detector,
+                    accumulator["tracker"],
+                    {str(path): (window_start, window_end)},
+                )
+                if result is None:
+                    break
+                in_count, processed_frames = result
+                accumulator["in_count"] += in_count
+                accumulator["processed_frames"] += processed_frames
+                accumulator["processed_paths"].add(path_key)
+                accumulator["covered_until"] = max(
+                    accumulator["covered_until"], end,
+                )
+                logger.info(
+                    "CP Plus in-hour segment checked %s-%s: cumulative IN=%d frames=%d",
+                    start.strftime("%H:%M:%S"), end.strftime("%H:%M:%S"),
+                    accumulator["in_count"], accumulator["processed_frames"],
+                )
+
+            if (
+                now >= hour_end
+                and accumulator["covered_until"] >= hour_end - tolerance
+            ):
+                uploaded = _post_cpplus_recount(
+                    hour_start,
+                    hour_end,
+                    accumulator["in_count"],
+                    accumulator["processed_frames"],
+                    "school_pc_segment_recording",
+                )
+                state[state_key] = {
+                    "in_count": accumulator["in_count"],
+                    "processed_frames": accumulator["processed_frames"],
+                    "uploaded": uploaded,
+                }
+                _save_cpplus_segment_replay_state(state)
+                accumulators.pop(state_key, None)
+                logger.info(
+                    "CP Plus in-hour recording check %s-%s: IN=%d frames=%d uploaded=%s",
+                    hour_start.strftime("%H:%M"), hour_end.strftime("%H:%M"),
+                    state[state_key]["in_count"],
+                    state[state_key]["processed_frames"], uploaded,
+                )
+        time.sleep(CPPLUS_SEGMENT_REPLAY_POLL_SECONDS)
+
+    logger.info("CP Plus five-minute segment replay worker stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -2705,6 +2885,14 @@ def run_gate_counter():
             )
             replay_thread.start()
             cpplus_threads.append(replay_thread)
+        if CPPLUS_SEGMENT_REPLAY_ENABLED and CPPLUS_LOCAL_RECORDING_ENABLED:
+            segment_thread = threading.Thread(
+                target=run_cpplus_segment_replay_worker,
+                args=(cam,), daemon=True,
+                name=f"cpplus-segment-replay-{cam['name']}",
+            )
+            segment_thread.start()
+            cpplus_threads.append(segment_thread)
 
     # One tracker per camera (for people) — DVR channels + CP Plus outside gate
     trackers: dict[str, CentroidTracker] = {}
