@@ -201,10 +201,10 @@ CPPLUS_NATIVE_HISTORY_GRACE_MINUTES = max(
 CPPLUS_NATIVE_HISTORY_RETRY_SECONDS = max(
     1.0, float(os.environ.get("CPPLUS_NATIVE_HISTORY_RETRY_SECONDS", "60")),
 )
-# Two frames per second retains several observations per walkway crossing while
-# allowing a CPU-only school PC to finish each hour before the next one queues.
+# Two frames per second retains several observations per walkway crossing.
+# Native 640px YOLO inference reduces replay latency on the CPU-only school PC.
 CPPLUS_REPLAY_SAMPLE_FPS = float(os.environ.get("CPPLUS_REPLAY_SAMPLE_FPS", "2"))
-CPPLUS_REPLAY_IMAGE_SIZE = int(os.environ.get("CPPLUS_REPLAY_IMAGE_SIZE", "960"))
+CPPLUS_REPLAY_IMAGE_SIZE = int(os.environ.get("CPPLUS_REPLAY_IMAGE_SIZE", "640"))
 CPPLUS_SD_REPLAY_ENABLED = os.environ.get(
     "CPPLUS_SD_REPLAY_ENABLED", "0"
 ).lower() in ("1", "true", "yes")
@@ -2190,11 +2190,11 @@ def _segment_replay_hours(now: datetime) -> list[tuple[datetime, datetime]]:
     current_start = min(now, day_end - timedelta(microseconds=1)).replace(
         minute=0, second=0, microsecond=0,
     )
-    hours = [(current_start, current_start + timedelta(hours=1))]
+    current_hour = (current_start, current_start + timedelta(hours=1))
     previous_start = current_start - timedelta(hours=1)
     if previous_start >= day_start:
-        hours.append((previous_start, current_start))
-    return hours
+        return [(previous_start, current_start), current_hour]
+    return [current_hour]
 
 
 def run_cpplus_segment_replay_worker(cam: dict) -> None:
