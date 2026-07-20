@@ -655,19 +655,19 @@ class CPPlusSDPlaybackTests(unittest.TestCase):
         post.assert_not_called()
         save.assert_not_called()
 
-    def test_segment_worker_considers_only_current_and_previous_hours(self):
+    def test_segment_worker_prioritizes_previous_then_current_hour(self):
         now = datetime(2026, 7, 14, 11, 35, tzinfo=gate_counter.IST)
 
         self.assertEqual(
             gate_counter._segment_replay_hours(now),
             [
                 (
-                    datetime(2026, 7, 14, 11, tzinfo=gate_counter.IST),
-                    datetime(2026, 7, 14, 12, tzinfo=gate_counter.IST),
-                ),
-                (
                     datetime(2026, 7, 14, 10, tzinfo=gate_counter.IST),
                     datetime(2026, 7, 14, 11, tzinfo=gate_counter.IST),
+                ),
+                (
+                    datetime(2026, 7, 14, 11, tzinfo=gate_counter.IST),
+                    datetime(2026, 7, 14, 12, tzinfo=gate_counter.IST),
                 ),
             ],
         )
