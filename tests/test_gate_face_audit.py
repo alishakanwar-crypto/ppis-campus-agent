@@ -16,13 +16,17 @@ IST = timezone(timedelta(hours=5, minutes=30))
 class FakeFaceRecognition:
     encoding = np.array([0.0, 0.0])
     locations = [(1, 3, 3, 1)]
+    location_calls = 0
+    encoded_locations = []
 
     @classmethod
     def face_locations(cls, image, number_of_times_to_upsample=1, model="hog"):
+        cls.location_calls += 1
         return cls.locations
 
     @classmethod
     def face_encodings(cls, image, locations):
+        cls.encoded_locations = locations
         return [cls.encoding.copy() for _ in locations]
 
     @staticmethod
@@ -31,6 +35,12 @@ class FakeFaceRecognition:
             np.linalg.norm(known_encoding - encoding)
             for known_encoding in known_encodings
         ])
+
+
+class FakeHaarDetector:
+    @staticmethod
+    def detectMultiScale(image, scaleFactor, minNeighbors, minSize):
+        return [(1, 1, 2, 2)]
 
 
 class FakeCapture:
@@ -103,6 +113,25 @@ class GateFaceAuditTests(unittest.TestCase):
         self.assertEqual(observations[0]["candidate_person_id"], "T001")
         self.assertEqual(observations[0]["candidate_category"], "teacher")
         self.assertEqual(observations[0]["review_state"], "pending")
+
+    @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
+    def test_fast_haar_detector_passes_locations_to_face_encoder(self):
+        FakeFaceRecognition.encoding = np.array([0.0, 0.0])
+        FakeFaceRecognition.location_calls = 0
+        analyzer = gate_face_audit.FaceAuditAnalyzer(
+            known_faces=self.known_faces,
+            minimum_face_width=1,
+            minimum_sharpness=0,
+            detector="haar",
+        )
+        analyzer._haar = FakeHaarDetector()
+
+        observations = analyzer.analyze(self.frame, self.now)
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["status"], "candidate_known")
+        self.assertEqual(FakeFaceRecognition.location_calls, 0)
+        self.assertEqual(FakeFaceRecognition.encoded_locations, [(1, 3, 3, 1)])
 
     @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
     def test_default_pilot_excludes_students_and_pseudonymizes_candidates(self):
@@ -180,6 +209,7 @@ class GateFaceAuditTests(unittest.TestCase):
         self.assertGreater(summary["stream_frames_read"], 0)
         self.assertGreater(summary["frames_captured"], 0)
         self.assertEqual(summary["analysis_max_width"], 720)
+        self.assertEqual(summary["face_detector"], "haar")
         self.assertFalse(summary["official_headcount_changed"])
 
     @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
