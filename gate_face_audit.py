@@ -136,6 +136,7 @@ class FaceAuditAnalyzer:
         max_width: int = 960,
         include_students: bool = False,
         log_identities: bool = False,
+        detector: str = "hog",
     ):
         self.candidate_distance = candidate_distance
         self.review_distance = review_distance
@@ -144,7 +145,18 @@ class FaceAuditAnalyzer:
         self.minimum_sharpness = minimum_sharpness
         self.max_width = max_width
         self.log_identities = log_identities
+        self.detector = detector
         self.unknowns = UnknownTracker()
+        self._haar = None
+        if detector == "haar":
+            if cv2 is None:
+                raise RuntimeError("OpenCV is required for Haar face detection")
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            self._haar = cv2.CascadeClassifier(cascade_path)
+            if self._haar.empty():
+                raise RuntimeError("OpenCV frontal-face detector could not be loaded")
+        elif detector != "hog":
+            raise ValueError(f"Unsupported face detector: {detector}")
         self._token_salt = os.urandom(16)
         loaded_faces = known_faces if known_faces is not None else face_db.load_known_faces()
         self._known_people = {
@@ -216,11 +228,24 @@ class FaceAuditAnalyzer:
             )
 
         rgb = cv2.cvtColor(working, cv2.COLOR_BGR2RGB)
-        locations = face_recognition.face_locations(
-            rgb,
-            number_of_times_to_upsample=1,
-            model="hog",
-        )
+        if self._haar is not None:
+            gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+            boxes = self._haar.detectMultiScale(
+                gray,
+                scaleFactor=1.08,
+                minNeighbors=5,
+                minSize=(20, 20),
+            )
+            locations = [
+                (int(y), int(x + width), int(y + height), int(x))
+                for x, y, width, height in boxes
+            ]
+        else:
+            locations = face_recognition.face_locations(
+                rgb,
+                number_of_times_to_upsample=1,
+                model="hog",
+            )
         encodings = face_recognition.face_encodings(rgb, locations)
         observations: list[dict] = []
 
@@ -391,8 +416,10 @@ def run_audit(
 
     load_dvr_passwords()
     max_width = int(os.environ.get("CPPLUS_FACE_AUDIT_MAX_WIDTH", "720"))
+    detector = os.environ.get("CPPLUS_FACE_AUDIT_DETECTOR", "haar").strip().lower()
     analyzer = FaceAuditAnalyzer(
         max_width=max_width,
+        detector=detector,
         include_students=os.environ.get(
             "CPPLUS_FACE_AUDIT_INCLUDE_STUDENTS", "0"
         ).lower() in {"1", "true", "yes"},
@@ -487,6 +514,7 @@ def run_audit(
         "capture_source": capture_source,
         "stream_frames_read": stream_frames_read,
         "analysis_max_width": max_width,
+        "face_detector": detector,
         "analysis_frame_rate_fps": (
             round(len(records) / runtime_seconds, 2) if runtime_seconds else 0.0
         ),
