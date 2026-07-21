@@ -236,10 +236,17 @@ class FaceAuditAnalyzer:
                 minNeighbors=5,
                 minSize=(20, 20),
             )
-            locations = [
-                (int(y), int(x + width), int(y + height), int(x))
-                for x, y, width, height in boxes
-            ]
+            working_height, working_width = working.shape[:2]
+            locations = []
+            for x, y, width, height in boxes:
+                horizontal_padding = int(round(width * 0.2))
+                vertical_padding = int(round(height * 0.2))
+                locations.append((
+                    max(0, int(y - vertical_padding)),
+                    min(working_width, int(x + width + horizontal_padding)),
+                    min(working_height, int(y + height + vertical_padding)),
+                    max(0, int(x - horizontal_padding)),
+                ))
         else:
             locations = face_recognition.face_locations(
                 rgb,
@@ -345,6 +352,18 @@ def summarize(records: list[dict], analyzer: FaceAuditAnalyzer) -> dict:
         "mode": "audit_only_non_additive",
         "frames_attempted": len(records),
         "frames_captured": successful_frames,
+        "rtsp_frames_analyzed": sum(
+            1
+            for record in records
+            if record.get("frame_ok")
+            and record.get("capture_source") == "rtsp_continuous"
+        ),
+        "http_frames_analyzed": sum(
+            1
+            for record in records
+            if record.get("frame_ok")
+            and record.get("capture_source") == "http_snapshot"
+        ),
         "frames_with_faces": frames_with_faces,
         "face_frame_rate_pct": (
             round(100 * frames_with_faces / successful_frames, 2)

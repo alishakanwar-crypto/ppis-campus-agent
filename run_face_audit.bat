@@ -12,6 +12,7 @@ echo or WhatsApp messages.
 echo.
 
 set "CPPLUS_FACE_AUDIT_ENABLED=1"
+set "CPPLUS_RTSP_SUBTYPE=1"
 python gate_face_audit.py --duration-minutes 10 --interval-seconds 0.25
 
 echo.
