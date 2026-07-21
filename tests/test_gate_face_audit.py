@@ -58,6 +58,17 @@ class FakeCapture:
         self.released = True
 
 
+class ErrorCapture:
+    def __init__(self):
+        self.released = False
+
+    def read(self):
+        raise gate_face_audit.cv2.error("decoder failed")
+
+    def release(self):
+        self.released = True
+
+
 class FakeUnknownTracker:
     count = 0
 
@@ -113,6 +124,19 @@ class GateFaceAuditTests(unittest.TestCase):
         self.assertEqual(observations[0]["candidate_person_id"], "T001")
         self.assertEqual(observations[0]["candidate_category"], "teacher")
         self.assertEqual(observations[0]["review_state"], "pending")
+
+    def test_latest_reader_records_opencv_error_without_thread_traceback(self):
+        capture = ErrorCapture()
+        reader = gate_face_audit.LatestFrameReader(capture)
+        reader.start()
+
+        latest = reader.next_frame(after_sequence=0, timeout=1)
+        reader.close()
+
+        self.assertIsNone(latest)
+        self.assertTrue(reader.failed)
+        self.assertIn("decoder failed", reader.failure_reason)
+        self.assertTrue(capture.released)
 
     @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
     def test_fast_haar_detector_passes_locations_to_face_encoder(self):
@@ -206,6 +230,8 @@ class GateFaceAuditTests(unittest.TestCase):
 
         self.assertTrue(capture.released)
         self.assertEqual(summary["capture_source"], "rtsp_continuous")
+        self.assertFalse(summary["stream_failed"])
+        self.assertIsNone(summary["stream_failure_reason"])
         self.assertGreater(summary["stream_frames_read"], 0)
         self.assertGreater(summary["frames_captured"], 0)
         self.assertGreater(summary["rtsp_frames_analyzed"], 0)

@@ -34,6 +34,7 @@ class LatestFrameReader:
         self.capture = capture
         self.frames_read = 0
         self.failed = False
+        self.failure_reason: str | None = None
         self._condition = threading.Condition()
         self._latest: tuple[int, datetime, np.ndarray] | None = None
         self._stopped = threading.Event()
@@ -44,10 +45,18 @@ class LatestFrameReader:
 
     def _read(self) -> None:
         while not self._stopped.is_set():
-            ok, frame = self.capture.read()
+            try:
+                ok, frame = self.capture.read()
+            except cv2.error as exc:
+                with self._condition:
+                    self.failed = True
+                    self.failure_reason = str(exc) or "OpenCV stream read failed"
+                    self._condition.notify_all()
+                return
             if not ok or frame is None:
                 with self._condition:
                     self.failed = True
+                    self.failure_reason = "Camera stream returned no frame"
                     self._condition.notify_all()
                 return
             captured_at = datetime.now(IST)
@@ -456,6 +465,8 @@ def run_audit(
     capture = open_cpplus_stream(CPPLUS_CAMERAS[0])
     reader = LatestFrameReader(capture) if capture is not None else None
     stream_frames_read = 0
+    stream_failed = False
+    stream_failure_reason = None
     last_sequence = 0
     used_rtsp = reader is not None
     used_http = reader is None
@@ -473,6 +484,8 @@ def run_audit(
                 if latest is None:
                     if reader.failed:
                         stream_frames_read = reader.frames_read
+                        stream_failed = True
+                        stream_failure_reason = reader.failure_reason
                         reader.close()
                         reader = None
                         used_http = True
@@ -515,6 +528,8 @@ def run_audit(
     finally:
         if reader is not None:
             stream_frames_read = reader.frames_read
+            stream_failed = reader.failed
+            stream_failure_reason = reader.failure_reason
             reader.close()
 
     if used_rtsp and used_http:
@@ -532,6 +547,8 @@ def run_audit(
         "camera": CPPLUS_CAMERAS[0]["name"],
         "capture_source": capture_source,
         "stream_frames_read": stream_frames_read,
+        "stream_failed": stream_failed,
+        "stream_failure_reason": stream_failure_reason,
         "analysis_max_width": max_width,
         "face_detector": detector,
         "analysis_frame_rate_fps": (
