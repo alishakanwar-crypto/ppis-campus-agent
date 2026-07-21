@@ -40,7 +40,7 @@ class FakeFaceRecognition:
 class FakeHaarDetector:
     @staticmethod
     def detectMultiScale(image, scaleFactor, minNeighbors, minSize):
-        return [(1, 1, 2, 2)]
+        return [(10, 10, 20, 20)]
 
 
 class FakeCapture:
@@ -131,7 +131,7 @@ class GateFaceAuditTests(unittest.TestCase):
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0]["status"], "candidate_known")
         self.assertEqual(FakeFaceRecognition.location_calls, 0)
-        self.assertEqual(FakeFaceRecognition.encoded_locations, [(1, 3, 3, 1)])
+        self.assertEqual(FakeFaceRecognition.encoded_locations, [(6, 34, 34, 6)])
 
     @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
     def test_default_pilot_excludes_students_and_pseudonymizes_candidates(self):
@@ -208,6 +208,8 @@ class GateFaceAuditTests(unittest.TestCase):
         self.assertEqual(summary["capture_source"], "rtsp_continuous")
         self.assertGreater(summary["stream_frames_read"], 0)
         self.assertGreater(summary["frames_captured"], 0)
+        self.assertGreater(summary["rtsp_frames_analyzed"], 0)
+        self.assertEqual(summary["http_frames_analyzed"], 0)
         self.assertEqual(summary["analysis_max_width"], 720)
         self.assertEqual(summary["face_detector"], "haar")
         self.assertFalse(summary["official_headcount_changed"])
