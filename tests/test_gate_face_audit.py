@@ -1,5 +1,8 @@
+import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -28,6 +31,35 @@ class FakeFaceRecognition:
             np.linalg.norm(known_encoding - encoding)
             for known_encoding in known_encodings
         ])
+
+
+class FakeCapture:
+    def __init__(self):
+        self.released = False
+        self.frame = np.full((40, 40, 3), 127, dtype=np.uint8)
+
+    def read(self):
+        time.sleep(0.002)
+        if self.released:
+            return False, None
+        return True, self.frame.copy()
+
+    def release(self):
+        self.released = True
+
+
+class FakeUnknownTracker:
+    count = 0
+
+
+class FakeAnalyzer:
+    enrolled_people = 1
+    enrollment_images = 2
+    unknowns = FakeUnknownTracker()
+
+    @staticmethod
+    def analyze(frame, captured_at):
+        return []
 
 
 class GateFaceAuditTests(unittest.TestCase):
@@ -112,6 +144,43 @@ class GateFaceAuditTests(unittest.TestCase):
             FakeFaceRecognition.locations = [(1, 3, 3, 1)]
 
         self.assertEqual(observations, [])
+
+    def test_runtime_uses_continuous_rtsp_without_http_snapshot_polling(self):
+        capture = FakeCapture()
+        analyzer = FakeAnalyzer()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(gate_face_audit, "load_dvr_passwords"),
+                patch.object(
+                    gate_face_audit,
+                    "open_cpplus_stream",
+                    return_value=capture,
+                ),
+                patch.object(
+                    gate_face_audit,
+                    "capture_cpplus_frame",
+                    side_effect=AssertionError("HTTP capture should not run"),
+                ),
+                patch.object(
+                    gate_face_audit,
+                    "FaceAuditAnalyzer",
+                    return_value=analyzer,
+                ),
+            ):
+                output_path, summary = gate_face_audit.run_audit(
+                    duration_minutes=0.001,
+                    interval_seconds=0.005,
+                    output_dir=Path(temp_dir),
+                )
+
+            self.assertTrue(output_path.exists())
+
+        self.assertTrue(capture.released)
+        self.assertEqual(summary["capture_source"], "rtsp_continuous")
+        self.assertGreater(summary["stream_frames_read"], 0)
+        self.assertGreater(summary["frames_captured"], 0)
+        self.assertEqual(summary["analysis_max_width"], 720)
+        self.assertFalse(summary["official_headcount_changed"])
 
     @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
     def test_summary_is_explicitly_non_additive(self):

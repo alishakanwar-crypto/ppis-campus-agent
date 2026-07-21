@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import statistics
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,13 +15,74 @@ from pathlib import Path
 import numpy as np
 
 import face_db
-from gate_counter import CPPLUS_CAMERAS, capture_cpplus_frame, load_dvr_passwords
+from gate_counter import (
+    CPPLUS_CAMERAS,
+    capture_cpplus_frame,
+    load_dvr_passwords,
+    open_cpplus_stream,
+)
 
 cv2 = face_db.cv2
 face_recognition = face_db.face_recognition
 
 IST = timezone(timedelta(hours=5, minutes=30))
 DEFAULT_OUTPUT_DIR = Path(__file__).parent / "face_audit_results"
+
+
+class LatestFrameReader:
+    def __init__(self, capture):
+        self.capture = capture
+        self.frames_read = 0
+        self.failed = False
+        self._condition = threading.Condition()
+        self._latest: tuple[int, datetime, np.ndarray] | None = None
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._read, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _read(self) -> None:
+        while not self._stopped.is_set():
+            ok, frame = self.capture.read()
+            if not ok or frame is None:
+                with self._condition:
+                    self.failed = True
+                    self._condition.notify_all()
+                return
+            captured_at = datetime.now(IST)
+            with self._condition:
+                self.frames_read += 1
+                self._latest = (self.frames_read, captured_at, frame)
+                self._condition.notify_all()
+
+    def next_frame(
+        self,
+        after_sequence: int,
+        timeout: float,
+    ) -> tuple[int, datetime, np.ndarray] | None:
+        with self._condition:
+            self._condition.wait_for(
+                lambda: (
+                    self.failed
+                    or self._stopped.is_set()
+                    or (
+                        self._latest is not None
+                        and self._latest[0] > after_sequence
+                    )
+                ),
+                timeout=timeout,
+            )
+            if self._latest is None or self._latest[0] <= after_sequence:
+                return None
+            return self._latest
+
+    def close(self) -> None:
+        self._stopped.set()
+        self.capture.release()
+        with self._condition:
+            self._condition.notify_all()
+        self._thread.join(timeout=2)
 
 
 def _category(role: str) -> str:
@@ -328,7 +390,9 @@ def run_audit(
         raise RuntimeError("CP Plus camera is disabled")
 
     load_dvr_passwords()
+    max_width = int(os.environ.get("CPPLUS_FACE_AUDIT_MAX_WIDTH", "720"))
     analyzer = FaceAuditAnalyzer(
+        max_width=max_width,
         include_students=os.environ.get(
             "CPPLUS_FACE_AUDIT_INCLUDE_STUDENTS", "0"
         ).lower() in {"1", "true", "yes"},
@@ -341,42 +405,91 @@ def run_audit(
     started_at = datetime.now(IST)
     output_path = output_dir / f"face_audit_{started_at.strftime('%Y%m%dT%H%M%S')}.jsonl"
     records: list[dict] = []
-    deadline = time.monotonic() + duration_minutes * 60
+    started_monotonic = time.monotonic()
+    deadline = started_monotonic + duration_minutes * 60
+    capture = open_cpplus_stream(CPPLUS_CAMERAS[0])
+    reader = LatestFrameReader(capture) if capture is not None else None
+    stream_frames_read = 0
+    last_sequence = 0
+    used_rtsp = reader is not None
+    used_http = reader is None
+    if reader is not None:
+        reader.start()
 
-    while time.monotonic() < deadline:
-        captured_at = datetime.now(IST)
-        processing_started = time.monotonic()
-        frame = capture_cpplus_frame(CPPLUS_CAMERAS[0])
-        if frame is None:
-            record = {
-                "captured_at": captured_at.strftime("%d-%m-%Y %H:%M:%S IST"),
-                "camera": CPPLUS_CAMERAS[0]["name"],
-                "frame_ok": False,
-                "processing_seconds": round(time.monotonic() - processing_started, 3),
-                "observations": [],
-            }
-        else:
-            observations = analyzer.analyze(frame, captured_at)
-            record = {
-                "captured_at": captured_at.strftime("%d-%m-%Y %H:%M:%S IST"),
-                "camera": CPPLUS_CAMERAS[0]["name"],
-                "frame_ok": True,
-                "frame_width": int(frame.shape[1]),
-                "frame_height": int(frame.shape[0]),
-                "processing_seconds": round(time.monotonic() - processing_started, 3),
-                "observations": observations,
-            }
-        records.append(record)
-        _secure_append(output_path, record)
-        remaining = interval_seconds - (time.monotonic() - processing_started)
-        if remaining > 0:
-            time.sleep(remaining)
+    try:
+        while time.monotonic() < deadline:
+            processing_started = time.monotonic()
+            capture_source = "http_snapshot"
+            if reader is not None:
+                capture_source = "rtsp_continuous"
+                wait_seconds = min(2.0, max(0.01, deadline - time.monotonic()))
+                latest = reader.next_frame(last_sequence, wait_seconds)
+                if latest is None:
+                    if reader.failed:
+                        stream_frames_read = reader.frames_read
+                        reader.close()
+                        reader = None
+                        used_http = True
+                    continue
+                last_sequence, captured_at, frame = latest
+            else:
+                captured_at = datetime.now(IST)
+                frame = capture_cpplus_frame(CPPLUS_CAMERAS[0])
 
+            if frame is None:
+                record = {
+                    "captured_at": captured_at.strftime("%d-%m-%Y %H:%M:%S IST"),
+                    "camera": CPPLUS_CAMERAS[0]["name"],
+                    "capture_source": capture_source,
+                    "frame_ok": False,
+                    "processing_seconds": round(
+                        time.monotonic() - processing_started, 3
+                    ),
+                    "observations": [],
+                }
+            else:
+                observations = analyzer.analyze(frame, captured_at)
+                record = {
+                    "captured_at": captured_at.strftime("%d-%m-%Y %H:%M:%S IST"),
+                    "camera": CPPLUS_CAMERAS[0]["name"],
+                    "capture_source": capture_source,
+                    "frame_ok": True,
+                    "frame_width": int(frame.shape[1]),
+                    "frame_height": int(frame.shape[0]),
+                    "processing_seconds": round(
+                        time.monotonic() - processing_started, 3
+                    ),
+                    "observations": observations,
+                }
+            records.append(record)
+            _secure_append(output_path, record)
+            remaining = interval_seconds - (time.monotonic() - processing_started)
+            if remaining > 0:
+                time.sleep(remaining)
+    finally:
+        if reader is not None:
+            stream_frames_read = reader.frames_read
+            reader.close()
+
+    if used_rtsp and used_http:
+        capture_source = "rtsp_continuous_then_http_snapshot"
+    elif used_rtsp:
+        capture_source = "rtsp_continuous"
+    else:
+        capture_source = "http_snapshot"
+
+    runtime_seconds = time.monotonic() - started_monotonic
     summary = summarize(records, analyzer)
     summary.update({
         "started_at": started_at.strftime("%d-%m-%Y %H:%M:%S IST"),
         "completed_at": datetime.now(IST).strftime("%d-%m-%Y %H:%M:%S IST"),
         "camera": CPPLUS_CAMERAS[0]["name"],
+        "capture_source": capture_source,
+        "stream_frames_read": stream_frames_read,
+        "analysis_max_width": max_width,
+        "analysis_frame_rate_fps": (
+            round(len(records) / runtime_seconds, 2) if runtime_seconds else 0.0
+        ),
     })
     _secure_append(output_path, {"summary": summary})
     return output_path, summary

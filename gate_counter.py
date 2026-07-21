@@ -49,7 +49,6 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-import io
 import json
 import logging
 import math
@@ -538,7 +537,7 @@ def capture_camera_frame(cam: dict) -> np.ndarray | None:
     return capture_gate_frame(cam["channel"], cam["dvr_ip"])
 
 
-def _open_cpplus_stream(cam: dict):
+def open_cpplus_stream(cam: dict):
     """Open a persistent, low-latency RTSP stream to the CP Plus camera.
 
     Returns an opened cv2.VideoCapture (buffer size 1 so reads stay current) or
@@ -647,7 +646,7 @@ def run_cpplus_worker(cam: dict):
             if cap is not None:
                 cap.release()
                 cap = None
-            cap = _open_cpplus_stream(cam)
+            cap = open_cpplus_stream(cam)
 
         frame = None
         if cap is not None:
@@ -890,7 +889,7 @@ def run_cpplus_local_recorder(cam: dict) -> None:
             if cap is None or not cap.isOpened():
                 if cap is not None:
                     cap.release()
-                cap = _open_cpplus_stream(cam)
+                cap = open_cpplus_stream(cam)
                 if cap is None:
                     time.sleep(2)
                     continue
