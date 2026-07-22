@@ -147,6 +147,7 @@ class FaceAuditAnalyzer:
         include_students: bool = False,
         log_identities: bool = False,
         detector: str = "hog",
+        multi_frame_window_seconds: float = 10.0,
     ):
         self.candidate_distance = candidate_distance
         self.review_distance = review_distance
@@ -156,6 +157,7 @@ class FaceAuditAnalyzer:
         self.max_width = max_width
         self.log_identities = log_identities
         self.detector = detector
+        self.multi_frame_window_seconds = multi_frame_window_seconds
         self.unknowns = UnknownTracker()
         self._haar = None
         if detector == "haar":
@@ -177,6 +179,12 @@ class FaceAuditAnalyzer:
         self._encodings: list[np.ndarray] = []
         self._encoding_people: list[str] = []
         self._last_seen: dict[str, float] = {}
+        self._review_evidence: dict[
+            tuple[str, str],
+            list[tuple[float, float]],
+        ] = {}
+        self._best_review_distance: dict[tuple[str, str], float] = {}
+        self._multi_frame_review_candidates: set[tuple[str, str]] = set()
 
         for person_id, person in self._known_people.items():
             for encoding in person.get("encodings", []):
@@ -190,6 +198,10 @@ class FaceAuditAnalyzer:
     @property
     def enrollment_images(self) -> int:
         return len(self._encodings)
+
+    @property
+    def multi_frame_review_candidates(self) -> int:
+        return len(self._multi_frame_review_candidates)
 
     def _match(self, encoding: np.ndarray) -> tuple[str | None, float | None, float | None]:
         if not self._encodings:
@@ -263,13 +275,31 @@ class FaceAuditAnalyzer:
                 number_of_times_to_upsample=1,
                 model="hog",
             )
-        encodings = face_recognition.face_encodings(rgb, locations)
+        encoding_locations = [
+            (
+                max(0, min(original_height, int(round(top / scale)))),
+                max(0, min(original_width, int(round(right / scale)))),
+                max(0, min(original_height, int(round(bottom / scale)))),
+                max(0, min(original_width, int(round(left / scale)))),
+            )
+            for top, right, bottom, left in locations
+        ]
+        encoding_rgb = (
+            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if scale < 1.0 else rgb
+        )
+        encodings = face_recognition.face_encodings(
+            encoding_rgb,
+            encoding_locations,
+        )
         observations: list[dict] = []
 
-        for location, encoding in zip(locations, encodings):
+        for location, encoding in zip(encoding_locations, encodings):
             top, right, bottom, left = location
-            face_width = max(0, int((right - left) / scale))
-            face_crop = working[max(0, top):max(0, bottom), max(0, left):max(0, right)]
+            face_width = max(0, right - left)
+            face_crop = frame[
+                max(0, top):max(0, bottom),
+                max(0, left):max(0, right),
+            ]
             if face_crop.size:
                 gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
                 sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
@@ -313,6 +343,9 @@ class FaceAuditAnalyzer:
                     round(second_distance, 4) if second_distance is not None else None
                 ),
                 "match_margin": round(margin, 4) if margin is not None else None,
+                "candidate_support_frames": 0,
+                "multi_frame_review_candidate": False,
+                "best_evidence_so_far": False,
                 "review_state": "pending",
             }
 
@@ -338,6 +371,26 @@ class FaceAuditAnalyzer:
                     "continuous_duplicate": repeated,
                 })
                 if review_match and person_id is not None:
+                    evidence_key = (temp_id, person_id)
+                    best_distance = self._best_review_distance.get(evidence_key)
+                    observation["best_evidence_so_far"] = (
+                        best_distance is None or distance < best_distance
+                    )
+                    if observation["best_evidence_so_far"]:
+                        self._best_review_distance[evidence_key] = distance
+                    if margin is None or margin >= self.minimum_margin:
+                        now_ts = captured_at.timestamp()
+                        evidence = [
+                            item
+                            for item in self._review_evidence.get(evidence_key, [])
+                            if now_ts - item[0] <= self.multi_frame_window_seconds
+                        ]
+                        evidence.append((now_ts, distance))
+                        self._review_evidence[evidence_key] = evidence
+                        observation["candidate_support_frames"] = len(evidence)
+                        if len(evidence) >= 3:
+                            observation["multi_frame_review_candidate"] = True
+                            self._multi_frame_review_candidates.add(evidence_key)
                     observation.update(self._identity_fields(person_id))
             observations.append(observation)
 
@@ -392,6 +445,7 @@ def summarize(records: list[dict], analyzer: FaceAuditAnalyzer) -> dict:
         ),
         "unknown": sum(1 for item in observations if item["status"] == "unknown"),
         "temporary_unknown_profiles": analyzer.unknowns.count,
+        "multi_frame_review_candidates": analyzer.multi_frame_review_candidates,
         "enrolled_people": analyzer.enrolled_people,
         "enrollment_images": analyzer.enrollment_images,
         "median_face_width_px": (
@@ -444,7 +498,7 @@ def run_audit(
         raise RuntimeError("CP Plus camera is disabled")
 
     load_dvr_passwords()
-    max_width = int(os.environ.get("CPPLUS_FACE_AUDIT_MAX_WIDTH", "720"))
+    max_width = int(os.environ.get("CPPLUS_FACE_AUDIT_MAX_WIDTH", "960"))
     detector = os.environ.get("CPPLUS_FACE_AUDIT_DETECTOR", "haar").strip().lower()
     analyzer = FaceAuditAnalyzer(
         max_width=max_width,
@@ -552,6 +606,7 @@ def run_audit(
         "stream_failure_reason": stream_failure_reason,
         "stopped_early": not gate_counter.running,
         "analysis_max_width": max_width,
+        "full_resolution_encoding": True,
         "face_detector": detector,
         "analysis_frame_rate_fps": (
             round(len(records) / runtime_seconds, 2) if runtime_seconds else 0.0
