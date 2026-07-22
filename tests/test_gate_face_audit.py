@@ -1,3 +1,4 @@
+import json
 import tempfile
 import time
 import unittest
@@ -358,6 +359,70 @@ class GateFaceAuditTests(unittest.TestCase):
         self.assertTrue(capture.released)
         self.assertEqual(summary["frames_attempted"], 0)
         self.assertTrue(summary["stopped_early"])
+
+    def test_repeated_face_track_maps_to_at_most_one_crossing(self):
+        records = [
+            {
+                "observations": [{
+                    "captured_at": (
+                        self.now + timedelta(seconds=seconds)
+                    ).strftime("%d-%m-%Y %H:%M:%S IST"),
+                    "quality_ok": True,
+                    "temporary_id": "visitor-1",
+                    "status": "unknown",
+                    "face_width_px": 80,
+                    "match_distance": None,
+                    "match_margin": None,
+                }],
+            }
+            for seconds in (0, 1)
+        ]
+        crossings = [
+            {
+                "event_id": f"crossing-{index}",
+                "timestamp": (
+                    self.now + timedelta(seconds=index)
+                ).strftime("%d-%m-%Y %H:%M:%S IST"),
+                "direction": "IN",
+            }
+            for index in range(2)
+        ]
+
+        profiles = gate_face_audit.correlate_crossing_evidence(
+            records,
+            crossings,
+        )
+
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]["crossing_event_id"], "crossing-0")
+        self.assertEqual(profiles[0]["temporary_id"], "visitor-1")
+        self.assertEqual(profiles[0]["review_state"], "pending")
+
+    def test_crossing_ledger_excludes_images_and_names(self):
+        event = {
+            "event_id": "crossing-1",
+            "timestamp": self.now.strftime("%d-%m-%Y %H:%M:%S IST"),
+            "camera": "ENTRY GATE-OUTSIDE (CP Plus)",
+            "direction": "IN",
+            "tracker_id": 7,
+            "attire_color": "blue",
+            "bbox_height_ratio": 0.5,
+            "bbox_width_ratio": 0.2,
+            "daily_in": 1,
+            "daily_out": 0,
+            "person_crop": "private-image",
+            "name": "Private Person",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = gate_face_audit.gate_counter._append_cpplus_crossing_audit(
+                [event],
+                Path(temp_dir),
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertNotIn("person_crop", payload)
+        self.assertNotIn("name", payload)
+        self.assertEqual(payload["event_id"], "crossing-1")
 
     @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
     def test_summary_is_explicitly_non_additive(self):
