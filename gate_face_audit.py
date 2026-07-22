@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 
 import face_db
+import gate_counter
 from gate_counter import (
     CPPLUS_CAMERAS,
     capture_cpplus_frame,
@@ -474,7 +475,7 @@ def run_audit(
         reader.start()
 
     try:
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and gate_counter.running:
             processing_started = time.monotonic()
             capture_source = "http_snapshot"
             if reader is not None:
@@ -549,6 +550,7 @@ def run_audit(
         "stream_frames_read": stream_frames_read,
         "stream_failed": stream_failed,
         "stream_failure_reason": stream_failure_reason,
+        "stopped_early": not gate_counter.running,
         "analysis_max_width": max_width,
         "face_detector": detector,
         "analysis_frame_rate_fps": (

@@ -204,6 +204,7 @@ class GateFaceAuditTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch.object(gate_face_audit, "load_dvr_passwords"),
+                patch.object(gate_face_audit.gate_counter, "running", True),
                 patch.object(
                     gate_face_audit,
                     "open_cpplus_stream",
@@ -239,6 +240,34 @@ class GateFaceAuditTests(unittest.TestCase):
         self.assertEqual(summary["analysis_max_width"], 720)
         self.assertEqual(summary["face_detector"], "haar")
         self.assertFalse(summary["official_headcount_changed"])
+        self.assertFalse(summary["stopped_early"])
+
+    def test_runtime_honors_signal_shutdown_flag(self):
+        capture = FakeCapture()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(gate_face_audit, "load_dvr_passwords"),
+                patch.object(gate_face_audit.gate_counter, "running", False),
+                patch.object(
+                    gate_face_audit,
+                    "open_cpplus_stream",
+                    return_value=capture,
+                ),
+                patch.object(
+                    gate_face_audit,
+                    "FaceAuditAnalyzer",
+                    return_value=FakeAnalyzer(),
+                ),
+            ):
+                _, summary = gate_face_audit.run_audit(
+                    duration_minutes=10,
+                    interval_seconds=0.005,
+                    output_dir=Path(temp_dir),
+                )
+
+        self.assertTrue(capture.released)
+        self.assertEqual(summary["frames_attempted"], 0)
+        self.assertTrue(summary["stopped_early"])
 
     @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
     def test_summary_is_explicitly_non_additive(self):
