@@ -18,6 +18,7 @@ class FakeFaceRecognition:
     locations = [(1, 3, 3, 1)]
     location_calls = 0
     encoded_locations = []
+    encoded_image_shape = None
 
     @classmethod
     def face_locations(cls, image, number_of_times_to_upsample=1, model="hog"):
@@ -27,6 +28,7 @@ class FakeFaceRecognition:
     @classmethod
     def face_encodings(cls, image, locations):
         cls.encoded_locations = locations
+        cls.encoded_image_shape = image.shape
         return [cls.encoding.copy() for _ in locations]
 
     @staticmethod
@@ -76,6 +78,7 @@ class FakeUnknownTracker:
 class FakeAnalyzer:
     enrolled_people = 1
     enrollment_images = 2
+    multi_frame_review_candidates = 0
     unknowns = FakeUnknownTracker()
 
     @staticmethod
@@ -158,6 +161,25 @@ class GateFaceAuditTests(unittest.TestCase):
         self.assertEqual(FakeFaceRecognition.encoded_locations, [(6, 34, 34, 6)])
 
     @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
+    def test_encodes_detected_faces_against_full_resolution_frame(self):
+        FakeFaceRecognition.encoding = np.array([0.0, 0.0])
+        full_resolution_frame = np.full((100, 200, 3), 127, dtype=np.uint8)
+        analyzer = gate_face_audit.FaceAuditAnalyzer(
+            known_faces=self.known_faces,
+            minimum_face_width=1,
+            minimum_sharpness=0,
+            max_width=100,
+            detector="haar",
+        )
+        analyzer._haar = FakeHaarDetector()
+
+        observation = analyzer.analyze(full_resolution_frame, self.now)[0]
+
+        self.assertEqual(FakeFaceRecognition.encoded_image_shape, (100, 200, 3))
+        self.assertEqual(FakeFaceRecognition.encoded_locations, [(12, 68, 68, 12)])
+        self.assertEqual(observation["face_width_px"], 56)
+
+    @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
     def test_default_pilot_excludes_students_and_pseudonymizes_candidates(self):
         FakeFaceRecognition.encoding = np.array([0.0, 0.0])
         analyzer = gate_face_audit.FaceAuditAnalyzer(
@@ -187,6 +209,73 @@ class GateFaceAuditTests(unittest.TestCase):
         self.assertEqual(second["temporary_id"], "Unknown-001")
         self.assertTrue(second["continuous_duplicate"])
         self.assertEqual(analyzer.unknowns.count, 1)
+
+    @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
+    def test_repeated_review_match_builds_manual_review_consensus(self):
+        FakeFaceRecognition.encoding = np.array([0.6, 0.0])
+        analyzer = self._analyzer()
+
+        observations = [
+            analyzer.analyze(self.frame, self.now + timedelta(seconds=index))[0]
+            for index in range(3)
+        ]
+
+        self.assertEqual(observations[0]["status"], "unknown_needs_verification")
+        self.assertTrue(observations[0]["best_evidence_so_far"])
+        self.assertFalse(observations[1]["best_evidence_so_far"])
+        self.assertEqual(observations[2]["candidate_support_frames"], 3)
+        self.assertTrue(observations[2]["multi_frame_review_candidate"])
+        self.assertEqual(analyzer.multi_frame_review_candidates, 1)
+
+    @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
+    def test_review_consensus_requires_observations_in_short_window(self):
+        FakeFaceRecognition.encoding = np.array([0.6, 0.0])
+        analyzer = gate_face_audit.FaceAuditAnalyzer(
+            known_faces=self.known_faces,
+            minimum_face_width=1,
+            minimum_sharpness=0,
+            log_identities=True,
+            multi_frame_window_seconds=5,
+        )
+
+        observations = [
+            analyzer.analyze(self.frame, self.now + timedelta(seconds=index * 6))[0]
+            for index in range(3)
+        ]
+
+        self.assertEqual(observations[-1]["candidate_support_frames"], 1)
+        self.assertFalse(observations[-1]["multi_frame_review_candidate"])
+        self.assertEqual(analyzer.multi_frame_review_candidates, 0)
+
+    @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
+    def test_ambiguous_matches_do_not_build_manual_review_consensus(self):
+        FakeFaceRecognition.encoding = np.array([0.51, 0.0])
+        known_faces = {
+            "T001": {
+                "name": "Teacher One",
+                "role": "teacher",
+                "encodings": [np.array([0.0, 0.0])],
+            },
+            "T002": {
+                "name": "Teacher Two",
+                "role": "teacher",
+                "encodings": [np.array([1.03, 0.0])],
+            },
+        }
+        analyzer = gate_face_audit.FaceAuditAnalyzer(
+            known_faces=known_faces,
+            minimum_face_width=1,
+            minimum_sharpness=0,
+        )
+
+        observations = [
+            analyzer.analyze(self.frame, self.now + timedelta(seconds=index))[0]
+            for index in range(3)
+        ]
+
+        self.assertEqual(observations[-1]["candidate_support_frames"], 0)
+        self.assertFalse(observations[-1]["multi_frame_review_candidate"])
+        self.assertEqual(analyzer.multi_frame_review_candidates, 0)
 
     @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
     def test_no_face_produces_no_identity_observation(self):
@@ -237,7 +326,8 @@ class GateFaceAuditTests(unittest.TestCase):
         self.assertGreater(summary["frames_captured"], 0)
         self.assertGreater(summary["rtsp_frames_analyzed"], 0)
         self.assertEqual(summary["http_frames_analyzed"], 0)
-        self.assertEqual(summary["analysis_max_width"], 720)
+        self.assertEqual(summary["analysis_max_width"], 960)
+        self.assertTrue(summary["full_resolution_encoding"])
         self.assertEqual(summary["face_detector"], "haar")
         self.assertFalse(summary["official_headcount_changed"])
         self.assertFalse(summary["stopped_early"])
