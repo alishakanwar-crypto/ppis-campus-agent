@@ -636,6 +636,43 @@ def _append_cpplus_crossing_audit(
     return path
 
 
+def _append_cpplus_tracker_trace(
+    samples: list[dict],
+    output_dir: Path = CPPLUS_CROSSING_AUDIT_DIR,
+) -> Path | None:
+    if not samples:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"c1_tracker_trace_{datetime.now(IST).strftime('%Y%m%d')}.jsonl"
+    is_new = not path.exists()
+    with _CPPLUS_CROSSING_AUDIT_LOCK, path.open("a", encoding="utf-8") as handle:
+        for sample in samples:
+            payload = {
+                key: sample[key]
+                for key in (
+                    "timestamp",
+                    "tracker_id",
+                    "line_axis",
+                    "line_position_ratio",
+                    "line_hysteresis_ratio",
+                    "anchor_x_ratio",
+                    "anchor_y_ratio",
+                    "line_side",
+                    "bbox_height_ratio",
+                    "bbox_width_ratio",
+                )
+                if key in sample
+            }
+            handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+    if is_new:
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    return path
+
+
 def run_cpplus_worker(cam: dict):
     """Dedicated head-count loop for the CP Plus outside gate camera.
 
@@ -664,6 +701,7 @@ def run_cpplus_worker(cam: dict):
     cap = None
     min_interval = 1.0 / CPPLUS_TARGET_FPS if CPPLUS_TARGET_FPS > 0 else 0.0
     reconnect_backoff = 2.0
+    tracker_trace_last_sample: dict[int, float] = {}
 
     logger.info("CP Plus worker started for %s (target %.1f FPS)", cam_name, CPPLUS_TARGET_FPS)
 
@@ -684,6 +722,7 @@ def run_cpplus_worker(cam: dict):
             current_date = today
             daily_in = 0
             daily_out = 0
+            tracker_trace_last_sample.clear()
             tracker = CentroidTracker(
                 max_disappeared=max(
                     MAX_DISAPPEARED,
@@ -740,6 +779,37 @@ def run_cpplus_worker(cam: dict):
         events: list[dict] = []
         audit_events: list[dict] = []
         now = datetime.now(IST)
+        crossing_audit_active = _cpplus_crossing_audit_active()
+        if crossing_audit_active:
+            sample_time = time.monotonic()
+            trace_samples: list[dict] = []
+            for tracker_id, anchor in tracker.objects.items():
+                if tracker.disappeared.get(tracker_id, 0) > 0:
+                    continue
+                if sample_time - tracker_trace_last_sample.get(tracker_id, 0) < 1.0:
+                    continue
+                x1, y1, x2, y2 = tracker.bboxes[tracker_id]
+                line_coordinate = tracker._line_coordinate(anchor)
+                trace_samples.append({
+                    "timestamp": now.strftime("%d-%m-%Y %H:%M:%S IST"),
+                    "tracker_id": tracker_id,
+                    "line_axis": tracker.line_axis,
+                    "line_position_ratio": round(tracker.line_y / line_dimension, 4),
+                    "line_hysteresis_ratio": round(
+                        tracker.line_hysteresis / line_dimension, 4
+                    ),
+                    "anchor_x_ratio": round(float(anchor[0]) / frame_w, 4),
+                    "anchor_y_ratio": round(float(anchor[1]) / frame_h, 4),
+                    "line_side": tracker._line_side(line_coordinate),
+                    "bbox_height_ratio": round(max(0, y2 - y1) / frame_h, 4),
+                    "bbox_width_ratio": round(max(0, x2 - x1) / frame_w, 4),
+                })
+                tracker_trace_last_sample[tracker_id] = sample_time
+            if trace_samples:
+                try:
+                    _append_cpplus_tracker_trace(trace_samples)
+                except OSError as exc:
+                    logger.warning("Could not append C1 tracker trace: %s", exc)
         for cr in crossings:
             raw_dir = cr["direction"]
             positive_direction_is_in = (
@@ -794,7 +864,7 @@ def run_cpplus_worker(cam: dict):
             logger.info("%s: %s person #%d at %s — %s attire — Day IN=%d OUT=%d",
                         cam_name, person_dir, cr["id"], ts, attire_color, daily_in, daily_out)
 
-        if audit_events and _cpplus_crossing_audit_active():
+        if audit_events and crossing_audit_active:
             try:
                 _append_cpplus_crossing_audit(audit_events)
             except OSError as exc:
