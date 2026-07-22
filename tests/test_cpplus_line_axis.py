@@ -1,9 +1,17 @@
 import unittest
 
-from gate_counter import CentroidTracker
+from gate_counter import (
+    CPPLUS_IN_LEFT_TO_RIGHT,
+    CPPLUS_LINE_AXIS,
+    CentroidTracker,
+)
 
 
 class CPPlusLineAxisTests(unittest.TestCase):
+    def test_cpplus_defaults_to_left_to_right_vertical_entry_boundary(self):
+        self.assertEqual(CPPLUS_LINE_AXIS, "vertical")
+        self.assertTrue(CPPLUS_IN_LEFT_TO_RIGHT)
+
     def test_vertical_entry_boundary_counts_diagonal_approach(self):
         tracker = CentroidTracker(max_distance=100, line_axis="vertical")
         tracker.set_line(50, hysteresis=2)

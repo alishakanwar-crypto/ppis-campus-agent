@@ -158,9 +158,9 @@ CPPLUS_LINE_HYSTERESIS = float(os.environ.get("CPPLUS_LINE_HYSTERESIS", "0.04"))
 CPPLUS_TRACK_MAX_GAP_SECONDS = float(
     os.environ.get("CPPLUS_TRACK_MAX_GAP_SECONDS", "5")
 )
-CPPLUS_LINE_AXIS = os.environ.get("CPPLUS_LINE_AXIS", "horizontal").strip().lower()
+CPPLUS_LINE_AXIS = os.environ.get("CPPLUS_LINE_AXIS", "vertical").strip().lower()
 if CPPLUS_LINE_AXIS not in {"horizontal", "vertical"}:
-    CPPLUS_LINE_AXIS = "horizontal"
+    CPPLUS_LINE_AXIS = "vertical"
 
 # Record the main RTSP stream on the school PC, then recount each completed
 # hour. Onboard SD playback remains a secondary source and live detections are
