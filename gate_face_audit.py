@@ -528,6 +528,81 @@ def _load_crossings(
     return sorted(crossings, key=lambda item: item["timestamp"])
 
 
+def _load_tracker_traces(
+    started_at: datetime,
+    completed_at: datetime,
+    audit_dir: Path = DEFAULT_CROSSING_AUDIT_DIR,
+) -> list[dict]:
+    traces: list[dict] = []
+    if not audit_dir.exists():
+        return traces
+    for path in audit_dir.glob("c1_tracker_trace_*.jsonl"):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                sample = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(sample, dict):
+                continue
+            observed_at = _parse_audit_timestamp(sample.get("timestamp"))
+            if observed_at is not None and started_at <= observed_at <= completed_at:
+                traces.append(sample)
+    return traces
+
+
+def summarize_tracker_traces(traces: list[dict]) -> dict:
+    sides_by_tracker: dict[int, set[int]] = {}
+    nearest_line_distance: float | None = None
+    tracks_reaching_line_band: set[int] = set()
+    line_axes: set[str] = set()
+    for sample in traces:
+        tracker_id = sample.get("tracker_id")
+        line_axis = sample.get("line_axis")
+        if not isinstance(tracker_id, int) or line_axis not in {
+            "horizontal",
+            "vertical",
+        }:
+            continue
+        line_axes.add(line_axis)
+        side = sample.get("line_side")
+        if side in {-1, 0, 1}:
+            sides_by_tracker.setdefault(tracker_id, set()).add(side)
+            if side == 0:
+                tracks_reaching_line_band.add(tracker_id)
+        anchor_key = "anchor_x_ratio" if line_axis == "vertical" else "anchor_y_ratio"
+        try:
+            distance = abs(
+                float(sample[anchor_key]) - float(sample["line_position_ratio"])
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        nearest_line_distance = (
+            distance
+            if nearest_line_distance is None
+            else min(nearest_line_distance, distance)
+        )
+
+    return {
+        "tracker_trace_samples": len(traces),
+        "tracker_tracks_observed": len(sides_by_tracker),
+        "tracker_tracks_reaching_line_band": len(tracks_reaching_line_band),
+        "tracker_tracks_observed_on_both_sides": sum(
+            1 for sides in sides_by_tracker.values() if {-1, 1}.issubset(sides)
+        ),
+        "tracker_nearest_line_distance_ratio": (
+            round(nearest_line_distance, 4)
+            if nearest_line_distance is not None
+            else None
+        ),
+        "tracker_line_axes": sorted(line_axes),
+        "tracker_trace_only_non_additive": True,
+    }
+
+
 def correlate_crossing_evidence(
     records: list[dict],
     crossings: list[dict],
@@ -748,11 +823,13 @@ def run_audit(
     runtime_seconds = time.monotonic() - started_monotonic
     completed_at = datetime.now(IST)
     crossings = _load_crossings(started_at, completed_at)
+    tracker_traces = _load_tracker_traces(started_at, completed_at)
     evidence_profiles = correlate_crossing_evidence(records, crossings)
     for profile in evidence_profiles:
         _secure_append(output_path, {"crossing_evidence_profile": profile})
 
     summary = summarize(records, analyzer)
+    summary.update(summarize_tracker_traces(tracker_traces))
     summary.update({
         "started_at": started_at.strftime("%d-%m-%Y %H:%M:%S IST"),
         "completed_at": completed_at.strftime("%d-%m-%Y %H:%M:%S IST"),

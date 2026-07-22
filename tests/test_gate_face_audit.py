@@ -424,6 +424,55 @@ class GateFaceAuditTests(unittest.TestCase):
         self.assertNotIn("name", payload)
         self.assertEqual(payload["event_id"], "crossing-1")
 
+    def test_tracker_trace_excludes_images_names_and_clothing(self):
+        sample = {
+            "timestamp": self.now.strftime("%d-%m-%Y %H:%M:%S IST"),
+            "tracker_id": 7,
+            "line_axis": "vertical",
+            "line_position_ratio": 0.5,
+            "line_hysteresis_ratio": 0.04,
+            "anchor_x_ratio": 0.4,
+            "anchor_y_ratio": 0.6,
+            "line_side": -1,
+            "bbox_height_ratio": 0.5,
+            "bbox_width_ratio": 0.2,
+            "person_crop": "private-image",
+            "name": "Private Person",
+            "attire_color": "blue",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = gate_face_audit.gate_counter._append_cpplus_tracker_trace(
+                [sample],
+                Path(temp_dir),
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertNotIn("person_crop", payload)
+        self.assertNotIn("name", payload)
+        self.assertNotIn("attire_color", payload)
+        self.assertEqual(payload["tracker_id"], 7)
+
+    def test_tracker_trace_summary_exposes_missed_crossing_evidence(self):
+        traces = [
+            {
+                "tracker_id": 7,
+                "line_axis": "vertical",
+                "line_position_ratio": 0.5,
+                "anchor_x_ratio": anchor_x,
+                "line_side": side,
+            }
+            for anchor_x, side in ((0.4, -1), (0.49, 0), (0.6, 1))
+        ]
+
+        summary = gate_face_audit.summarize_tracker_traces(traces)
+
+        self.assertEqual(summary["tracker_trace_samples"], 3)
+        self.assertEqual(summary["tracker_tracks_observed"], 1)
+        self.assertEqual(summary["tracker_tracks_reaching_line_band"], 1)
+        self.assertEqual(summary["tracker_tracks_observed_on_both_sides"], 1)
+        self.assertEqual(summary["tracker_nearest_line_distance_ratio"], 0.01)
+        self.assertTrue(summary["tracker_trace_only_non_additive"])
+
     @patch.object(gate_face_audit, "face_recognition", FakeFaceRecognition)
     def test_summary_is_explicitly_non_additive(self):
         FakeFaceRecognition.encoding = np.array([0.0, 0.0])
