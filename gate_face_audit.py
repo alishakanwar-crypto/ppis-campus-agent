@@ -28,6 +28,12 @@ face_recognition = face_db.face_recognition
 
 IST = timezone(timedelta(hours=5, minutes=30))
 DEFAULT_OUTPUT_DIR = Path(__file__).parent / "face_audit_results"
+DEFAULT_CROSSING_AUDIT_DIR = Path(
+    os.environ.get(
+        "CPPLUS_CROSSING_AUDIT_DIR",
+        str(DEFAULT_OUTPUT_DIR),
+    )
+)
 
 
 class LatestFrameReader:
@@ -489,6 +495,141 @@ def _cleanup_old_reports(output_dir: Path, retention_days: int) -> None:
             continue
 
 
+def _parse_audit_timestamp(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, "%d-%m-%Y %H:%M:%S IST").replace(tzinfo=IST)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_crossings(
+    started_at: datetime,
+    completed_at: datetime,
+    audit_dir: Path = DEFAULT_CROSSING_AUDIT_DIR,
+) -> list[dict]:
+    crossings: list[dict] = []
+    if not audit_dir.exists():
+        return crossings
+    for path in audit_dir.glob("c1_crossings_*.jsonl"):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                crossing = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(crossing, dict):
+                continue
+            observed_at = _parse_audit_timestamp(crossing.get("timestamp"))
+            if observed_at is not None and started_at <= observed_at <= completed_at:
+                crossings.append(crossing)
+    return sorted(crossings, key=lambda item: item["timestamp"])
+
+
+def correlate_crossing_evidence(
+    records: list[dict],
+    crossings: list[dict],
+    window_seconds: float = 5.0,
+) -> list[dict]:
+    track_episodes: dict[str, list[list[tuple[datetime, dict]]]] = {}
+    for record in records:
+        for observation in record.get("observations", []):
+            if not observation.get("quality_ok"):
+                continue
+            observed_at = _parse_audit_timestamp(observation.get("captured_at"))
+            base_track_key = observation.get("candidate_token") or observation.get(
+                "temporary_id"
+            )
+            if observed_at is None or not base_track_key:
+                continue
+            episodes = track_episodes.setdefault(base_track_key, [])
+            if (
+                not episodes
+                or (observed_at - episodes[-1][-1][0]).total_seconds()
+                > window_seconds
+            ):
+                episodes.append([])
+            episodes[-1].append((observed_at, observation))
+
+    tracks = {
+        f"{base_track_key}:{index}": episode
+        for base_track_key, episodes in track_episodes.items()
+        for index, episode in enumerate(episodes)
+    }
+
+    profiles: list[dict] = []
+    used_tracks: set[str] = set()
+    status_rank = {
+        "candidate_known": 3,
+        "unknown_needs_verification": 2,
+        "unknown": 1,
+    }
+    for crossing in crossings:
+        crossing_at = _parse_audit_timestamp(crossing.get("timestamp"))
+        if crossing_at is None:
+            continue
+        candidates: list[tuple[tuple[float, float, float], str, dict]] = []
+        for track_key, observations in tracks.items():
+            if track_key in used_tracks:
+                continue
+            nearby = [
+                (abs((observed_at - crossing_at).total_seconds()), observation)
+                for observed_at, observation in observations
+                if abs((observed_at - crossing_at).total_seconds()) <= window_seconds
+            ]
+            if not nearby:
+                continue
+            seconds_apart, observation = min(nearby, key=lambda item: item[0])
+            score = (
+                float(status_rank.get(observation.get("status"), 0)),
+                float(observation.get("face_width_px", 0)),
+                -seconds_apart,
+            )
+            candidates.append((score, track_key, observation))
+        if not candidates:
+            continue
+        _, track_key, observation = max(candidates, key=lambda item: item[0])
+        used_tracks.add(track_key)
+        profile = {
+            "crossing_event_id": crossing.get("event_id"),
+            "crossing_at": crossing.get("timestamp"),
+            "direction": crossing.get("direction"),
+            "attire_color": crossing.get("attire_color"),
+            "bbox_height_ratio": crossing.get("bbox_height_ratio"),
+            "bbox_width_ratio": crossing.get("bbox_width_ratio"),
+            "face_evidence_status": observation.get("status"),
+            "face_width_px": observation.get("face_width_px"),
+            "match_distance": observation.get("match_distance"),
+            "match_margin": observation.get("match_margin"),
+            "review_state": "pending",
+        }
+        for key in (
+            "candidate_token",
+            "candidate_category",
+            "temporary_id",
+            "candidate_support_frames",
+            "multi_frame_review_candidate",
+        ):
+            if key in observation:
+                profile[key] = observation[key]
+        profiles.append(profile)
+    return profiles
+
+
+def _activate_crossing_audit(marker_path: Path, duration_minutes: float) -> None:
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps({"expires_at_epoch": time.time() + duration_minutes * 60 + 60}),
+        encoding="utf-8",
+    )
+    try:
+        marker_path.chmod(0o600)
+    except OSError:
+        pass
+
+
 def run_audit(
     duration_minutes: float,
     interval_seconds: float,
@@ -528,6 +669,12 @@ def run_audit(
     if reader is not None:
         reader.start()
 
+    marker_path = gate_counter.CPPLUS_CROSSING_AUDIT_MARKER
+    crossing_correlation_enabled = True
+    try:
+        _activate_crossing_audit(marker_path, duration_minutes)
+    except OSError:
+        crossing_correlation_enabled = False
     try:
         while time.monotonic() < deadline and gate_counter.running:
             processing_started = time.monotonic()
@@ -586,6 +733,10 @@ def run_audit(
             stream_failed = reader.failed
             stream_failure_reason = reader.failure_reason
             reader.close()
+        try:
+            marker_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     if used_rtsp and used_http:
         capture_source = "rtsp_continuous_then_http_snapshot"
@@ -595,16 +746,31 @@ def run_audit(
         capture_source = "http_snapshot"
 
     runtime_seconds = time.monotonic() - started_monotonic
+    completed_at = datetime.now(IST)
+    crossings = _load_crossings(started_at, completed_at)
+    evidence_profiles = correlate_crossing_evidence(records, crossings)
+    for profile in evidence_profiles:
+        _secure_append(output_path, {"crossing_evidence_profile": profile})
+
     summary = summarize(records, analyzer)
     summary.update({
         "started_at": started_at.strftime("%d-%m-%Y %H:%M:%S IST"),
-        "completed_at": datetime.now(IST).strftime("%d-%m-%Y %H:%M:%S IST"),
+        "completed_at": completed_at.strftime("%d-%m-%Y %H:%M:%S IST"),
         "camera": CPPLUS_CAMERAS[0]["name"],
         "capture_source": capture_source,
         "stream_frames_read": stream_frames_read,
         "stream_failed": stream_failed,
         "stream_failure_reason": stream_failure_reason,
         "stopped_early": not gate_counter.running,
+        "official_crossings_observed": len(crossings),
+        "crossings_with_face_evidence": len(evidence_profiles),
+        "crossings_with_candidate_identity": sum(
+            1
+            for profile in evidence_profiles
+            if profile["face_evidence_status"] == "candidate_known"
+        ),
+        "crossing_correlation_enabled": crossing_correlation_enabled,
+        "crossing_correlation_only_non_additive": True,
         "analysis_max_width": max_width,
         "full_resolution_encoding": True,
         "face_detector": detector,

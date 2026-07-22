@@ -174,6 +174,16 @@ CPPLUS_LOCAL_RECORDING_DIR = Path(
         str(Path(__file__).parent / "cpplus_recordings"),
     )
 )
+CPPLUS_CROSSING_AUDIT_DIR = Path(
+    os.environ.get(
+        "CPPLUS_CROSSING_AUDIT_DIR",
+        str(Path(__file__).parent / "face_audit_results"),
+    )
+)
+_CPPLUS_CROSSING_AUDIT_LOCK = threading.Lock()
+CPPLUS_CROSSING_AUDIT_MARKER = (
+    CPPLUS_CROSSING_AUDIT_DIR / ".c1_face_audit_active"
+)
 CPPLUS_LOCAL_RECORDING_FPS = max(
     0.1, float(os.environ.get("CPPLUS_LOCAL_RECORDING_FPS", "10")),
 )
@@ -579,6 +589,53 @@ def open_cpplus_stream(cam: dict):
     return None
 
 
+def _cpplus_crossing_audit_active(
+    marker_path: Path = CPPLUS_CROSSING_AUDIT_MARKER,
+) -> bool:
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        return float(marker["expires_at_epoch"]) > time.time()
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _append_cpplus_crossing_audit(
+    events: list[dict],
+    output_dir: Path = CPPLUS_CROSSING_AUDIT_DIR,
+) -> Path | None:
+    if not events:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"c1_crossings_{datetime.now(IST).strftime('%Y%m%d')}.jsonl"
+    is_new = not path.exists()
+    with _CPPLUS_CROSSING_AUDIT_LOCK, path.open("a", encoding="utf-8") as handle:
+        for event in events:
+            payload = {
+                key: event[key]
+                for key in (
+                    "event_id",
+                    "timestamp",
+                    "camera",
+                    "direction",
+                    "tracker_id",
+                    "attire_color",
+                    "bbox_height_ratio",
+                    "bbox_width_ratio",
+                    "daily_in",
+                    "daily_out",
+                )
+                if key in event
+            }
+            handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+    if is_new:
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    return path
+
+
 def run_cpplus_worker(cam: dict):
     """Dedicated head-count loop for the CP Plus outside gate camera.
 
@@ -681,6 +738,7 @@ def run_cpplus_worker(cam: dict):
         crossings = tracker.update(detections)
 
         events: list[dict] = []
+        audit_events: list[dict] = []
         now = datetime.now(IST)
         for cr in crossings:
             raw_dir = cr["direction"]
@@ -711,6 +769,19 @@ def run_cpplus_worker(cam: dict):
             else:
                 person_crop = crop_person_jpeg(frame, bbox)
             ts = now.strftime("%Y-%m-%d %H:%M:%S")
+            x1, y1, x2, y2 = bbox
+            audit_events.append({
+                "event_id": uuid4().hex,
+                "timestamp": now.strftime("%d-%m-%Y %H:%M:%S IST"),
+                "camera": cam_name,
+                "direction": person_dir,
+                "tracker_id": cr["id"],
+                "attire_color": attire_color,
+                "bbox_height_ratio": round(max(0, y2 - y1) / frame_h, 4),
+                "bbox_width_ratio": round(max(0, x2 - x1) / frame_w, 4),
+                "daily_in": daily_in,
+                "daily_out": daily_out,
+            })
             events.append({
                 "timestamp": ts,
                 "camera": cam_name,
@@ -723,6 +794,11 @@ def run_cpplus_worker(cam: dict):
             logger.info("%s: %s person #%d at %s — %s attire — Day IN=%d OUT=%d",
                         cam_name, person_dir, cr["id"], ts, attire_color, daily_in, daily_out)
 
+        if audit_events and _cpplus_crossing_audit_active():
+            try:
+                _append_cpplus_crossing_audit(audit_events)
+            except OSError as exc:
+                logger.warning("Could not append C1 crossing audit: %s", exc)
         if events:
             send_gate_event(events)
 
