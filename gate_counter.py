@@ -253,6 +253,87 @@ CPPLUS_IN_LEFT_TO_RIGHT = os.environ.get("CPPLUS_IN_LEFT_TO_RIGHT", "1") not in 
     "0", "false", "False", "no", "NO",
 )
 
+
+def _env_flag(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() not in (
+        "0", "false", "no",
+    )
+
+
+# ---------------------------------------------------------------------------
+# CP Plus C1 anonymous event interface
+#
+# The outside gate (C1) is ANONYMOUS ONLY: no names, faces, or biometrics.
+# Behaviour/health signals never modify official head-count totals; they are
+# posted to a dedicated non-additive endpoint (mirrors candidate-boundary
+# events) and are safe to ignore on the backend.
+# ---------------------------------------------------------------------------
+
+# When true, C1 live crossing events omit the person face crop so nothing
+# biometric leaves the school PC. Default on to honour the anonymous-only rule.
+CPPLUS_C1_ANONYMOUS = _env_flag("CPPLUS_C1_ANONYMOUS", "1")
+
+# Non-additive signal channel for queue/wrong-way/loitering/after-hours/
+# vehicle/camera-health/replay-discrepancy events.
+C1_SIGNAL_API = os.environ.get(
+    "C1_SIGNAL_API",
+    "https://ppis-whatsapp-bot.fly.dev/api/gate/c1-signal",
+)
+CPPLUS_SIGNALS_ENABLED = _env_flag("CPPLUS_SIGNALS_ENABLED", "1")
+
+# Queue / congestion: sustained simultaneous occupancy in view.
+CPPLUS_QUEUE_THRESHOLD = max(1, int(os.environ.get("CPPLUS_QUEUE_THRESHOLD", "6")))
+CPPLUS_QUEUE_MIN_INTERVAL_SEC = max(
+    1.0, float(os.environ.get("CPPLUS_QUEUE_MIN_INTERVAL_SEC", "60")),
+)
+
+# Wrong-way: the direction expected for normal C1 flow ("IN" or "OUT").
+CPPLUS_EXPECTED_FLOW = (
+    os.environ.get("CPPLUS_EXPECTED_FLOW", "IN").strip().upper()
+)
+if CPPLUS_EXPECTED_FLOW not in {"IN", "OUT"}:
+    CPPLUS_EXPECTED_FLOW = "IN"
+
+# Loitering / dwell: seconds a track may linger before a signal is raised.
+CPPLUS_LOITER_SECONDS = max(
+    1.0, float(os.environ.get("CPPLUS_LOITER_SECONDS", "60")),
+)
+
+# After-hours activity (default OFF — enabling changes the monitoring window).
+CPPLUS_AFTER_HOURS_ENABLED = _env_flag("CPPLUS_AFTER_HOURS_ENABLED", "0")
+CPPLUS_AFTER_HOURS_POLL_SEC = max(
+    2.0, float(os.environ.get("CPPLUS_AFTER_HOURS_POLL_SEC", "10")),
+)
+
+# Vehicle classification/count/dwell on C1 (default OFF — extra CPU).
+CPPLUS_VEHICLE_ENABLED = _env_flag("CPPLUS_VEHICLE_ENABLED", "0")
+CPPLUS_VEHICLE_DWELL_SECONDS = max(
+    1.0, float(os.environ.get("CPPLUS_VEHICLE_DWELL_SECONDS", "120")),
+)
+
+# Camera health thresholds.
+CPPLUS_HEALTH_ENABLED = _env_flag("CPPLUS_HEALTH_ENABLED", "1")
+CPPLUS_HEALTH_OFFLINE_FRAMES = max(
+    1, int(os.environ.get("CPPLUS_HEALTH_OFFLINE_FRAMES", "10")),
+)
+CPPLUS_HEALTH_FROZEN_FRAMES = max(
+    2, int(os.environ.get("CPPLUS_HEALTH_FROZEN_FRAMES", "30")),
+)
+CPPLUS_HEALTH_BLUR_VARIANCE = max(
+    0.0, float(os.environ.get("CPPLUS_HEALTH_BLUR_VARIANCE", "40")),
+)
+CPPLUS_HEALTH_DARK_LUMA = max(
+    0.0, float(os.environ.get("CPPLUS_HEALTH_DARK_LUMA", "20")),
+)
+CPPLUS_HEALTH_BAD_FRAMES = max(
+    1, int(os.environ.get("CPPLUS_HEALTH_BAD_FRAMES", "20")),
+)
+# Mean per-pixel difference (0-255, on a 32x32 grayscale) from the learned
+# scene baseline that indicates the camera has been physically moved/re-aimed.
+CPPLUS_HEALTH_MOVED_DIFF = max(
+    0.0, float(os.environ.get("CPPLUS_HEALTH_MOVED_DIFF", "45")),
+)
+
 # Allow disabling the CP Plus outside-gate camera without a code change
 CPPLUS_ENABLED = os.environ.get("CPPLUS_GATE_ENABLED", "1") not in ("0", "false", "False")
 if not CPPLUS_ENABLED:
@@ -673,6 +754,230 @@ def _append_cpplus_tracker_trace(
     return path
 
 
+# ---------------------------------------------------------------------------
+# C1 anonymous event helpers
+# ---------------------------------------------------------------------------
+
+def stable_event_id(
+    camera: str, date_ymd: str, tracker_id: int, ordinal: int,
+) -> str:
+    """Deterministic, anonymous id for a C1 crossing.
+
+    Derived only from non-PII inputs so the same physical crossing yields the
+    same id from the live loop, the audit ledger, and any replay correlation.
+    """
+    raw = f"{camera}|{date_ymd}|{tracker_id}|{ordinal}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+# Live per-hour IN counts recorded by the live worker so the replay verifier
+# can compute a live-vs-verified discrepancy without changing official totals.
+_CPPLUS_LIVE_HOURLY_LOCK = threading.Lock()
+_cpplus_live_hourly_in: dict[str, int] = {}
+
+
+def _record_live_hourly_in(now: datetime) -> None:
+    key = now.replace(minute=0, second=0, microsecond=0).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    with _CPPLUS_LIVE_HOURLY_LOCK:
+        _cpplus_live_hourly_in[key] = _cpplus_live_hourly_in.get(key, 0) + 1
+
+
+def _get_live_hourly_in(hour_start: datetime) -> int | None:
+    key = hour_start.strftime("%Y-%m-%d %H:%M:%S")
+    with _CPPLUS_LIVE_HOURLY_LOCK:
+        return _cpplus_live_hourly_in.get(key)
+
+
+def _build_c1_signal(
+    camera: str,
+    signal_type: str,
+    data: dict,
+    timestamp: datetime,
+    event_id: str | None = None,
+) -> dict:
+    """Build a non-additive, anonymous C1 signal event.
+
+    ``verification_only`` marks the event as never affecting official totals.
+    The payload intentionally carries no images, names, or biometrics.
+    """
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=IST)
+    return {
+        "event_id": event_id or uuid4().hex,
+        "timestamp": timestamp.astimezone(IST).strftime("%d-%m-%Y %H:%M:%S IST"),
+        "camera": camera,
+        "type": signal_type,
+        "verification_only": True,
+        "data": data,
+    }
+
+
+def send_c1_signal_events(events: list[dict]) -> bool:
+    """Send anonymous, non-additive C1 signal events to the cloud."""
+    if not events:
+        return True
+    if not CPPLUS_SIGNALS_ENABLED:
+        return True
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.post(
+                C1_SIGNAL_API, json=events, headers=_agent_secret_headers(),
+            )
+            if response.status_code == 200:
+                logger.info("Sent %d C1 signal event(s) — OK", len(events))
+                return True
+            logger.warning(
+                "C1 signal API returned %d: %s",
+                response.status_code, response.text[:200],
+            )
+    except Exception as exc:
+        logger.error("C1 signal API error: %s", exc)
+    return False
+
+
+def _frame_blur_variance(frame: np.ndarray) -> float:
+    """Variance of the Laplacian — low values indicate a blurred frame."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _frame_mean_luma(frame: np.ndarray) -> float:
+    """Mean brightness — very low values indicate a blocked/covered lens."""
+    return float(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).mean())
+
+
+def _frame_signature(frame: np.ndarray) -> str:
+    """Cheap perceptual signature for frozen-frame detection."""
+    small = cv2.resize(frame, (16, 16), interpolation=cv2.INTER_AREA)
+    return hashlib.md5(small.tobytes()).hexdigest()
+
+
+class CameraHealthMonitor:
+    """Detect offline/frozen/blurred/blocked/moved conditions.
+
+    Emits at most one signal per health state until the camera recovers, so a
+    persistent fault does not flood the backend. Returns a health state string
+    when a NEW fault (or a recovery) is observed, otherwise ``None``.
+    """
+
+    def __init__(
+        self,
+        offline_frames: int = CPPLUS_HEALTH_OFFLINE_FRAMES,
+        frozen_frames: int = CPPLUS_HEALTH_FROZEN_FRAMES,
+        blur_variance: float = CPPLUS_HEALTH_BLUR_VARIANCE,
+        dark_luma: float = CPPLUS_HEALTH_DARK_LUMA,
+        bad_frames: int = CPPLUS_HEALTH_BAD_FRAMES,
+        moved_diff: float = CPPLUS_HEALTH_MOVED_DIFF,
+    ):
+        self.offline_frames = offline_frames
+        self.frozen_frames = frozen_frames
+        self.blur_variance = blur_variance
+        self.dark_luma = dark_luma
+        self.bad_frames = bad_frames
+        self.moved_diff = moved_diff
+        self._missing = 0
+        self._same = 0
+        self._blur = 0
+        self._dark = 0
+        self._moved = 0
+        self._last_signature: str | None = None
+        self._baseline: np.ndarray | None = None
+        self._active: str | None = None
+
+    @staticmethod
+    def _scene(frame: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA).astype(
+            np.float32
+        )
+
+    def _fire(self, state: str | None) -> str | None:
+        if state == self._active:
+            return None
+        self._active = state
+        return state or "healthy"
+
+    def observe(self, frame: np.ndarray | None) -> str | None:
+        if frame is None:
+            self._missing += 1
+            if self._missing >= self.offline_frames:
+                return self._fire("offline")
+            return None
+        self._missing = 0
+
+        signature = _frame_signature(frame)
+        if signature == self._last_signature:
+            self._same += 1
+        else:
+            self._same = 0
+        self._last_signature = signature
+        if self._same >= self.frozen_frames:
+            return self._fire("frozen")
+
+        if _frame_mean_luma(frame) < self.dark_luma:
+            self._dark += 1
+        else:
+            self._dark = 0
+        if self._dark >= self.bad_frames:
+            return self._fire("blocked")
+
+        if _frame_blur_variance(frame) < self.blur_variance:
+            self._blur += 1
+        else:
+            self._blur = 0
+        if self._blur >= self.bad_frames:
+            return self._fire("blurred")
+
+        scene = self._scene(frame)
+        if self._baseline is None:
+            self._baseline = scene
+        else:
+            diff = float(np.abs(scene - self._baseline).mean())
+            if diff > self.moved_diff:
+                self._moved += 1
+            else:
+                self._moved = 0
+                # Track slow scene drift (lighting, seasons) when stable.
+                self._baseline = 0.95 * self._baseline + 0.05 * scene
+            if self._moved >= self.bad_frames:
+                self._baseline = scene
+                self._moved = 0
+                return self._fire("moved")
+
+        return self._fire(None)
+
+
+class DwellTracker:
+    """Track per-object first-seen time to flag loitering, fired once each."""
+
+    def __init__(self, threshold_seconds: float):
+        self.threshold_seconds = threshold_seconds
+        self._first_seen: dict[int, float] = {}
+        self._fired: set[int] = set()
+
+    def update(
+        self, active_ids: list[int], now_monotonic: float,
+    ) -> list[tuple[int, float]]:
+        active = set(active_ids)
+        for oid in active:
+            self._first_seen.setdefault(oid, now_monotonic)
+        fired: list[tuple[int, float]] = []
+        for oid in active:
+            if oid in self._fired:
+                continue
+            dwell = now_monotonic - self._first_seen[oid]
+            if dwell >= self.threshold_seconds:
+                self._fired.add(oid)
+                fired.append((oid, dwell))
+        for oid in list(self._first_seen):
+            if oid not in active:
+                self._first_seen.pop(oid, None)
+                self._fired.discard(oid)
+        return fired
+
+
 def run_cpplus_worker(cam: dict):
     """Dedicated head-count loop for the CP Plus outside gate camera.
 
@@ -703,6 +1008,27 @@ def run_cpplus_worker(cam: dict):
     reconnect_backoff = 2.0
     tracker_trace_last_sample: dict[int, float] = {}
 
+    # Anonymous, non-additive signal state (queue/wrong-way/loitering/health/
+    # vehicle). None of these ever change the official head-count totals.
+    crossing_ordinal: dict[int, int] = {}
+    health_monitor = CameraHealthMonitor()
+    dwell_tracker = DwellTracker(CPPLUS_LOITER_SECONDS)
+    last_queue_signal = 0.0
+    vehicle_tracker: CentroidTracker | None = None
+    vehicle_dwell: DwellTracker | None = None
+    if CPPLUS_VEHICLE_ENABLED:
+        vehicle_tracker = CentroidTracker(
+            max_disappeared=max(
+                MAX_DISAPPEARED,
+                int(CPPLUS_TARGET_FPS * CPPLUS_TRACK_MAX_GAP_SECONDS),
+            ),
+            max_distance=MAX_DISTANCE * 2,
+            anchor_y="bottom",
+            line_axis=CPPLUS_LINE_AXIS,
+        )
+        vehicle_dwell = DwellTracker(CPPLUS_VEHICLE_DWELL_SECONDS)
+    seen_vehicle_ids: set[int] = set()
+
     logger.info("CP Plus worker started for %s (target %.1f FPS)", cam_name, CPPLUS_TARGET_FPS)
 
     while running:
@@ -723,6 +1049,8 @@ def run_cpplus_worker(cam: dict):
             daily_in = 0
             daily_out = 0
             tracker_trace_last_sample.clear()
+            crossing_ordinal.clear()
+            seen_vehicle_ids.clear()
             tracker = CentroidTracker(
                 max_disappeared=max(
                     MAX_DISAPPEARED,
@@ -754,6 +1082,16 @@ def run_cpplus_worker(cam: dict):
         if frame is None:
             frame = capture_cpplus_frame(cam)
         if frame is None:
+            if CPPLUS_HEALTH_ENABLED:
+                state = health_monitor.observe(None)
+                if state and state != "healthy":
+                    send_c1_signal_events([
+                        _build_c1_signal(
+                            cam_name, "camera_health",
+                            {"state": state, "detector": "capture"},
+                            datetime.now(IST),
+                        )
+                    ])
             time.sleep(reconnect_backoff)
             continue
 
@@ -778,7 +1116,19 @@ def run_cpplus_worker(cam: dict):
 
         events: list[dict] = []
         audit_events: list[dict] = []
+        signal_events: list[dict] = []
         now = datetime.now(IST)
+
+        # Camera-health assessment on a real frame (frozen/blurred/blocked/moved).
+        if CPPLUS_HEALTH_ENABLED:
+            health_state = health_monitor.observe(frame)
+            if health_state and health_state != "healthy":
+                signal_events.append(_build_c1_signal(
+                    cam_name, "camera_health",
+                    {"state": health_state, "detector": "frame"},
+                    now,
+                ))
+
         crossing_audit_active = _cpplus_crossing_audit_active()
         if crossing_audit_active:
             sample_time = time.monotonic()
@@ -824,6 +1174,7 @@ def run_cpplus_worker(cam: dict):
 
             if person_dir == "IN":
                 daily_in += 1
+                _record_live_hourly_in(now)
             else:
                 daily_out += 1
 
@@ -831,16 +1182,13 @@ def run_cpplus_worker(cam: dict):
             if bbox is None:
                 continue
             attire_color = extract_dominant_color(frame, bbox)
-            # Snapshot uses a full-resolution crop (see docstring) so the cloud
-            # frontal-face gate can actually resolve a face; only IN crossings
-            # trigger a snapshot, so only pay the hi-res grab for those.
-            if person_dir == "IN":
-                person_crop = crop_person_hires_cpplus(cam, frame, bbox)
-            else:
-                person_crop = crop_person_jpeg(frame, bbox)
             ts = now.strftime("%Y-%m-%d %H:%M:%S")
             x1, y1, x2, y2 = bbox
-            event_id = uuid4().hex
+            # Stable, anonymous id derived from (camera, date, track, ordinal)
+            # so the same crossing is identifiable across audit and replay.
+            ordinal = crossing_ordinal.get(cr["id"], 0)
+            crossing_ordinal[cr["id"]] = ordinal + 1
+            event_id = stable_event_id(cam_name, current_date, cr["id"], ordinal)
             audit_events.append({
                 "event_id": event_id,
                 "timestamp": now.strftime("%d-%m-%Y %H:%M:%S IST"),
@@ -853,18 +1201,102 @@ def run_cpplus_worker(cam: dict):
                 "daily_in": daily_in,
                 "daily_out": daily_out,
             })
-            events.append({
+            event = {
                 "event_id": event_id,
                 "timestamp": ts,
                 "camera": cam_name,
                 "direction": person_dir,
                 "attire_color": attire_color,
-                "person_crop": person_crop,
                 "daily_in": daily_in,
                 "daily_out": daily_out,
-            })
+            }
+            # C1 is anonymous-only by default: no face crop leaves the PC.
+            # The hi-res snapshot is only produced when explicitly allowed.
+            if not CPPLUS_C1_ANONYMOUS:
+                if person_dir == "IN":
+                    event["person_crop"] = crop_person_hires_cpplus(cam, frame, bbox)
+                else:
+                    event["person_crop"] = crop_person_jpeg(frame, bbox)
+            events.append(event)
+
+            # Wrong-way movement: crossing against the expected C1 flow.
+            if person_dir != CPPLUS_EXPECTED_FLOW:
+                signal_events.append(_build_c1_signal(
+                    cam_name, "wrong_way",
+                    {"observed": person_dir, "expected": CPPLUS_EXPECTED_FLOW},
+                    now, event_id=event_id,
+                ))
+
             logger.info("%s: %s person #%d at %s — %s attire — Day IN=%d OUT=%d",
                         cam_name, person_dir, cr["id"], ts, attire_color, daily_in, daily_out)
+
+        # Queue / congestion: sustained simultaneous occupancy in the frame.
+        active_ids = [
+            oid for oid in tracker.objects
+            if tracker.disappeared.get(oid, 0) == 0
+        ]
+        occupancy = len(active_ids)
+        if (
+            occupancy >= CPPLUS_QUEUE_THRESHOLD
+            and time.monotonic() - last_queue_signal >= CPPLUS_QUEUE_MIN_INTERVAL_SEC
+        ):
+            last_queue_signal = time.monotonic()
+            signal_events.append(_build_c1_signal(
+                cam_name, "queue",
+                {"occupancy": occupancy, "threshold": CPPLUS_QUEUE_THRESHOLD},
+                now,
+            ))
+
+        # Loitering / dwell: a person lingering longer than the threshold.
+        for oid, dwell in dwell_tracker.update(active_ids, time.monotonic()):
+            signal_events.append(_build_c1_signal(
+                cam_name, "loitering",
+                {
+                    "tracker_id": oid,
+                    "dwell_sec": round(dwell, 1),
+                    "threshold_sec": CPPLUS_LOITER_SECONDS,
+                },
+                now,
+            ))
+
+        # Vehicle classification / count / dwell (opt-in).
+        if CPPLUS_VEHICLE_ENABLED and vehicle_tracker is not None:
+            try:
+                v_detections = detector.detect_vehicles(frame)
+            except Exception as exc:
+                logger.error("CP Plus %s: vehicle detection error: %s", cam_name, exc)
+                v_detections = []
+            v_type_map = {d[0]: d[2] for d in v_detections}
+            vehicle_tracker.update([(d[0], d[1]) for d in v_detections])
+            v_active = [
+                oid for oid in vehicle_tracker.objects
+                if vehicle_tracker.disappeared.get(oid, 0) == 0
+            ]
+            for oid in v_active:
+                if oid in seen_vehicle_ids:
+                    continue
+                seen_vehicle_ids.add(oid)
+                v_type = v_type_map.get(vehicle_tracker.bboxes.get(oid), "vehicle")
+                signal_events.append(_build_c1_signal(
+                    cam_name, "vehicle",
+                    {"tracker_id": oid, "vehicle_type": v_type},
+                    now,
+                ))
+            if vehicle_dwell is not None:
+                for oid, dwell in vehicle_dwell.update(v_active, time.monotonic()):
+                    v_type = v_type_map.get(
+                        vehicle_tracker.bboxes.get(oid), "vehicle",
+                    )
+                    signal_events.append(_build_c1_signal(
+                        cam_name, "vehicle_dwell",
+                        {
+                            "tracker_id": oid,
+                            "vehicle_type": v_type,
+                            "dwell_sec": round(dwell, 1),
+                            "threshold_sec": CPPLUS_VEHICLE_DWELL_SECONDS,
+                        },
+                        now,
+                    ))
 
         if audit_events and crossing_audit_active:
             try:
@@ -873,6 +1305,8 @@ def run_cpplus_worker(cam: dict):
                 logger.warning("Could not append C1 crossing audit: %s", exc)
         if events:
             send_gate_event(events)
+        if signal_events:
+            send_c1_signal_events(signal_events)
 
         # Throttle to the target processing rate.
         elapsed = time.monotonic() - loop_start
@@ -883,6 +1317,57 @@ def run_cpplus_worker(cam: dict):
         cap.release()
     logger.info("CP Plus worker stopped for %s (final IN=%d OUT=%d)",
                 cam_name, daily_in, daily_out)
+
+
+def run_cpplus_after_hours_worker(cam: dict) -> None:
+    """Watch the C1 camera OUTSIDE monitoring hours for any person activity.
+
+    The main worker sleeps outside 06:00-17:00 IST, so after-hours motion is
+    otherwise never seen. This low-rate loop only runs when monitoring is
+    closed and emits an anonymous, non-additive ``after_hours`` signal when a
+    person is detected (no images/faces, never touches official totals).
+    """
+    cam_name = cam["name"]
+    detector: PersonDetector | None = None
+    last_signal = 0.0
+    logger.info("CP Plus after-hours worker started for %s", cam_name)
+
+    while running:
+        if is_monitoring_time():
+            time.sleep(CPPLUS_AFTER_HOURS_POLL_SEC)
+            continue
+
+        frame = capture_cpplus_frame(cam)
+        if frame is None:
+            time.sleep(CPPLUS_AFTER_HOURS_POLL_SEC)
+            continue
+
+        if detector is None:
+            detector = PersonDetector()
+            detector.load()
+        try:
+            detections = detector.detect(
+                frame, confidence_threshold=CPPLUS_CONFIDENCE_THRESHOLD,
+            )
+        except Exception as exc:
+            logger.error("CP Plus %s after-hours detection error: %s", cam_name, exc)
+            detections = []
+
+        now = time.monotonic()
+        if detections and now - last_signal >= CPPLUS_AFTER_HOURS_POLL_SEC:
+            last_signal = now
+            send_c1_signal_events([_build_c1_signal(
+                cam_name, "after_hours",
+                {"person_count": len(detections)},
+                datetime.now(IST),
+            )])
+            logger.info(
+                "%s: after-hours activity — %d person(s) detected",
+                cam_name, len(detections),
+            )
+        time.sleep(CPPLUS_AFTER_HOURS_POLL_SEC)
+
+    logger.info("CP Plus after-hours worker stopped for %s", cam_name)
 
 
 def _local_recording_name(start: datetime, end: datetime) -> str:
@@ -2142,6 +2627,38 @@ def _post_cpplus_recount(
         return False
 
 
+def _emit_replay_discrepancy(
+    cam: dict,
+    hour_start: datetime,
+    hour_end: datetime,
+    verified: int,
+    source: str,
+) -> None:
+    """Emit an anonymous, verification-only live-vs-verified discrepancy.
+
+    Never modifies official totals — the recount itself is the authoritative
+    verified figure; this signal only surfaces the gap for review.
+    """
+    live = _get_live_hourly_in(hour_start)
+    if live is None:
+        return
+    send_c1_signal_events([
+        _build_c1_signal(
+            cam["name"],
+            "replay_discrepancy",
+            {
+                "hour_start": hour_start.strftime("%Y-%m-%d %H:%M:%S"),
+                "hour_end": hour_end.strftime("%Y-%m-%d %H:%M:%S"),
+                "live": live,
+                "verified": verified,
+                "delta": verified - live,
+                "verified_source": source,
+            },
+            hour_end,
+        )
+    ])
+
+
 def _completed_replay_hours(now: datetime) -> list[tuple[datetime, datetime]]:
     day_start = now.replace(
         hour=MONITOR_START_HOUR, minute=MONITOR_START_MIN, second=0, microsecond=0,
@@ -2218,6 +2735,10 @@ def run_cpplus_replay_worker(cam: dict) -> None:
                         "source": "camera_native_counter",
                     }
                     _save_cpplus_replay_state(state)
+                    _emit_replay_discrepancy(
+                        cam, hour_start, hour_end, native_count,
+                        "camera_native_counter",
+                    )
                     continue
                 logger.warning(
                     "CP Plus native count was rejected; trying recording recount for %s-%s",
@@ -2281,6 +2802,9 @@ def run_cpplus_replay_worker(cam: dict) -> None:
                     "source": source,
                 }
                 _save_cpplus_replay_state(state)
+                _emit_replay_discrepancy(
+                    cam, hour_start, hour_end, in_count, source,
+                )
                 logger.info(
                     "CP Plus recording recount %s-%s: IN=%d frames=%d source=%s uploaded=%s",
                     hour_start.strftime("%H:%M"), hour_end.strftime("%H:%M"),
@@ -3063,6 +3587,13 @@ def run_gate_counter():
             )
             segment_thread.start()
             cpplus_threads.append(segment_thread)
+        if CPPLUS_AFTER_HOURS_ENABLED:
+            after_hours_thread = threading.Thread(
+                target=run_cpplus_after_hours_worker, args=(cam,), daemon=True,
+                name=f"cpplus-after-hours-{cam['name']}",
+            )
+            after_hours_thread.start()
+            cpplus_threads.append(after_hours_thread)
 
     # One tracker per camera (for people) — DVR channels + CP Plus outside gate
     trackers: dict[str, CentroidTracker] = {}
