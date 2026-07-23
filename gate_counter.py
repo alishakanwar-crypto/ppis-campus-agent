@@ -61,7 +61,8 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from urllib.parse import quote
 from uuid import uuid4
@@ -69,6 +70,8 @@ from uuid import uuid4
 import cv2
 import httpx
 import numpy as np
+
+from gate_intelligence import GateIntelligenceConfig, GateIntelligenceMonitor
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -269,6 +272,10 @@ CPPLUS_RECOUNT_API = os.environ.get(
     "CPPLUS_RECOUNT_API",
     "https://ppis-whatsapp-bot.fly.dev/api/gate/cpplus-hourly-recount",
 )
+CPPLUS_INTELLIGENCE_API = os.environ.get(
+    "CPPLUS_INTELLIGENCE_API",
+    "https://ppis-whatsapp-bot.fly.dev/api/gate/c1-signal",
+)
 
 POLL_INTERVAL = int(os.environ.get("GATE_POLL_SECONDS", "5"))
 
@@ -277,8 +284,50 @@ MONITOR_START_HOUR = 6   # 6:00 AM
 MONITOR_START_MIN = 0
 MONITOR_END_HOUR = 17    # 5:00 PM
 MONITOR_END_MIN = 0
+CPPLUS_AFTER_HOURS_ENABLED = os.environ.get(
+    "CPPLUS_AFTER_HOURS_ENABLED", "1",
+).lower() not in {"0", "false", "no"}
+CPPLUS_AFTER_HOURS_START_HOUR = int(os.environ.get(
+    "CPPLUS_AFTER_HOURS_START_HOUR", "5",
+))
+CPPLUS_AFTER_HOURS_END_HOUR = int(os.environ.get(
+    "CPPLUS_AFTER_HOURS_END_HOUR", "22",
+))
+CPPLUS_AFTER_HOURS_FPS = max(
+    0.2, float(os.environ.get("CPPLUS_AFTER_HOURS_FPS", "1")),
+)
+CPPLUS_INTELLIGENCE_CONFIG = GateIntelligenceConfig(
+    congestion_people=max(2, int(os.environ.get("CPPLUS_CONGESTION_PEOPLE", "6"))),
+    congestion_seconds=max(
+        1.0, float(os.environ.get("CPPLUS_CONGESTION_SECONDS", "20")),
+    ),
+    loiter_seconds=max(
+        10.0, float(os.environ.get("CPPLUS_LOITER_SECONDS", "120")),
+    ),
+    vehicle_dwell_seconds=max(
+        10.0, float(os.environ.get("CPPLUS_VEHICLE_DWELL_SECONDS", "180")),
+    ),
+    offline_seconds=max(
+        5.0, float(os.environ.get("CPPLUS_OFFLINE_SECONDS", "20")),
+    ),
+    frozen_seconds=max(
+        5.0, float(os.environ.get("CPPLUS_FROZEN_SECONDS", "15")),
+    ),
+    blurred_seconds=max(
+        5.0, float(os.environ.get("CPPLUS_BLURRED_SECONDS", "30")),
+    ),
+    blocked_seconds=max(
+        5.0, float(os.environ.get("CPPLUS_BLOCKED_SECONDS", "20")),
+    ),
+    view_changed_seconds=max(
+        10.0, float(os.environ.get("CPPLUS_VIEW_CHANGED_SECONDS", "60")),
+    ),
+    expected_direction=os.environ.get(
+        "CPPLUS_EXPECTED_DIRECTION", "",
+    ).strip().upper(),
+)
 
-IST = timezone(timedelta(hours=5, minutes=30))
+IST = ZoneInfo("Asia/Kolkata")
 
 # YOLO model path (will be downloaded on first run)
 MODEL_DIR = Path(__file__).parent / "models"
@@ -695,19 +744,35 @@ def run_cpplus_worker(cam: dict):
         anchor_y="bottom",
         line_axis=CPPLUS_LINE_AXIS,
     )
+    vehicle_tracker = CentroidTracker(
+        max_disappeared=max(
+            MAX_DISAPPEARED,
+            int(CPPLUS_TARGET_FPS * CPPLUS_TRACK_MAX_GAP_SECONDS),
+        ),
+        max_distance=MAX_DISTANCE,
+        anchor_y="bottom",
+        line_axis=CPPLUS_LINE_AXIS,
+    )
+    intelligence = GateIntelligenceMonitor(
+        cam_name,
+        CPPLUS_INTELLIGENCE_CONFIG,
+    )
+    pending_intelligence_events: list[dict] = []
+    pending_vehicle_events: list[dict] = []
     daily_in = 0
     daily_out = 0
     current_date = datetime.now(IST).strftime("%Y-%m-%d")
     cap = None
-    min_interval = 1.0 / CPPLUS_TARGET_FPS if CPPLUS_TARGET_FPS > 0 else 0.0
     reconnect_backoff = 2.0
     tracker_trace_last_sample: dict[int, float] = {}
 
     logger.info("CP Plus worker started for %s (target %.1f FPS)", cam_name, CPPLUS_TARGET_FPS)
 
     while running:
-        # Only monitor during school hours; drop the stream when idle.
-        if not is_monitoring_time():
+        now = datetime.now(IST)
+        official_hours = is_monitoring_time(now)
+        after_hours = is_cpplus_after_hours_time(now)
+        if not official_hours and not after_hours:
             if cap is not None:
                 cap.release()
                 cap = None
@@ -732,6 +797,19 @@ def run_cpplus_worker(cam: dict):
                 anchor_y="bottom",
                 line_axis=CPPLUS_LINE_AXIS,
             )
+            vehicle_tracker = CentroidTracker(
+                max_disappeared=max(
+                    MAX_DISAPPEARED,
+                    int(CPPLUS_TARGET_FPS * CPPLUS_TRACK_MAX_GAP_SECONDS),
+                ),
+                max_distance=MAX_DISTANCE,
+                anchor_y="bottom",
+                line_axis=CPPLUS_LINE_AXIS,
+            )
+            intelligence = GateIntelligenceMonitor(
+                cam_name,
+                CPPLUS_INTELLIGENCE_CONFIG,
+            )
 
         loop_start = time.monotonic()
 
@@ -754,31 +832,66 @@ def run_cpplus_worker(cam: dict):
         if frame is None:
             frame = capture_cpplus_frame(cam)
         if frame is None:
+            pending_intelligence_events.extend(
+                intelligence.observe_capture_failure(datetime.now(IST))
+            )
+            if pending_intelligence_events and send_cpplus_intelligence_events(
+                pending_intelligence_events
+            ):
+                pending_intelligence_events.clear()
             time.sleep(reconnect_backoff)
             continue
 
         frame_h, frame_w = frame.shape[:2]
         line_dimension = frame_w if CPPLUS_LINE_AXIS == "vertical" else frame_h
-        tracker.set_line(
-            int(line_dimension * (cam.get("line_position") or LINE_POSITION)),
-            hysteresis=int(line_dimension * CPPLUS_LINE_HYSTERESIS),
+        line_position = int(
+            line_dimension * (cam.get("line_position") or LINE_POSITION)
         )
-        tracker.max_distance = max(MAX_DISTANCE, frame_w * MAX_DISTANCE / 640.0)
+        line_hysteresis = int(line_dimension * CPPLUS_LINE_HYSTERESIS)
+        tracker.set_line(line_position, hysteresis=line_hysteresis)
+        vehicle_tracker.set_line(line_position, hysteresis=line_hysteresis)
+        scaled_distance = max(MAX_DISTANCE, frame_w * MAX_DISTANCE / 640.0)
+        tracker.max_distance = scaled_distance
+        vehicle_tracker.max_distance = scaled_distance
 
         try:
-            detections = detector.detect(
+            detections, vehicle_detections = detector.detect_people_and_vehicles(
                 frame,
                 confidence_threshold=CPPLUS_CONFIDENCE_THRESHOLD,
             )
         except Exception as e:
             logger.error("CP Plus %s: detection error: %s", cam_name, e)
             detections = []
-        # Raw IN means negative-to-positive across the selected line axis.
+            vehicle_detections = []
         crossings = tracker.update(detections)
+        vehicle_crossings = vehicle_tracker.update([
+            (bbox, confidence)
+            for bbox, confidence, _vehicle_type in vehicle_detections
+        ])
 
         events: list[dict] = []
         audit_events: list[dict] = []
+        vehicle_events: list[dict] = []
+        intelligence_events: list[dict] = []
         now = datetime.now(IST)
+        official_hours = is_monitoring_time(now)
+        active_people = {
+            tracker_id
+            for tracker_id in tracker.objects
+            if tracker.disappeared.get(tracker_id, 0) == 0
+        }
+        intelligence_events.extend(intelligence.observe_tracks(
+            now,
+            set(tracker.objects),
+            set(vehicle_tracker.objects),
+            visible_person_count=len(active_people),
+        ))
+        intelligence_events.extend(intelligence.observe_frame(
+            now,
+            frame,
+            active_people=len(active_people),
+        ))
+
         crossing_audit_active = _cpplus_crossing_audit_active()
         if crossing_audit_active:
             sample_time = time.monotonic()
@@ -810,43 +923,57 @@ def run_cpplus_worker(cam: dict):
                     _append_cpplus_tracker_trace(trace_samples)
                 except OSError as exc:
                     logger.warning("Could not append C1 tracker trace: %s", exc)
-        for cr in crossings:
-            raw_dir = cr["direction"]
-            positive_direction_is_in = (
-                CPPLUS_IN_LEFT_TO_RIGHT
-                if CPPLUS_LINE_AXIS == "vertical"
-                else CPPLUS_IN_TOP_TO_BOTTOM
-            )
-            if positive_direction_is_in:
-                person_dir = raw_dir
-            else:
-                person_dir = "OUT" if raw_dir == "IN" else "IN"
 
-            if person_dir == "IN":
+        positive_direction_is_in = (
+            CPPLUS_IN_LEFT_TO_RIGHT
+            if CPPLUS_LINE_AXIS == "vertical"
+            else CPPLUS_IN_TOP_TO_BOTTOM
+        )
+        for crossing in crossings:
+            raw_direction = crossing["direction"]
+            person_direction = (
+                raw_direction
+                if positive_direction_is_in
+                else "OUT" if raw_direction == "IN" else "IN"
+            )
+            intelligence_events.extend(intelligence.observe_crossing(
+                now,
+                crossing["id"],
+                person_direction,
+                official_hours=official_hours,
+            ))
+            if not official_hours:
+                logger.warning(
+                    "%s: after-hours %s movement by tracker #%d at %s",
+                    cam_name,
+                    person_direction,
+                    crossing["id"],
+                    now.strftime("%d-%m-%Y %H:%M:%S IST"),
+                )
+                continue
+
+            if person_direction == "IN":
                 daily_in += 1
             else:
                 daily_out += 1
 
-            bbox = cr.get("bbox")
+            bbox = crossing.get("bbox")
             if bbox is None:
                 continue
             attire_color = extract_dominant_color(frame, bbox)
-            # Snapshot uses a full-resolution crop (see docstring) so the cloud
-            # frontal-face gate can actually resolve a face; only IN crossings
-            # trigger a snapshot, so only pay the hi-res grab for those.
-            if person_dir == "IN":
+            if person_direction == "IN":
                 person_crop = crop_person_hires_cpplus(cam, frame, bbox)
             else:
                 person_crop = crop_person_jpeg(frame, bbox)
-            ts = now.strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
             x1, y1, x2, y2 = bbox
             event_id = uuid4().hex
             audit_events.append({
                 "event_id": event_id,
                 "timestamp": now.strftime("%d-%m-%Y %H:%M:%S IST"),
                 "camera": cam_name,
-                "direction": person_dir,
-                "tracker_id": cr["id"],
+                "direction": person_direction,
+                "tracker_id": crossing["id"],
                 "attire_color": attire_color,
                 "bbox_height_ratio": round(max(0, y2 - y1) / frame_h, 4),
                 "bbox_width_ratio": round(max(0, x2 - x1) / frame_w, 4),
@@ -855,16 +982,57 @@ def run_cpplus_worker(cam: dict):
             })
             events.append({
                 "event_id": event_id,
-                "timestamp": ts,
+                "timestamp": timestamp,
                 "camera": cam_name,
-                "direction": person_dir,
+                "direction": person_direction,
                 "attire_color": attire_color,
                 "person_crop": person_crop,
                 "daily_in": daily_in,
                 "daily_out": daily_out,
             })
-            logger.info("%s: %s person #%d at %s — %s attire — Day IN=%d OUT=%d",
-                        cam_name, person_dir, cr["id"], ts, attire_color, daily_in, daily_out)
+            logger.info(
+                "%s: %s person #%d at %s — %s attire — Day IN=%d OUT=%d",
+                cam_name,
+                person_direction,
+                crossing["id"],
+                timestamp,
+                attire_color,
+                daily_in,
+                daily_out,
+            )
+
+        vehicle_type_by_bbox = {
+            bbox: vehicle_type
+            for bbox, _confidence, vehicle_type in vehicle_detections
+        }
+        for crossing in vehicle_crossings:
+            raw_direction = crossing["direction"]
+            vehicle_direction = (
+                raw_direction
+                if positive_direction_is_in
+                else "OUT" if raw_direction == "IN" else "IN"
+            )
+            bbox = crossing.get("bbox")
+            vehicle_type = vehicle_type_by_bbox.get(bbox, "vehicle")
+            vehicle_events.append({
+                "event_id": uuid4().hex,
+                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "camera": cam_name,
+                "direction": vehicle_direction,
+                "vehicle_type": vehicle_type,
+                "dwell_seconds": intelligence.vehicle_dwell_seconds(
+                    crossing["id"],
+                    now,
+                ),
+            })
+            logger.info(
+                "%s: %s %s vehicle #%d at %s",
+                cam_name,
+                vehicle_direction,
+                vehicle_type,
+                crossing["id"],
+                now.strftime("%d-%m-%Y %H:%M:%S IST"),
+            )
 
         if audit_events and crossing_audit_active:
             try:
@@ -873,8 +1041,17 @@ def run_cpplus_worker(cam: dict):
                 logger.warning("Could not append C1 crossing audit: %s", exc)
         if events:
             send_gate_event(events)
+        pending_vehicle_events.extend(vehicle_events)
+        if pending_vehicle_events and send_vehicle_event(pending_vehicle_events):
+            pending_vehicle_events.clear()
+        pending_intelligence_events.extend(intelligence_events)
+        if pending_intelligence_events and send_cpplus_intelligence_events(
+            pending_intelligence_events
+        ):
+            pending_intelligence_events.clear()
 
-        # Throttle to the target processing rate.
+        target_fps = CPPLUS_TARGET_FPS if official_hours else CPPLUS_AFTER_HOURS_FPS
+        min_interval = 1.0 / target_fps if target_fps > 0 else 0.0
         elapsed = time.monotonic() - loop_start
         if min_interval > elapsed:
             time.sleep(min_interval - elapsed)
@@ -2803,6 +2980,48 @@ class PersonDetector:
 
         return detections
 
+    def detect_people_and_vehicles(
+        self,
+        frame: np.ndarray,
+        confidence_threshold: float,
+    ) -> tuple[
+        list[tuple[tuple[int, int, int, int], float]],
+        list[tuple[tuple[int, int, int, int], float, str]],
+    ]:
+        """Detect C1 pedestrians and vehicles in one model inference."""
+        if self.model is None:
+            return [], []
+
+        class_ids = [0, *VEHICLE_CLASSES]
+        results = self.model(
+            frame,
+            verbose=False,
+            classes=class_ids,
+            conf=min(confidence_threshold, VEHICLE_CONF_THRESHOLD),
+        )
+        people: list[tuple[tuple[int, int, int, int], float]] = []
+        vehicles: list[tuple[tuple[int, int, int, int], float, str]] = []
+        for result in results:
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                confidence = float(box.conf[0])
+                class_id = int(box.cls[0])
+                x1, y1, x2, y2 = box.xyxy[0].int().tolist()
+                bbox = (x1, y1, x2, y2)
+                if class_id == 0 and confidence >= confidence_threshold:
+                    people.append((bbox, confidence))
+                elif (
+                    class_id in VEHICLE_CLASSES
+                    and confidence >= VEHICLE_CONF_THRESHOLD
+                ):
+                    vehicles.append((
+                        bbox,
+                        confidence,
+                        VEHICLE_CLASSES[class_id],
+                    ))
+        return people, vehicles
+
     def detect_vehicles(self, frame: np.ndarray) -> list[tuple[tuple[int, int, int, int], float, str]]:
         """Detect vehicles in a frame.
 
@@ -2869,6 +3088,33 @@ def send_vehicle_event(events: list[dict]) -> bool:
     except Exception as e:
         logger.error("Vehicle API error: %s", e)
 
+    return False
+
+
+def send_cpplus_intelligence_events(events: list[dict]) -> bool:
+    """Send anonymous, non-additive C1 operational signals."""
+    if not events:
+        return True
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.post(
+                CPPLUS_INTELLIGENCE_API,
+                json=events,
+                headers=_agent_secret_headers(),
+            )
+            if response.status_code == 200:
+                logger.info(
+                    "Sent %d C1 intelligence event(s) to cloud — OK",
+                    len(events),
+                )
+                return True
+            logger.warning(
+                "C1 intelligence API returned %d: %s",
+                response.status_code,
+                response.text[:200],
+            )
+    except Exception as exc:
+        logger.error("C1 intelligence API error: %s", exc)
     return False
 
 
@@ -2987,12 +3233,64 @@ def load_dvr_passwords() -> None:
 # Main Loop
 # ---------------------------------------------------------------------------
 
-def is_monitoring_time() -> bool:
-    """Check if current IST time is within school monitoring hours."""
-    now = datetime.now(IST)
-    start = now.replace(hour=MONITOR_START_HOUR, minute=MONITOR_START_MIN, second=0)
-    end = now.replace(hour=MONITOR_END_HOUR, minute=MONITOR_END_MIN, second=0)
-    return start <= now <= end
+def is_monitoring_time(now: datetime | None = None) -> bool:
+    """Check if an IST time is within official school monitoring hours."""
+    current = now or datetime.now(IST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=IST)
+    else:
+        current = current.astimezone(IST)
+    start = current.replace(
+        hour=MONITOR_START_HOUR,
+        minute=MONITOR_START_MIN,
+        second=0,
+        microsecond=0,
+    )
+    end = current.replace(
+        hour=MONITOR_END_HOUR,
+        minute=MONITOR_END_MIN,
+        second=0,
+        microsecond=0,
+    )
+    return start <= current < end
+
+
+def is_cpplus_after_hours_time(now: datetime | None = None) -> bool:
+    if not CPPLUS_AFTER_HOURS_ENABLED:
+        return False
+    current = now or datetime.now(IST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=IST)
+    else:
+        current = current.astimezone(IST)
+    morning_start = current.replace(
+        hour=CPPLUS_AFTER_HOURS_START_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    school_start = current.replace(
+        hour=MONITOR_START_HOUR,
+        minute=MONITOR_START_MIN,
+        second=0,
+        microsecond=0,
+    )
+    school_end = current.replace(
+        hour=MONITOR_END_HOUR,
+        minute=MONITOR_END_MIN,
+        second=0,
+        microsecond=0,
+    )
+    evening_end = current.replace(
+        hour=CPPLUS_AFTER_HOURS_END_HOUR,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return (
+        morning_start <= current < school_start
+        or school_end <= current < evening_end
+    )
 
 
 def run_gate_counter():
