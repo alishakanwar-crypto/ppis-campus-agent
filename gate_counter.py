@@ -840,8 +840,9 @@ def run_cpplus_worker(cam: dict):
                 person_crop = crop_person_jpeg(frame, bbox)
             ts = now.strftime("%Y-%m-%d %H:%M:%S")
             x1, y1, x2, y2 = bbox
+            event_id = uuid4().hex
             audit_events.append({
-                "event_id": uuid4().hex,
+                "event_id": event_id,
                 "timestamp": now.strftime("%d-%m-%Y %H:%M:%S IST"),
                 "camera": cam_name,
                 "direction": person_dir,
@@ -853,6 +854,7 @@ def run_cpplus_worker(cam: dict):
                 "daily_out": daily_out,
             })
             events.append({
+                "event_id": event_id,
                 "timestamp": ts,
                 "camera": cam_name,
                 "direction": person_dir,
