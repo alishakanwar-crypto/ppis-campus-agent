@@ -439,6 +439,16 @@ def compress_jpeg(data: bytes, max_bytes: int = 200_000, quality_start: int = 70
 
 
 _last_capture_error: str = ""
+_digest_auth_cache: dict[tuple[str, str, str], httpx.DigestAuth] = {}
+
+
+def _digest_auth(ip: str, user: str, password: str) -> httpx.DigestAuth:
+    key = (ip, user, password)
+    auth = _digest_auth_cache.get(key)
+    if auth is None:
+        auth = httpx.DigestAuth(user, password)
+        _digest_auth_cache[key] = auth
+    return auth
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +539,8 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
             timeout=httpx.Timeout(8.0, connect=3.0)
         ) as client:
             # Try digest auth first (Hikvision default), then basic
-            resp = await client.get(url, auth=httpx.DigestAuth(user, pwd))
+            digest_auth = _digest_auth(ip, user, pwd)
+            resp = await client.get(url, auth=digest_auth)
             if resp.status_code == 401:
                 resp = await client.get(url, auth=httpx.BasicAuth(user, pwd))
 
@@ -551,7 +562,7 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
                 # Try alternate URL format (sub-stream: channel*100 + 2)
                 alt_stream = channel * 100 + 2
                 alt_url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{alt_stream}/picture"
-                resp2 = await client.get(alt_url, auth=httpx.DigestAuth(user, pwd))
+                resp2 = await client.get(alt_url, auth=digest_auth)
                 if resp2.status_code == 200 and resp2.headers.get("content-type", "").startswith("image"):
                     logger.info(f"Snapshot captured (sub-stream): {len(resp2.content)} bytes")
                     _last_capture_error = ""
@@ -559,7 +570,7 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
 
                 # Try without /ISAPI prefix
                 alt_url2 = f"http://{ip}:{port}/Streaming/channels/{stream_channel}/picture"
-                resp3 = await client.get(alt_url2, auth=httpx.DigestAuth(user, pwd))
+                resp3 = await client.get(alt_url2, auth=digest_auth)
                 if resp3.status_code == 200 and resp3.headers.get("content-type", "").startswith("image"):
                     logger.info(f"Snapshot captured (alt2 URL): {len(resp3.content)} bytes")
                     _last_capture_error = ""
@@ -992,13 +1003,44 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
 
     logger.info(f"Capturing from {len(all_cameras)} camera(s) for {classroom}")
 
-    results = await asyncio.gather(*(
-        _capture_classroom_camera(classroom, camera)
+    capture_tasks = [
+        asyncio.create_task(_capture_classroom_camera(classroom, camera))
         for camera in all_cameras[:2]
-    ))
-    raw_images = [result for result in results if result is not None]
+    ]
+    expected_total = len(capture_tasks)
+    sent_count = 0
 
-    if not raw_images:
+    for completed in asyncio.as_completed(capture_tasks):
+        result = await completed
+        if result is None:
+            continue
+
+        raw_data, filename, desc = result
+        compressed = compress_jpeg(raw_data)
+        b64 = base64.b64encode(compressed).decode("ascii")
+        await ws.send(json.dumps({
+            "type": "snapshot_image",
+            "request_id": request_id,
+            "classroom": classroom,
+            "image_index": sent_count,
+            "image_total": expected_total,
+            "filename": filename,
+            "image_base64": b64,
+            "size_bytes": len(compressed),
+            "description": desc,
+        }))
+        sent_count += 1
+        logger.info(
+            "Sent image %d/%d: %s (%d bytes) - %s in %.2fs",
+            sent_count,
+            expected_total,
+            filename,
+            len(compressed),
+            desc,
+            time.monotonic() - request_started,
+        )
+
+    if sent_count == 0:
         await ws.send(json.dumps({
             "type": "snapshot_response",
             "request_id": request_id,
@@ -1008,38 +1050,18 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         }))
         return
 
-    total = len(raw_images)
-    logger.info(f"Sending {total} snapshot(s) for {classroom} individually")
-
-    # Send each image as a separate message (avoids WebSocket size limits)
-    for idx, (raw_data, filename, desc) in enumerate(raw_images):
-        compressed = compress_jpeg(raw_data)
-        b64 = base64.b64encode(compressed).decode("ascii")
-        await ws.send(json.dumps({
-            "type": "snapshot_image",
-            "request_id": request_id,
-            "classroom": classroom,
-            "image_index": idx,
-            "image_total": total,
-            "filename": filename,
-            "image_base64": b64,
-            "size_bytes": len(compressed),
-            "description": desc,
-        }))
-        logger.info(f"Sent image {idx+1}/{total}: {filename} ({len(compressed)} bytes) - {desc}")
-
     # Send completion message
     await ws.send(json.dumps({
         "type": "snapshot_complete",
         "request_id": request_id,
         "success": True,
         "classroom": classroom,
-        "image_count": total,
+        "image_count": sent_count,
     }))
     logger.info(
         "Sent snapshot_complete for %s: %d image(s) in %.2fs",
         classroom,
-        total,
+        sent_count,
         time.monotonic() - request_started,
     )
 
