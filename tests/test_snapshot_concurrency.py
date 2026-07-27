@@ -17,6 +17,40 @@ class FakeWebSocket:
 
 
 class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_uses_direct_main_stream_without_resolution_probe(self):
+        requested_urls = []
+
+        class Response:
+            status_code = 200
+            headers = {"content-type": "image/jpeg"}
+            content = b"jpeg"
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def get(self, url, auth):
+                requested_urls.append(url)
+                return Response()
+
+        dvr = {
+            "ip": "192.0.2.1",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            snapshot = await main.capture_snapshot(dvr, 3)
+
+        self.assertEqual(snapshot, b"jpeg")
+        self.assertEqual(
+            requested_urls,
+            ["http://192.0.2.1:80/ISAPI/Streaming/channels/301/picture"],
+        )
+
     async def test_two_classroom_cameras_capture_in_parallel(self):
         cameras = [
             ({"ip": "192.0.2.1"}, 1, "TEST C1"),
