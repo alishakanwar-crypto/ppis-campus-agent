@@ -11,9 +11,11 @@ import main
 class FakeWebSocket:
     def __init__(self):
         self.messages = []
+        self.message_event = asyncio.Event()
 
     async def send(self, message):
         self.messages.append(json.loads(message))
+        self.message_event.set()
 
 
 class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
@@ -51,6 +53,38 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             ["http://192.0.2.1:80/ISAPI/Streaming/channels/301/picture"],
         )
 
+    async def test_digest_auth_is_reused_for_repeat_snapshots(self):
+        auth_objects = []
+
+        class Response:
+            status_code = 200
+            headers = {"content-type": "image/jpeg"}
+            content = b"jpeg"
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def get(self, _url, auth):
+                auth_objects.append(auth)
+                return Response()
+
+        dvr = {
+            "ip": "192.0.2.2",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        main._digest_auth_cache.clear()
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            await main.capture_snapshot(dvr, 3)
+            await main.capture_snapshot(dvr, 3)
+
+        self.assertIs(auth_objects[0], auth_objects[1])
+
     async def test_two_classroom_cameras_capture_in_parallel(self):
         cameras = [
             ({"ip": "192.0.2.1"}, 1, "TEST C1"),
@@ -85,6 +119,36 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             [message.get("description") for message in websocket.messages[:2]],
             ["TEST C1", "TEST C2"],
         )
+
+    async def test_first_completed_camera_is_sent_without_waiting_for_second(self):
+        cameras = [
+            ({"ip": "192.0.2.1"}, 1, "SLOW C1"),
+            ({"ip": "192.0.2.1"}, 2, "FAST C2"),
+        ]
+        release_slow_camera = asyncio.Event()
+
+        async def capture(_dvr, channel):
+            if channel == 1:
+                await release_slow_camera.wait()
+            return b"jpeg"
+
+        websocket = FakeWebSocket()
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            main, "find_all_cameras_for_classroom", return_value=cameras
+        ), patch.object(main, "capture_snapshot", side_effect=capture), patch.object(
+            main, "SNAPSHOT_DIR", Path(directory)
+        ), patch.object(main, "compress_jpeg", side_effect=lambda data: data):
+            request_task = asyncio.create_task(
+                main._handle_snapshot_request(websocket, "TEST", "request-1")
+            )
+            await asyncio.wait_for(websocket.message_event.wait(), timeout=1)
+            self.assertEqual(websocket.messages[0]["type"], "snapshot_image")
+            self.assertEqual(websocket.messages[0]["description"], "FAST C2")
+            self.assertFalse(request_task.done())
+            release_slow_camera.set()
+            await request_task
+
+        self.assertEqual(websocket.messages[-1]["type"], "snapshot_complete")
 
     async def test_two_snapshot_requests_can_run_concurrently(self):
         cameras = [
