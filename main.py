@@ -515,30 +515,14 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
     # Hikvision uses channelNo * 100 + 1 for main stream snapshot
     stream_channel = channel * 100 + 1
 
-    # Probe native resolution for highest quality capture
-    from attendance_engine import _probe_channel_resolution, _channel_resolution_cache
-    try:
-        cam_key = f"{ip}:{channel}"
-        if cam_key in _channel_resolution_cache:
-            native_res = _channel_resolution_cache[cam_key]
-        else:
-            async with httpx.AsyncClient(
-                timeout=5.0,
-                auth=httpx.DigestAuth(user, pwd),
-            ) as probe_client:
-                native_res = await asyncio.wait_for(
-                    _probe_channel_resolution(probe_client, ip, port, channel),
-                    timeout=5.0,
-                )
-        req_w = native_res[0] if native_res else 1920
-        req_h = native_res[1] if native_res else 1080
-    except Exception:
-        req_w, req_h = 1920, 1080
-
-    url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
-           f"?snapShotImageType=JPEG&videoResolutionWidth={req_w}&videoResolutionHeight={req_h}")
-
-    logger.info(f"Capturing snapshot from {ip} channel {channel} (stream {stream_channel}) at {req_w}x{req_h}")
+    url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+    capture_started = time.monotonic()
+    logger.info(
+        "Capturing snapshot from %s channel %d (stream %d)",
+        ip,
+        channel,
+        stream_channel,
+    )
 
     try:
         async with httpx.AsyncClient(
@@ -550,7 +534,13 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
                 resp = await client.get(url, auth=httpx.BasicAuth(user, pwd))
 
             if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-                logger.info(f"Snapshot captured: {len(resp.content)} bytes from {ip} ch{channel}")
+                logger.info(
+                    "Snapshot captured: %d bytes from %s ch%d in %.2fs",
+                    len(resp.content),
+                    ip,
+                    channel,
+                    time.monotonic() - capture_started,
+                )
                 _last_capture_error = ""
                 return resp.content
             else:
@@ -972,6 +962,7 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
 
 
 async def _handle_snapshot_request(ws, classroom: str, request_id: str):
+    request_started = time.monotonic()
     all_cameras = find_all_cameras_for_classroom(classroom)
 
     if not all_cameras:
@@ -1029,7 +1020,12 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         "classroom": classroom,
         "image_count": total,
     }))
-    logger.info(f"Sent snapshot_complete for {classroom}: {total} image(s)")
+    logger.info(
+        "Sent snapshot_complete for %s: %d image(s) in %.2fs",
+        classroom,
+        total,
+        time.monotonic() - request_started,
+    )
 
 
 # ---------------------------------------------------------------------------
