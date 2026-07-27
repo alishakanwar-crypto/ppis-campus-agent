@@ -119,6 +119,59 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_websocket.messages[-1]["type"], "snapshot_complete")
         self.assertEqual(second_websocket.messages[-1]["type"], "snapshot_complete")
 
+    async def test_slow_camera_does_not_block_available_snapshot(self):
+        cameras = [
+            ({"ip": "192.0.2.1"}, 1, "TEST C1"),
+            ({"ip": "192.0.2.1"}, 2, "TEST C2"),
+        ]
+
+        async def capture(_dvr, channel):
+            if channel == 1:
+                await asyncio.sleep(1)
+            return b"jpeg"
+
+        websocket = FakeWebSocket()
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            main, "find_all_cameras_for_classroom", return_value=cameras
+        ), patch.object(main, "capture_snapshot", side_effect=capture), patch.object(
+            main, "SNAPSHOT_DIR", Path(directory)
+        ), patch.object(main, "compress_jpeg", side_effect=lambda data: data), patch.object(
+            main, "_SNAPSHOT_CAMERA_TIMEOUT_SECONDS", 0.01
+        ):
+            await main._handle_snapshot_request(websocket, "TEST", "request-1")
+
+        self.assertEqual(
+            [message["type"] for message in websocket.messages],
+            ["snapshot_image", "snapshot_complete"],
+        )
+        self.assertEqual(websocket.messages[0]["description"], "TEST C2")
+        self.assertEqual(websocket.messages[-1]["image_count"], 1)
+
+    async def test_websocket_watchdog_restarts_missing_task(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def websocket_client():
+            started.set()
+            await release.wait()
+
+        previous_task = main.ws_task
+        previous_connection = main.ws_connection
+        main.ws_task = None
+        main.ws_connection = object()
+        try:
+            with patch.object(main, "websocket_client", side_effect=websocket_client):
+                self.assertTrue(main._restart_websocket_task_if_needed())
+                await asyncio.wait_for(started.wait(), timeout=1)
+                self.assertIsNone(main.ws_connection)
+                self.assertFalse(main._restart_websocket_task_if_needed())
+        finally:
+            release.set()
+            if main.ws_task is not None:
+                await main.ws_task
+            main.ws_task = previous_task
+            main.ws_connection = previous_connection
+
 
 if __name__ == "__main__":
     unittest.main()
