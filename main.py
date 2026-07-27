@@ -770,6 +770,9 @@ _snapshot_tasks: set[asyncio.Task] = set()
 _snapshot_request_semaphore = asyncio.Semaphore(
     max(1, int(os.environ.get("SNAPSHOT_CONCURRENT_REQUESTS", "2")))
 )
+_SNAPSHOT_CAMERA_TIMEOUT_SECONDS = max(
+    1.0, float(os.environ.get("SNAPSHOT_CAMERA_TIMEOUT_SECONDS", "12"))
+)
 
 
 def _snapshot_task_done(task: asyncio.Task) -> None:
@@ -795,7 +798,7 @@ async def websocket_client():
                 url,
                 extra_headers={"X-Agent-Secret": secret},
                 ping_interval=30,
-                ping_timeout=10,
+                ping_timeout=30,
                 max_size=10 * 1024 * 1024,  # 10 MB max message size
             ) as ws:
                 ws_connection = ws
@@ -929,7 +932,20 @@ async def _capture_classroom_camera(
     camera: tuple[dict, int, str],
 ) -> tuple[bytes, str, str] | None:
     dvr, channel, desc = camera
-    snapshot = await capture_snapshot(dvr, channel)
+    try:
+        snapshot = await asyncio.wait_for(
+            capture_snapshot(dvr, channel),
+            timeout=_SNAPSHOT_CAMERA_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Snapshot timed out after %.1fs from DVR %s channel %d (%s)",
+            _SNAPSHOT_CAMERA_TIMEOUT_SECONDS,
+            dvr["ip"],
+            channel,
+            desc,
+        )
+        return None
     if not snapshot:
         logger.warning(
             f"Failed to capture from DVR {dvr['ip']} channel {channel} ({desc})"
@@ -1089,6 +1105,23 @@ async def _auto_start_mood_and_sighting():
         logger.error(f"Mood/Sighting auto-start failed: {e}", exc_info=True)
 
 
+def _restart_websocket_task_if_needed() -> bool:
+    global ws_connection, ws_task
+    if ws_task is not None and not ws_task.done():
+        return False
+
+    if ws_task is not None:
+        try:
+            error = ws_task.exception()
+        except (asyncio.CancelledError, asyncio.InvalidStateError):
+            error = None
+        logger.error("WATCHDOG: WebSocket task stopped — restarting (%s)", error)
+
+    ws_connection = None
+    ws_task = asyncio.create_task(websocket_client())
+    return True
+
+
 async def _health_watchdog():
     """Background watchdog that monitors system health and auto-recovers.
 
@@ -1106,6 +1139,8 @@ async def _health_watchdog():
     while True:
         await asyncio.sleep(60)
         try:
+            _restart_websocket_task_if_needed()
+
             # --- Check 1: Classwise monitoring alive ---
             if attendance_engine._health.get("auto_start_enabled", True):
                 if not attendance_engine.classwise_running and not attendance_engine.running:
@@ -1303,7 +1338,7 @@ async def lifespan(app: FastAPI):
     # Start WebSocket client FIRST — connects to backend immediately
     # so snapshot requests work even during face sync
     logger.info("Starting WebSocket client task...")
-    ws_task = asyncio.create_task(websocket_client())
+    _restart_websocket_task_if_needed()
 
     # Clean up known junk/duplicate face entries before syncing
     cleanup_junk_face_entries()
