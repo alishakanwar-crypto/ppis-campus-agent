@@ -17,7 +17,6 @@ The run_trueface.bat wrapper handles auto-restart on crash.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import signal
@@ -26,6 +25,9 @@ import time
 from datetime import datetime, timezone, timedelta
 
 import httpx
+
+from process_priority import set_windows_process_priority
+from trueface_instance import acquire_single_instance, release_single_instance
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -43,6 +45,7 @@ CLOUD_API = os.environ.get(
 
 POLL_INTERVAL = int(os.environ.get("TRUEFACE_POLL_SECONDS", "3"))
 SCAN_DELAY = 1.5  # seconds to wait after clicking Query before reading table
+SELENIUM_TIMEOUT_SECONDS = 30
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -113,10 +116,17 @@ def _create_driver():
 
     if driver_path:
         service = Service(executable_path=driver_path)
-        return webdriver.Chrome(service=service, options=opts)
+        driver = webdriver.Chrome(service=service, options=opts)
     else:
         # Let Selenium find it automatically
-        return webdriver.Chrome(options=opts)
+        driver = webdriver.Chrome(options=opts)
+
+    driver.set_page_load_timeout(SELENIUM_TIMEOUT_SECONDS)
+    driver.set_script_timeout(SELENIUM_TIMEOUT_SECONDS)
+    client_config = getattr(driver.command_executor, "_client_config", None)
+    if client_config is not None and hasattr(client_config, "timeout"):
+        client_config.timeout = SELENIUM_TIMEOUT_SECONDS
+    return driver
 
 
 def _login(driver):
@@ -125,11 +135,11 @@ def _login(driver):
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
-    logger.info("Logging in to %s ...", DEVICE_URL)
-    driver.get(DEVICE_URL)
-    time.sleep(5)  # Allow page to fully render before interacting
-
     try:
+        logger.info("Logging in to %s ...", DEVICE_URL)
+        driver.get(DEVICE_URL)
+        time.sleep(5)  # Allow page to fully render before interacting
+
         # Wait for username field to be clickable (not just present)
         user_input = WebDriverWait(driver, 15).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='text'], input[name='username'], input[placeholder*='user' i]"))
@@ -184,9 +194,6 @@ def _navigate_to_search_records(driver):
           └── Alarm Log
     """
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-
     logger.info("Navigating to Search Records page...")
     time.sleep(2)
 
@@ -760,7 +767,7 @@ def run_poller():
 
     driver = None
     consecutive_errors = 0
-    max_errors = 10
+    max_errors = 3
     poll_count = 0
     SESSION_REFRESH_EVERY = 300  # Re-login every 300 polls (~15 min) to keep session alive
 
@@ -781,7 +788,10 @@ def run_poller():
                 driver = _create_driver()
                 if not _login(driver):
                     logger.error("Login failed — retrying in 30s")
-                    driver.quit()
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
                     driver = None
                     time.sleep(30)
                     continue
@@ -913,12 +923,22 @@ def test_connectivity():
         print("  Also need chromedriver matching your Chrome version")
 
 
+def _run_from_args(args):
+    if args.test:
+        test_connectivity()
+        return
+
+    if not acquire_single_instance():
+        sys.exit(1)
+
+    set_windows_process_priority("ABOVE_NORMAL_PRIORITY_CLASS", "TrueFace poller")
+    try:
+        run_poller()
+    finally:
+        release_single_instance()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TrueFace 3000 Auto-Poller")
     parser.add_argument("--test", action="store_true", help="Test connectivity")
-    args = parser.parse_args()
-
-    if args.test:
-        test_connectivity()
-    else:
-        run_poller()
+    _run_from_args(parser.parse_args())

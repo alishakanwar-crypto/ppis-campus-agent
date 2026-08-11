@@ -72,6 +72,7 @@ import httpx
 import numpy as np
 
 from gate_intelligence import GateIntelligenceConfig, GateIntelligenceMonitor
+from process_priority import set_windows_process_priority
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -3696,4 +3697,5 @@ if __name__ == "__main__":
     if args.test:
         test_connectivity()
     else:
+        set_windows_process_priority("BELOW_NORMAL_PRIORITY_CLASS", "Gate counter")
         run_gate_counter()
