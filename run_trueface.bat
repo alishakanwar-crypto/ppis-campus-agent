@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 REM TrueFace 3000 Auto-Poller — Auto-restart wrapper
 REM Runs alongside the main campus agent.
 REM Auto-restarts if the poller crashes.
@@ -19,13 +20,22 @@ git fetch origin 2>nul
 git reset --hard origin/main 2>nul
 
 REM The Python mutex is the authoritative single-instance guard. This
-REM process check avoids needless wrapper churn during normal startup.
-wmic process where "name='python.exe'" get commandline 2>nul | find /i "trueface_poller" >nul
-if %ERRORLEVEL% EQU 0 (
-    echo [%DATE% %TIME%] TrueFace poller already running; launcher exiting.
-    exit /b 0
+REM check only waits for a process that is still shutting down; it must
+REM never make the supervision wrapper exit.
+set "DUPLICATE_WAIT=0"
+:wait_for_existing_poller
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'python.exe' }; if ($p | Where-Object { $_.CommandLine -match 'trueface_poller' }) { exit 0 } else { exit 1 }" >nul 2>&1
+if !ERRORLEVEL! NEQ 0 goto launch_poller
+echo [%DATE% %TIME%] Existing TrueFace poller is still clearing; waiting... >> "%~dp0trueface_poller.log"
+if !DUPLICATE_WAIT! GEQ 30 (
+    echo [%DATE% %TIME%] Existing poller did not clear after 30 seconds; proceeding and letting the mutex decide. >> "%~dp0trueface_poller.log"
+    goto launch_poller
 )
+set /a DUPLICATE_WAIT+=5
+timeout /t 5 /nobreak >nul
+goto wait_for_existing_poller
 
+:launch_poller
 py -3.12 trueface_poller.py
 echo.
 echo [%DATE% %TIME%] Poller stopped (exit code: %ERRORLEVEL%). Restarting in 10 seconds...
