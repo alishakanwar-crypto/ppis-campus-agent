@@ -923,19 +923,22 @@ def test_connectivity():
         print("  Also need chromedriver matching your Chrome version")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TrueFace 3000 Auto-Poller")
-    parser.add_argument("--test", action="store_true", help="Test connectivity")
-    args = parser.parse_args()
+def _run_from_args(args):
+    if args.test:
+        test_connectivity()
+        return
 
     if not acquire_single_instance():
         sys.exit(1)
 
     set_windows_process_priority("ABOVE_NORMAL_PRIORITY_CLASS", "TrueFace poller")
     try:
-        if args.test:
-            test_connectivity()
-        else:
-            run_poller()
+        run_poller()
     finally:
         release_single_instance()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="TrueFace 3000 Auto-Poller")
+    parser.add_argument("--test", action="store_true", help="Test connectivity")
+    _run_from_args(parser.parse_args())

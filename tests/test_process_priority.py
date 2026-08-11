@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import process_priority
 import trueface_instance
+import trueface_poller
 
 
 class TestProcessPriority(unittest.TestCase):
@@ -42,6 +43,19 @@ class TestProcessPriority(unittest.TestCase):
 
 
 class TestTrueFaceInstance(unittest.TestCase):
+    def test_connectivity_test_is_not_blocked_by_running_poller(self):
+        args = type("Args", (), {"test": True})()
+        with (
+            patch.object(trueface_poller, "test_connectivity") as test_connectivity,
+            patch.object(
+                trueface_poller,
+                "acquire_single_instance",
+                side_effect=AssertionError("test mode must not acquire mutex"),
+            ),
+        ):
+            trueface_poller._run_from_args(args)
+        test_connectivity.assert_called_once_with()
+
     def test_instance_guard_is_noop_off_windows(self):
         with patch.object(trueface_instance.os, "name", "posix"):
             self.assertTrue(trueface_instance.acquire_single_instance())
