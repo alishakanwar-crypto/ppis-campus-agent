@@ -13,23 +13,19 @@ set LOGFILE=%~dp0watchdog.log
 set NEED_AGENT=0
 set NEED_TRUEFACE=0
 
-REM Check if campus agent (main.py) is running
-wmic process where "name='python.exe'" get commandline 2>nul | find /i "main.py" >nul
+REM Check if campus agent (main.py) is running. If PowerShell/CIM fails,
+REM the nonzero status deliberately fails open and requests a start.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'python.exe' }; if ($p | Where-Object { $_.CommandLine -match 'main.py' }) { exit 0 } else { exit 1 }" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     set NEED_AGENT=1
 )
 
-REM Check if TrueFace poller (trueface_poller.py) is running
-wmic process where "name='python.exe'" get commandline 2>nul | find /i "trueface_poller" >nul
+REM Check if TrueFace poller (trueface_poller.py) is running. If the
+REM process query fails, request a start; the Python mutex remains
+REM authoritative if an old process is still shutting down.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'python.exe' }; if ($p | Where-Object { $_.CommandLine -match 'trueface_poller' }) { exit 0 } else { exit 1 }" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     set NEED_TRUEFACE=1
-)
-
-REM A wrapper may be between launches and the Python process appearing.
-REM Do not start a second wrapper during that short handoff window.
-wmic process where "name='cmd.exe'" get commandline 2>nul | find /i "run_trueface.bat" >nul
-if %ERRORLEVEL% EQU 0 (
-    set NEED_TRUEFACE=0
 )
 
 REM If both are running, do nothing
