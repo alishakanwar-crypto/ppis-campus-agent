@@ -25,6 +25,13 @@ if %ERRORLEVEL% NEQ 0 (
     set NEED_TRUEFACE=1
 )
 
+REM A wrapper may be between launches and the Python process appearing.
+REM Do not start a second wrapper during that short handoff window.
+wmic process where "name='cmd.exe'" get commandline 2>nul | find /i "run_trueface.bat" >nul
+if %ERRORLEVEL% EQU 0 (
+    set NEED_TRUEFACE=0
+)
+
 REM If both are running, do nothing
 if "%NEED_AGENT%"=="0" if "%NEED_TRUEFACE%"=="0" exit /b 0
 

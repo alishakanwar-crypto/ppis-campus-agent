@@ -1339,6 +1339,10 @@ async def _entry_gate_snapshot_loop():
 async def lifespan(app: FastAPI):
     global ws_task, config
 
+    from process_priority import set_windows_process_priority
+
+    set_windows_process_priority("BELOW_NORMAL_PRIORITY_CLASS", "Campus agent")
+
     # Set up asyncio exception handler to log unhandled task errors
     def _handle_task_exception(loop, context):
         exc = context.get("exception")
