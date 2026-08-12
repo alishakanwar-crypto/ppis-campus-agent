@@ -44,6 +44,16 @@ class TestProcessPriority(unittest.TestCase):
 
 
 class TestTrueFaceInstance(unittest.TestCase):
+    def test_duplicate_polling_exits_with_dedicated_code(self):
+        args = type("Args", (), {"test": False})()
+        with patch.object(trueface_poller, "acquire_single_instance", return_value=False):
+            with self.assertRaises(SystemExit) as raised:
+                trueface_poller._run_from_args(args)
+        self.assertEqual(
+            raised.exception.code,
+            trueface_instance.DUPLICATE_INSTANCE_EXIT_CODE,
+        )
+
     def test_connectivity_test_is_not_blocked_by_running_poller(self):
         args = type("Args", (), {"test": True})()
         with (
@@ -109,6 +119,13 @@ class TestTrueFaceInstance(unittest.TestCase):
 
 
 class TestCampusInstance(unittest.TestCase):
+    def test_duplicate_exit_code_is_distinct_from_crash_code(self):
+        self.assertNotEqual(campus_instance.DUPLICATE_INSTANCE_EXIT_CODE, 1)
+        self.assertEqual(
+            campus_instance.DUPLICATE_INSTANCE_EXIT_CODE,
+            trueface_instance.DUPLICATE_INSTANCE_EXIT_CODE,
+        )
+
     def test_mutex_rejects_second_instance(self):
         class FakeFunction:
             def __init__(self, callback):

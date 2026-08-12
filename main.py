@@ -64,10 +64,13 @@ def _kill_port_holder_early(port: int = 8897) -> None:
         pass
 
 if __name__ == "__main__":
-    from campus_instance import acquire_single_instance
+    from campus_instance import (
+        DUPLICATE_INSTANCE_EXIT_CODE,
+        acquire_single_instance,
+    )
 
     if not acquire_single_instance():
-        raise SystemExit(1)
+        raise SystemExit(DUPLICATE_INSTANCE_EXIT_CODE)
 
     # Early diagnostic: write startup timestamp so we know the process launched
     try:

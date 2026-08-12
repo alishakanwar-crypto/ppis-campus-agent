@@ -13,6 +13,7 @@ _MUTEX_NAMES = (
     r"Local\PPIS.CampusAgent",
 )
 _ERROR_ALREADY_EXISTS = 183
+DUPLICATE_INSTANCE_EXIT_CODE = 75
 _mutex_handle = None
 
 

@@ -19,6 +19,8 @@ reg add "HKLM\Software\Microsoft\Windows\Windows Error Reporting" /v Disabled /t
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug" /v Auto /t REG_SZ /d 1 /f >nul 2>&1
 
 set PYTHONDONTWRITEBYTECODE=1
+REM Must match DUPLICATE_INSTANCE_EXIT_CODE in campus_instance.py.
+set "DUPLICATE_EXIT_CODE=75"
 
 :loop
 echo ============================================
@@ -41,7 +43,12 @@ echo.
 echo [%DATE% %TIME%] Starting PPIS Campus Agent...
 echo ============================================
 py -3.12 -B main.py
+set "EXIT_CODE=%ERRORLEVEL%"
+if "%EXIT_CODE%"=="%DUPLICATE_EXIT_CODE%" (
+    echo [%DATE% %TIME%] Another campus agent owns the mutex; wrapper exiting cleanly.
+    exit /b 0
+)
 echo.
-echo [%DATE% %TIME%] Agent stopped (exit code: %ERRORLEVEL%). Restarting in 10 seconds...
+echo [%DATE% %TIME%] Agent stopped (exit code: %EXIT_CODE%). Restarting in 10 seconds...
 timeout /t 10 /nobreak
 goto loop
