@@ -8,6 +8,8 @@ title TrueFace 3000 Poller (24/7)
 cd /d "%~dp0"
 
 set PYTHONDONTWRITEBYTECODE=1
+REM Must match DUPLICATE_INSTANCE_EXIT_CODE in trueface_instance.py.
+set "DUPLICATE_EXIT_CODE=75"
 
 :loop
 echo.
@@ -37,7 +39,12 @@ goto wait_for_existing_poller
 
 :launch_poller
 py -3.12 trueface_poller.py
+set "EXIT_CODE=%ERRORLEVEL%"
+if "%EXIT_CODE%"=="%DUPLICATE_EXIT_CODE%" (
+    echo [%DATE% %TIME%] Another TrueFace poller owns the mutex; wrapper exiting cleanly.
+    exit /b 0
+)
 echo.
-echo [%DATE% %TIME%] Poller stopped (exit code: %ERRORLEVEL%). Restarting in 10 seconds...
+echo [%DATE% %TIME%] Poller stopped (exit code: %EXIT_CODE%). Restarting in 10 seconds...
 timeout /t 10 /nobreak
 goto loop

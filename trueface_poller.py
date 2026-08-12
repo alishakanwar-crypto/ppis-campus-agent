@@ -27,7 +27,11 @@ from datetime import datetime, timezone, timedelta
 import httpx
 
 from process_priority import set_windows_process_priority
-from trueface_instance import acquire_single_instance, release_single_instance
+from trueface_instance import (
+    DUPLICATE_INSTANCE_EXIT_CODE,
+    acquire_single_instance,
+    release_single_instance,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -929,7 +933,7 @@ def _run_from_args(args):
         return
 
     if not acquire_single_instance():
-        sys.exit(1)
+        sys.exit(DUPLICATE_INSTANCE_EXIT_CODE)
 
     set_windows_process_priority("ABOVE_NORMAL_PRIORITY_CLASS", "TrueFace poller")
     try:

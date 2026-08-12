@@ -160,17 +160,12 @@ if !ERRORLEVEL! EQU 0 (
 )
 del "%XMLFILE2%" >nul 2>&1
 
-REM ── Startup folder shortcut (always works) ─────────────────────
+REM ── Remove the legacy startup-folder launcher ──────────────────
 
-echo [4/6] Adding startup folder shortcut...
+echo [4/6] Removing duplicate startup-folder launcher...
 set STARTUP_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
-
-> "%STARTUP_DIR%\PPIS Agent.vbs" (
-    echo Set WshShell = CreateObject^("WScript.Shell"^)
-    echo WshShell.CurrentDirectory = "%AGENT_DIR%"
-    echo WshShell.Run """" ^& "%AGENT_DIR%run_forever.bat" ^& """", 0, False
-)
-echo       Startup folder shortcut created
+if exist "%STARTUP_DIR%\PPIS Agent.vbs" del "%STARTUP_DIR%\PPIS Agent.vbs" >nul 2>&1
+echo       Legacy startup-folder launcher removed
 
 REM ── Verify tasks ───────────────────────────────────────────────
 
@@ -191,11 +186,7 @@ if !ERRORLEVEL! EQU 0 (
     echo       [!!] Watchdog task:   NOT INSTALLED
 )
 
-if exist "%STARTUP_DIR%\PPIS Agent.vbs" (
-    echo       [OK] Startup folder:  INSTALLED
-) else (
-    echo       [!!] Startup folder:  NOT INSTALLED
-)
+echo       [OK] Startup folder:  DISABLED (single scheduled launcher)
 
 REM ── Start the agent NOW ───────────────────────────────────────
 
@@ -214,7 +205,7 @@ echo   Status:    service_status.bat
 echo   Stop:      taskkill /F /IM python.exe
 echo   Uninstall: schtasks /delete /tn "PPIS Campus Agent" /f
 echo              schtasks /delete /tn "PPIS Campus Agent Watchdog" /f
-echo              del "%STARTUP_DIR%\PPIS Agent.vbs"
+echo              del "%STARTUP_DIR%\PPIS Agent.vbs" (already removed)
 echo.
 
 pause

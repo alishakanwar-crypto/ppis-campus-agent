@@ -64,7 +64,14 @@ def _kill_port_holder_early(port: int = 8897) -> None:
         pass
 
 if __name__ == "__main__":
-    _kill_port_holder_early()
+    from campus_instance import (
+        DUPLICATE_INSTANCE_EXIT_CODE,
+        acquire_single_instance,
+    )
+
+    if not acquire_single_instance():
+        raise SystemExit(DUPLICATE_INSTANCE_EXIT_CODE)
+
     # Early diagnostic: write startup timestamp so we know the process launched
     try:
         _diag_path = Path(__file__).parent / "startup_diag.log"
