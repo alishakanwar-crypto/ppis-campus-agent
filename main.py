@@ -503,7 +503,7 @@ class _DvrCaptureLimiter:
 
 
 _DVR_CAPTURE_LIMIT = max(
-    1, int(os.environ.get("DVR_CAPTURE_CONCURRENCY", "3"))
+    1, int(os.environ.get("DVR_CAPTURE_CONCURRENCY", "6"))
 )
 _DVR_BACKGROUND_WAIT_SECONDS = max(
     0.1, float(os.environ.get("DVR_BACKGROUND_WAIT_SECONDS", "5"))
@@ -522,6 +522,12 @@ async def _dvr_limiter(ip: str) -> _DvrCaptureLimiter:
                     _DVR_CAPTURE_LIMIT, _DVR_BACKGROUND_WAIT_SECONDS
                 )
                 _dvr_capture_limiters[ip] = limiter
+    return limiter
+
+
+async def _acquire_dvr_capture(ip: str, background: bool) -> _DvrCaptureLimiter:
+    limiter = await _dvr_limiter(ip)
+    await limiter.acquire(not background)
     return limiter
 
 
@@ -600,6 +606,21 @@ _SNAPSHOT_HTTP_TIMEOUT_SECONDS = max(
     _SNAPSHOT_CONNECT_TIMEOUT_SECONDS,
     float(os.environ.get("SNAPSHOT_HTTP_TIMEOUT_SECONDS", "6")),
 )
+_SNAPSHOT_BACKGROUND_RETRIES = max(
+    1, int(os.environ.get("SNAPSHOT_BACKGROUND_RETRIES", "1"))
+)
+_SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS = max(
+    1.0, float(os.environ.get("SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS", "8"))
+)
+_SNAPSHOT_BACKGROUND_HTTP_TIMEOUT_SECONDS = max(
+    1.0, float(os.environ.get("SNAPSHOT_BACKGROUND_HTTP_TIMEOUT_SECONDS", "4"))
+)
+_SNAPSHOT_BACKGROUND_CONNECT_TIMEOUT_SECONDS = max(
+    1.0, float(os.environ.get("SNAPSHOT_BACKGROUND_CONNECT_TIMEOUT_SECONDS", "3"))
+)
+_SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS", "0.1"))
+)
 
 
 async def _capture_snapshot_once(
@@ -654,23 +675,35 @@ async def capture_snapshot(
         stream_channel,
     )
 
-    limiter = await _dvr_limiter(ip)
-    await limiter.acquire(not background)
+    limiter = await _acquire_dvr_capture(ip, background)
     try:
-        capture_deadline = capture_started + _SNAPSHOT_CAMERA_TIMEOUT_SECONDS
+        retries = _SNAPSHOT_BACKGROUND_RETRIES if background else _SNAPSHOT_RETRIES
+        camera_timeout = (
+            _SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS
+            if background else _SNAPSHOT_CAMERA_TIMEOUT_SECONDS
+        )
+        http_timeout = (
+            _SNAPSHOT_BACKGROUND_HTTP_TIMEOUT_SECONDS
+            if background else _SNAPSHOT_HTTP_TIMEOUT_SECONDS
+        )
+        connect_timeout = (
+            _SNAPSHOT_BACKGROUND_CONNECT_TIMEOUT_SECONDS
+            if background else _SNAPSHOT_CONNECT_TIMEOUT_SECONDS
+        )
+        capture_deadline = capture_started + camera_timeout
         timeout = httpx.Timeout(
-            _SNAPSHOT_HTTP_TIMEOUT_SECONDS,
-            connect=_SNAPSHOT_CONNECT_TIMEOUT_SECONDS,
+            http_timeout,
+            connect=connect_timeout,
         )
         async with httpx.AsyncClient(timeout=timeout) as client:
-            for attempt in range(_SNAPSHOT_RETRIES):
+            for attempt in range(retries):
                 remaining = capture_deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 try:
                     snapshot = await asyncio.wait_for(
                         _capture_snapshot_once(dvr, channel, client),
-                        timeout=min(_SNAPSHOT_HTTP_TIMEOUT_SECONDS, remaining),
+                        timeout=min(http_timeout, remaining),
                     )
                     if snapshot:
                         logger.info(
@@ -681,9 +714,10 @@ async def capture_snapshot(
                         _last_capture_error = ""
                         return snapshot
                     _last_capture_error = f"{ip} ch{channel}: ISAPI capture failed"
-                    if attempt < _SNAPSHOT_RETRIES - 1:
+                    if attempt < retries - 1:
                         await asyncio.sleep(min(
-                            _SNAPSHOT_RETRY_BACKOFF_SECONDS,
+                            _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
+                            else _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
                             max(0.0, capture_deadline - time.monotonic()),
                         ))
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
@@ -692,22 +726,24 @@ async def capture_snapshot(
                     )
                     logger.warning(
                         "Snapshot attempt %d/%d failed from %s ch%d: %s",
-                        attempt + 1, _SNAPSHOT_RETRIES, ip, channel, exc,
+                        attempt + 1, retries, ip, channel, exc,
                     )
-                    if attempt < _SNAPSHOT_RETRIES - 1:
+                    if attempt < retries - 1:
                         await asyncio.sleep(min(
-                            _SNAPSHOT_RETRY_BACKOFF_SECONDS,
+                            _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
+                            else _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
                             max(0.0, capture_deadline - time.monotonic()),
                         ))
                 except asyncio.TimeoutError as exc:
                     _last_capture_error = f"{ip} ch{channel}: snapshot_timeout ({exc})"
                     logger.warning(
                         "Snapshot attempt %d/%d timed out from %s ch%d",
-                        attempt + 1, _SNAPSHOT_RETRIES, ip, channel,
+                        attempt + 1, retries, ip, channel,
                     )
-                    if attempt < _SNAPSHOT_RETRIES - 1:
+                    if attempt < retries - 1:
                         await asyncio.sleep(min(
-                            _SNAPSHOT_RETRY_BACKOFF_SECONDS,
+                            _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
+                            else _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
                             max(0.0, capture_deadline - time.monotonic()),
                         ))
                 except Exception as exc:
@@ -715,7 +751,7 @@ async def capture_snapshot(
                     logger.error("Snapshot error from %s ch%d: %s", ip, channel, exc)
                     break
             remaining = capture_deadline - time.monotonic()
-            if remaining > 0:
+            if remaining > 0 and (not background or ip in _RTSP_FALLBACK_IPS):
                 logger.info("ISAPI exhausted for %s ch%d, trying RTSP fallback", ip, channel)
                 try:
                     rtsp_frame = await asyncio.wait_for(

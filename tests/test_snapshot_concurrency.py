@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import attendance_engine
 import main
 
 
@@ -151,6 +152,86 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(snapshot, b"rtsp")
         fallback.assert_awaited_once_with(dvr, 3)
+
+    async def test_background_capture_uses_short_budget_and_no_general_rtsp(self):
+        class Client:
+            def __init__(self):
+                self.calls = 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def get(self, _url, auth):
+                self.calls += 1
+                raise main.httpx.ConnectTimeout("busy")
+
+        dvr = {
+            "ip": "192.0.2.5",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        client = Client()
+        with patch.object(main.httpx, "AsyncClient", return_value=client), patch.object(
+            main, "_SNAPSHOT_RETRIES", 3
+        ), patch.object(main, "_SNAPSHOT_BACKGROUND_RETRIES", 1), patch.object(
+            main, "_SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS", 1
+        ), patch.object(main, "_SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS", 0), patch.object(
+            main, "_capture_snapshot_rtsp", new=AsyncMock()
+        ) as fallback:
+            snapshot = await main.capture_snapshot(dvr, 3, background=True)
+
+        self.assertIsNone(snapshot)
+        self.assertEqual(client.calls, 1)
+        fallback.assert_not_awaited()
+
+    async def test_attendance_capture_keeps_native_resolution_request(self):
+        class Response:
+            status_code = 200
+            headers = {"content-type": "image/jpeg"}
+            content = b"high-resolution-jpeg"
+
+        class Client:
+            async def get(self, url):
+                requested_urls.append(url)
+                return Response()
+
+        class Limiter:
+            async def release(self, _background):
+                return None
+
+        requested_urls = []
+        dvr = {
+            "ip": "192.0.2.6",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        engine = attendance_engine.AttendanceEngine()
+        engine._get_dvr_client = lambda _dvr: Client()
+        attendance_engine._channel_resolution_cache.clear()
+        with patch.object(
+            main, "_acquire_dvr_capture", new=AsyncMock(return_value=Limiter())
+        ), patch.object(
+            attendance_engine, "_probe_channel_resolution",
+            new=AsyncMock(return_value=(3840, 2160)),
+        ), patch.object(
+            main, "_SNAPSHOT_BACKGROUND_RETRIES", 1
+        ):
+            frame = await engine.capture_frame_from_dvr(dvr, 7)
+
+        self.assertEqual(frame, b"high-resolution-jpeg")
+        self.assertEqual(
+            requested_urls,
+            [
+                "http://192.0.2.6:80/ISAPI/Streaming/channels/701/picture"
+                "?snapShotImageType=JPEG"
+                "&videoResolutionWidth=3840&videoResolutionHeight=2160"
+            ],
+        )
 
     async def test_live_capture_has_priority_and_limiter_releases_on_error(self):
         limiter = main._DvrCaptureLimiter(limit=1, background_wait=0.05)

@@ -211,7 +211,6 @@ class TeacherSightingTracker:
         self.agent_secret = agent_secret
         self.running = False
         self._task: asyncio.Task | None = None
-        self._dvr_clients: dict[str, httpx.AsyncClient] = {}
         self._teacher_encodings: dict[str, dict] = {}
         self._all_encodings: dict[str, dict] = {}  # all registered faces
         # Dedup: (person_id, camera_label) → last_sighting_timestamp
@@ -234,16 +233,6 @@ class TeacherSightingTracker:
                 self._teacher_encodings[pid] = data
         logger.info(f"[SIGHTING] Loaded {len(self._teacher_encodings)} teacher faces, "
                      f"{len(self._all_encodings)} total known faces")
-
-    def _get_dvr_client(self, dvr: dict) -> httpx.AsyncClient:
-        ip = dvr["ip"]
-        if ip not in self._dvr_clients:
-            self._dvr_clients[ip] = httpx.AsyncClient(
-                timeout=15,
-                auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
-                limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
-            )
-        return self._dvr_clients[ip]
 
     async def _capture_frame(self, dvr: dict, channel: int) -> bytes | None:
         try:

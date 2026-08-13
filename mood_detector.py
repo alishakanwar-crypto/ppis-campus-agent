@@ -188,7 +188,6 @@ class MoodDetector:
         self.agent_secret = agent_secret
         self.running = False
         self._task: asyncio.Task | None = None
-        self._dvr_clients: dict[str, httpx.AsyncClient] = {}
         self._emotion_net = None
         self._face_cascade = None
         self._tracked_encodings: dict[str, list] = {}
@@ -252,16 +251,6 @@ class MoodDetector:
                         break
 
         logger.info(f"[MOOD] Tracked persons loaded: {list(self._tracked_encodings.keys())}")
-
-    def _get_dvr_client(self, dvr: dict) -> httpx.AsyncClient:
-        ip = dvr["ip"]
-        if ip not in self._dvr_clients:
-            self._dvr_clients[ip] = httpx.AsyncClient(
-                timeout=15,
-                auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
-                limits=httpx.Limits(max_connections=3, max_keepalive_connections=2),
-            )
-        return self._dvr_clients[ip]
 
     async def _capture_frame(self, dvr: dict, channel: int) -> bytes | None:
         try:

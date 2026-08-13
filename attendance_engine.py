@@ -2401,20 +2401,84 @@ class AttendanceEngine:
         Probes the camera's native resolution on first call and requests
         the highest available quality (up to 4MP if the camera supports it).
         """
+        from main import (
+            _SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS,
+            _SNAPSHOT_BACKGROUND_HTTP_TIMEOUT_SECONDS,
+            _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
+            _SNAPSHOT_BACKGROUND_RETRIES,
+            _RTSP_FALLBACK_IPS,
+            _acquire_dvr_capture,
+            _capture_snapshot_rtsp,
+        )
+
+        ip = dvr["ip"]
+        port = dvr.get("port", 80)
+        cam_key = f"{ip}:{channel}"
+        limiter = await _acquire_dvr_capture(ip, background=True)
+        started = time.monotonic()
         try:
-            from main import capture_snapshot
-            frame = await capture_snapshot(dvr, channel, background=True)
-            cam_key = f"{dvr['ip']}:{channel}"
-            if frame:
-                self._camera_errors.pop(cam_key, None)
-            else:
-                self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
-            return frame
+            client = self._get_dvr_client(dvr)
+            deadline = started + _SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            native_res = await asyncio.wait_for(
+                _probe_channel_resolution(client, ip, port, channel),
+                timeout=min(_SNAPSHOT_BACKGROUND_HTTP_TIMEOUT_SECONDS, remaining),
+            )
+            req_w, req_h = native_res or (1920, 1080)
+            stream_channel = channel * 100 + 1
+            url = (
+                f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+                f"?snapShotImageType=JPEG"
+                f"&videoResolutionWidth={req_w}&videoResolutionHeight={req_h}"
+            )
+
+            attempts = min(max_retries, _SNAPSHOT_BACKGROUND_RETRIES)
+            for attempt in range(attempts):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    resp = await asyncio.wait_for(
+                        client.get(url),
+                        timeout=min(_SNAPSHOT_BACKGROUND_HTTP_TIMEOUT_SECONDS, remaining),
+                    )
+                    if resp.status_code == 200 and resp.headers.get(
+                            "content-type", "").startswith("image"):
+                        self._camera_errors.pop(cam_key, None)
+                        return resp.content
+                    self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
+                except (asyncio.TimeoutError, httpx.ConnectError,
+                        httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+                    self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
+                    if attempt == attempts - 1:
+                        self.add_debug_log(
+                            "dvr_error",
+                            f"Capture failed from {ip} ch{channel}: {exc}",
+                        )
+                if attempt < attempts - 1:
+                    await asyncio.sleep(min(
+                        _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
+                        max(0.0, deadline - time.monotonic()),
+                    ))
+
+            remaining = deadline - time.monotonic()
+            if ip in _RTSP_FALLBACK_IPS and remaining > 0:
+                try:
+                    return await asyncio.wait_for(
+                        _capture_snapshot_rtsp(dvr, channel), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            return None
         except Exception as e:
             self.add_debug_log(
-                "dvr_error", f"Capture failed from {dvr['ip']} ch{channel}: {e}"
+                "dvr_error", f"Capture failed from {ip} ch{channel}: {e}"
             )
             return None
+        finally:
+            await limiter.release(False)
 
     async def scan_camera(self, dvr: dict, channel: int,
                           camera_label: str = "",
