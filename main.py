@@ -11,7 +11,9 @@ Features:
 
 from __future__ import annotations
 
+import concurrent.futures
 import faulthandler
+import threading
 faulthandler.enable()  # Print C-level crash tracebacks
 
 import asyncio
@@ -544,6 +546,46 @@ def _digest_auth(ip: str, user: str, password: str) -> httpx.DigestAuth:
 # RTSP Snapshot Fallback (for DVRs where ISAPI auth is broken)
 # ---------------------------------------------------------------------------
 _RTSP_FALLBACK_IPS: set[str] = {"192.168.0.13"}  # DVR 4 — ISAPI 401 but RTSP works
+_RTSP_COOLDOWN_SECONDS = max(
+    1.0, float(os.environ.get("RTSP_FAILURE_COOLDOWN_SECONDS", "120"))
+)
+_rtsp_cooldowns: dict[str, float] = {}
+_rtsp_timeout_warning_logged = False
+_rtsp_timeout_warning_lock = threading.Lock()
+
+
+def _exception_text(exc: BaseException) -> str:
+    """Return a useful description even when str(exc) is empty."""
+    detail = str(exc).strip()
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+
+def _rtsp_cooldown_active(ip: str) -> bool:
+    expires_at = _rtsp_cooldowns.get(ip, 0.0)
+    if expires_at <= time.monotonic():
+        _rtsp_cooldowns.pop(ip, None)
+        return False
+    return True
+
+
+def _mark_rtsp_failure(ip: str) -> None:
+    _rtsp_cooldowns[ip] = time.monotonic() + _RTSP_COOLDOWN_SECONDS
+
+
+def _clear_rtsp_failure(ip: str) -> None:
+    _rtsp_cooldowns.pop(ip, None)
+
+
+def _warn_rtsp_timeouts_unsupported() -> None:
+    global _rtsp_timeout_warning_logged
+    with _rtsp_timeout_warning_lock:
+        if _rtsp_timeout_warning_logged:
+            return
+        logger.warning(
+            "[RTSP] OpenCV build does not support timeout parameters; "
+            "using unbounded RTSP open/read calls"
+        )
+        _rtsp_timeout_warning_logged = True
 
 
 def _capture_frame_rtsp(ip: str, port: int, user: str, pwd: str,
@@ -566,7 +608,24 @@ def _capture_frame_rtsp(ip: str, port: int, user: str, pwd: str,
 
     cap = None
     try:
-        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        try:
+            cap = cv2.VideoCapture()
+            timeout_params = []
+            for property_name in (
+                "CAP_PROP_OPEN_TIMEOUT_MSEC",
+                "CAP_PROP_READ_TIMEOUT_MSEC",
+            ):
+                property_id = getattr(cv2, property_name, None)
+                if property_id is not None:
+                    timeout_params.extend(
+                        (property_id, _RTSP_CAPTURE_TIMEOUT_MILLISECONDS)
+                    )
+            cap.open(rtsp_url, cv2.CAP_FFMPEG, timeout_params)
+        except Exception:
+            _warn_rtsp_timeouts_unsupported()
+            if cap is not None:
+                cap.release()
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
         if not cap.isOpened():
             logger.warning("[RTSP] Failed to open %s ch%d", ip, channel)
             return None
@@ -581,7 +640,12 @@ def _capture_frame_rtsp(ip: str, port: int, user: str, pwd: str,
             return buf.tobytes()
         return None
     except Exception as e:
-        logger.error("[RTSP] Error capturing from %s ch%d: %s", ip, channel, e)
+        logger.error(
+            "[RTSP] Error capturing from %s ch%d: %s",
+            ip,
+            channel,
+            _exception_text(e),
+        )
         return None
     finally:
         if cap is not None:
@@ -590,9 +654,27 @@ def _capture_frame_rtsp(ip: str, port: int, user: str, pwd: str,
 
 async def _capture_snapshot_rtsp(dvr: dict, channel: int) -> bytes | None:
     """Async wrapper around synchronous RTSP capture."""
-    return await asyncio.get_event_loop().run_in_executor(
-        None, _capture_frame_rtsp,
-        dvr["ip"], 554, dvr["username"], dvr["password"], channel)
+    loop = asyncio.get_running_loop()
+    await _rtsp_capture_semaphore.acquire()
+    try:
+        future = _rtsp_capture_executor.submit(
+            _capture_frame_rtsp,
+            dvr["ip"],
+            554,
+            dvr["username"],
+            dvr["password"],
+            channel,
+        )
+    except Exception:
+        _rtsp_capture_semaphore.release()
+        raise
+
+    def release_slot(_future: concurrent.futures.Future) -> None:
+        if not loop.is_closed():
+            loop.call_soon_threadsafe(_rtsp_capture_semaphore.release)
+
+    future.add_done_callback(release_slot)
+    return await asyncio.wrap_future(future)
 
 
 _SNAPSHOT_RETRIES = max(1, int(os.environ.get("SNAPSHOT_RETRIES", "3")))
@@ -621,6 +703,17 @@ _SNAPSHOT_BACKGROUND_CONNECT_TIMEOUT_SECONDS = max(
 _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS = max(
     0.0, float(os.environ.get("SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS", "0.1"))
 )
+_RTSP_CAPTURE_CONCURRENCY = max(
+    1, int(os.environ.get("RTSP_CAPTURE_CONCURRENCY", "2"))
+)
+_RTSP_CAPTURE_TIMEOUT_MILLISECONDS = max(
+    1000, int(os.environ.get("RTSP_CAPTURE_TIMEOUT_MILLISECONDS", "3000"))
+)
+_rtsp_capture_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_RTSP_CAPTURE_CONCURRENCY,
+    thread_name_prefix="ppis-rtsp",
+)
+_rtsp_capture_semaphore = asyncio.Semaphore(_RTSP_CAPTURE_CONCURRENCY)
 
 
 async def _capture_snapshot_once(
@@ -721,12 +814,10 @@ async def capture_snapshot(
                             max(0.0, capture_deadline - time.monotonic()),
                         ))
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
-                    _last_capture_error = (
-                        f"{ip} ch{channel}: {type(exc).__name__} ({exc})"
-                    )
+                    _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
                     logger.warning(
                         "Snapshot attempt %d/%d failed from %s ch%d: %s",
-                        attempt + 1, retries, ip, channel, exc,
+                        attempt + 1, retries, ip, channel, _exception_text(exc),
                     )
                     if attempt < retries - 1:
                         await asyncio.sleep(min(
@@ -735,7 +826,7 @@ async def capture_snapshot(
                             max(0.0, capture_deadline - time.monotonic()),
                         ))
                 except asyncio.TimeoutError as exc:
-                    _last_capture_error = f"{ip} ch{channel}: snapshot_timeout ({exc})"
+                    _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
                     logger.warning(
                         "Snapshot attempt %d/%d timed out from %s ch%d",
                         attempt + 1, retries, ip, channel,
@@ -747,21 +838,56 @@ async def capture_snapshot(
                             max(0.0, capture_deadline - time.monotonic()),
                         ))
                 except Exception as exc:
-                    _last_capture_error = f"{ip} ch{channel}: {type(exc).__name__}: {exc}"
-                    logger.error("Snapshot error from %s ch%d: %s", ip, channel, exc)
-                    break
+                    _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
+                    logger.error(
+                        "Snapshot error from %s ch%d: %s",
+                        ip,
+                        channel,
+                        _exception_text(exc),
+                    )
+                    if attempt < retries - 1:
+                        await asyncio.sleep(min(
+                            _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
+                            else _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
+                            max(0.0, capture_deadline - time.monotonic()),
+                        ))
             remaining = capture_deadline - time.monotonic()
-            if remaining > 0 and (not background or ip in _RTSP_FALLBACK_IPS):
+            if (
+                remaining > 0
+                and (not background or ip in _RTSP_FALLBACK_IPS)
+                and not _rtsp_cooldown_active(ip)
+            ):
                 logger.info("ISAPI exhausted for %s ch%d, trying RTSP fallback", ip, channel)
                 try:
                     rtsp_frame = await asyncio.wait_for(
                         _capture_snapshot_rtsp(dvr, channel), timeout=remaining
                     )
                     if rtsp_frame:
+                        _clear_rtsp_failure(ip)
                         _last_capture_error = ""
                         return rtsp_frame
+                    _mark_rtsp_failure(ip)
                 except asyncio.TimeoutError:
-                    logger.warning("RTSP fallback timed out from %s ch%d", ip, channel)
+                    _mark_rtsp_failure(ip)
+                    logger.warning(
+                        "RTSP fallback timed out from %s ch%d",
+                        ip,
+                        channel,
+                    )
+                except Exception as exc:
+                    _mark_rtsp_failure(ip)
+                    logger.warning(
+                        "RTSP fallback failed from %s ch%d: %s",
+                        ip,
+                        channel,
+                        _exception_text(exc),
+                    )
+            elif remaining > 0 and not background and _rtsp_cooldown_active(ip):
+                logger.info(
+                    "Skipping RTSP fallback for %s ch%d during failure cooldown",
+                    ip,
+                    channel,
+                )
             return None
     finally:
         await limiter.release(not background)
@@ -950,7 +1076,11 @@ def _snapshot_task_done(task: asyncio.Task) -> None:
     try:
         task.result()
     except Exception as exc:
-        logger.error("Snapshot request task failed: %s", exc, exc_info=True)
+        logger.error(
+            "Snapshot request task failed: %s",
+            _exception_text(exc),
+            exc_info=True,
+        )
 
 
 async def websocket_client():
@@ -1083,14 +1213,25 @@ async def websocket_client():
                     except json.JSONDecodeError:
                         logger.error(f"Invalid JSON from cloud bot: {message[:200]}")
                     except Exception as e:
-                        logger.error(f"Error handling WS message: {e}", exc_info=True)
+                        logger.error(
+                            "Error handling WS message: %s",
+                            _exception_text(e),
+                            exc_info=True,
+                        )
 
         except websockets.exceptions.ConnectionClosed as e:
-            logger.warning(f"WebSocket closed: {e}. Reconnecting in 5s...")
+            logger.warning(
+                "WebSocket closed: %s. Reconnecting in 5s...",
+                _exception_text(e),
+            )
             ws_connection = None
             ws_backoff = 5
         except Exception as e:
-            logger.error(f"WebSocket error: {e}. Reconnecting in {ws_backoff}s...")
+            logger.error(
+                "WebSocket error: %s. Reconnecting in %ss...",
+                _exception_text(e),
+                ws_backoff,
+            )
             ws_connection = None
 
         await asyncio.sleep(ws_backoff)

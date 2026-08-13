@@ -2409,6 +2409,7 @@ class AttendanceEngine:
             _RTSP_FALLBACK_IPS,
             _acquire_dvr_capture,
             _capture_snapshot_rtsp,
+            _exception_text,
         )
 
         ip = dvr["ip"]
@@ -2422,10 +2423,20 @@ class AttendanceEngine:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
-            native_res = await asyncio.wait_for(
-                _probe_channel_resolution(client, ip, port, channel),
-                timeout=min(_SNAPSHOT_BACKGROUND_HTTP_TIMEOUT_SECONDS, remaining),
-            )
+            try:
+                native_res = await asyncio.wait_for(
+                    _probe_channel_resolution(client, ip, port, channel),
+                    timeout=min(_SNAPSHOT_BACKGROUND_HTTP_TIMEOUT_SECONDS, remaining),
+                )
+            except Exception as exc:
+                native_res = None
+                logger.debug(
+                    "Native resolution probe failed from %s ch%d: %s; "
+                    "using default resolution",
+                    ip,
+                    channel,
+                    _exception_text(exc),
+                )
             req_w, req_h = native_res or (1920, 1080)
             stream_channel = channel * 100 + 1
             url = (
@@ -2449,13 +2460,13 @@ class AttendanceEngine:
                         self._camera_errors.pop(cam_key, None)
                         return resp.content
                     self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
-                except (asyncio.TimeoutError, httpx.ConnectError,
-                        httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+                except Exception as exc:
                     self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
                     if attempt == attempts - 1:
                         self.add_debug_log(
                             "dvr_error",
-                            f"Capture failed from {ip} ch{channel}: {exc}",
+                            f"Capture failed from {ip} ch{channel}: "
+                            f"{_exception_text(exc)}",
                         )
                 if attempt < attempts - 1:
                     await asyncio.sleep(min(
@@ -2474,7 +2485,8 @@ class AttendanceEngine:
             return None
         except Exception as e:
             self.add_debug_log(
-                "dvr_error", f"Capture failed from {ip} ch{channel}: {e}"
+                "dvr_error",
+                f"Capture failed from {ip} ch{channel}: {_exception_text(e)}",
             )
             return None
         finally:
