@@ -50,6 +50,15 @@ CLOUD_API = os.environ.get(
 POLL_INTERVAL = int(os.environ.get("TRUEFACE_POLL_SECONDS", "3"))
 SCAN_DELAY = 1.5  # seconds to wait after clicking Query before reading table
 SELENIUM_TIMEOUT_SECONDS = 30
+CLOUD_POST_TIMEOUT_SECONDS = max(
+    0.1, float(os.environ.get("TRUEFACE_CLOUD_TIMEOUT_SECONDS", "4"))
+)
+CLOUD_RETRY_BACKOFF_SECONDS = max(
+    0.0, float(os.environ.get("TRUEFACE_CLOUD_RETRY_BACKOFF_SECONDS", "0.5"))
+)
+PHOTO_FETCH_TIMEOUT_SECONDS = max(
+    0.1, float(os.environ.get("TRUEFACE_PHOTO_TIMEOUT_SECONDS", "8"))
+)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -414,7 +423,9 @@ def _deep_diag_vue(driver) -> dict:
         return {"__error": str(e)}
 
 
-def _fetch_snapshot_image(driver, snap_url: str) -> str:
+def _fetch_snapshot_image(
+    driver, snap_url: str, deadline: float | None = None
+) -> str:
     """Fetch a snapshot image given its full or partial URL.
 
     Tries multiple methods: async fetch API, async XHR, canvas, and
@@ -437,8 +448,19 @@ def _fetch_snapshot_image(driver, snap_url: str) -> str:
     else:
         rel_path = f"/RPC2_Loadfile/{snap_url}"
 
+    def _prepare_script_timeout() -> bool:
+        if deadline is None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        driver.set_script_timeout(min(SELENIUM_TIMEOUT_SECONDS, remaining))
+        return True
+
     # Method 1: fetch() API with blob — handles auth cookies automatically
     try:
+        if not _prepare_script_timeout():
+            return ""
         b64 = driver.execute_async_script("""
             var url = arguments[0];
             var done = arguments[arguments.length - 1];
@@ -468,6 +490,8 @@ def _fetch_snapshot_image(driver, snap_url: str) -> str:
 
     # Method 2: async XHR with arraybuffer (sync XHR can't use arraybuffer)
     try:
+        if not _prepare_script_timeout():
+            return ""
         b64 = driver.execute_async_script("""
             var url = arguments[0];
             var done = arguments[arguments.length - 1];
@@ -500,6 +524,8 @@ def _fetch_snapshot_image(driver, snap_url: str) -> str:
 
     # Method 3: Create an <img>, draw to canvas, extract base64
     try:
+        if not _prepare_script_timeout():
+            return ""
         b64 = driver.execute_async_script("""
             var url = arguments[0];
             var done = arguments[arguments.length - 1];
@@ -529,8 +555,15 @@ def _fetch_snapshot_image(driver, snap_url: str) -> str:
     base = DEVICE_URL.rstrip("/")
     full_url = f"{base}{rel_path}" if rel_path.startswith("/") else f"{base}/{rel_path}"
     try:
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            return ""
         auth = httpx.DigestAuth("admin", "tipl9910")
-        resp = httpx.get(full_url, timeout=5, verify=False, auth=auth)
+        timeout = (
+            5
+            if deadline is None
+            else max(0.1, min(5, deadline - time.monotonic()))
+        )
+        resp = httpx.get(full_url, timeout=timeout, verify=False, auth=auth)
         if resp.status_code == 200 and len(resp.content) > 500:
             logger.info("Snapshot fetched via httpx digest auth: %d bytes", len(resp.content))
             return base64.b64encode(resp.content).decode()
@@ -540,7 +573,14 @@ def _fetch_snapshot_image(driver, snap_url: str) -> str:
 
     # Method 5: Direct httpx without auth (device might allow after login)
     try:
-        resp = httpx.get(full_url, timeout=5, verify=False)
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            return ""
+        timeout = (
+            5
+            if deadline is None
+            else max(0.1, min(5, deadline - time.monotonic()))
+        )
+        resp = httpx.get(full_url, timeout=timeout, verify=False)
         if resp.status_code == 200 and len(resp.content) > 500:
             logger.info("Snapshot fetched via httpx no-auth: %d bytes", len(resp.content))
             return base64.b64encode(resp.content).decode()
@@ -583,7 +623,7 @@ def _extract_events(driver) -> list[dict]:
     return events
 
 
-def _attach_photos(driver, new_events: list[dict]) -> None:
+def _attach_photos(driver, new_events: list[dict]) -> dict[str, float]:
     """Fetch live snapshots from the TrueFace device for new events.
 
     Reads snapshot paths from Vue.js component data, then fetches images.
@@ -594,7 +634,10 @@ def _attach_photos(driver, new_events: list[dict]) -> None:
     # Try to extract snapshot URLs from discovered data
     snap_map = _try_extract_snapshots(driver)
 
+    elapsed_by_key: dict[str, float] = {}
     for evt in new_events:
+        started = time.monotonic()
+        deadline = started + PHOTO_FETCH_TIMEOUT_SECONDS
         pin = evt.get("pin", "")
         ts = evt.get("timestamp", "")
         if not pin:
@@ -608,7 +651,13 @@ def _attach_photos(driver, new_events: list[dict]) -> None:
                     break
 
         if snap_path:
-            photo_b64 = _fetch_snapshot_image(driver, snap_path)
+            try:
+                photo_b64 = _fetch_snapshot_image(driver, snap_path, deadline)
+            finally:
+                try:
+                    driver.set_script_timeout(SELENIUM_TIMEOUT_SECONDS)
+                except Exception:
+                    pass
             if not _photo_debug_done:
                 _photo_debug_done = True
                 logger.info(
@@ -620,6 +669,9 @@ def _attach_photos(driver, new_events: list[dict]) -> None:
                 )
             if photo_b64:
                 evt["photo"] = photo_b64
+                elapsed_by_key[f"{pin}-{ts}"] = round(
+                    time.monotonic() - started, 3
+                )
                 continue
 
         if not _photo_debug_done:
@@ -628,6 +680,8 @@ def _attach_photos(driver, new_events: list[dict]) -> None:
                 "Live snapshot for %s (PIN=%s): NO URL IN VUE DATA (backend will use DB photo)",
                 evt.get("name", "?"), pin,
             )
+        elapsed_by_key[f"{pin}-{ts}"] = round(time.monotonic() - started, 3)
+    return elapsed_by_key
 
 
 def _try_extract_snapshots(driver) -> dict[str, str]:
@@ -705,11 +759,41 @@ def _try_extract_snapshots(driver) -> dict[str, str]:
 
 # Events that failed to send — retry on next cycle
 _pending_events: list[dict] = []
+_last_cloud_post_metrics: dict[str, object] = {}
+
+
+def _log_event_timing(
+    event: dict,
+    detected_at: float,
+    photo_elapsed: float,
+    post_metrics: dict[str, object],
+) -> None:
+    key = f"{event.get('pin', '')}-{event.get('timestamp', '')}"
+    logger.info(
+        "[TRUEFACE] EVENT key=%s device_event=%s "
+        "detection_elapsed=%.3fs photo_elapsed=%.3fs "
+        "cloud_post_elapsed=%.3fs attempts=%s http_status=%s outcome=%s",
+        key,
+        event.get("timestamp", ""),
+        time.monotonic() - detected_at,
+        photo_elapsed,
+        post_metrics.get("elapsed", 0.0),
+        post_metrics.get("attempts", 0),
+        post_metrics.get("status"),
+        post_metrics.get("outcome", "unknown"),
+    )
 
 
 def _send_to_cloud(events: list[dict]) -> dict | None:
     """Send events to the cloud API with retry logic."""
-    global _pending_events
+    global _pending_events, _last_cloud_post_metrics
+    started = time.monotonic()
+    _last_cloud_post_metrics = {
+        "attempts": 0,
+        "status": None,
+        "outcome": "not_started",
+        "elapsed": 0.0,
+    }
 
     # Prepend any previously failed events
     if _pending_events:
@@ -718,29 +802,48 @@ def _send_to_cloud(events: list[dict]) -> dict | None:
         _pending_events = []
 
     for attempt in range(3):
+        _last_cloud_post_metrics["attempts"] = attempt + 1
         try:
             resp = httpx.post(
                 CLOUD_API,
                 json=events,
-                timeout=30,
+                timeout=CLOUD_POST_TIMEOUT_SECONDS,
             )
+            _last_cloud_post_metrics["status"] = resp.status_code
             if resp.status_code == 200:
-                return resp.json()
+                _last_cloud_post_metrics["outcome"] = "success"
+                _last_cloud_post_metrics["elapsed"] = round(
+                    time.monotonic() - started, 3
+                )
+                try:
+                    return resp.json()
+                except Exception as e:
+                    logger.error("Cloud API success response was not JSON: %s", e)
+                    return {}
             else:
                 logger.error("Cloud API error: HTTP %d — %s", resp.status_code, resp.text[:200])
                 if attempt < 2:
-                    time.sleep(2)
+                    time.sleep(CLOUD_RETRY_BACKOFF_SECONDS)
                     continue
+                _last_cloud_post_metrics["outcome"] = "http_error"
+                _last_cloud_post_metrics["elapsed"] = round(
+                    time.monotonic() - started, 3
+                )
                 return None
         except Exception as e:
             logger.error("Cloud API request failed (attempt %d/3): %s", attempt + 1, e)
             if attempt < 2:
-                time.sleep(3)
+                time.sleep(CLOUD_RETRY_BACKOFF_SECONDS)
                 continue
             # Save events for retry on next poll cycle
             _pending_events.extend(events)
             logger.warning("Queued %d event(s) for retry on next cycle", len(events))
+            _last_cloud_post_metrics["outcome"] = "requeued"
+            _last_cloud_post_metrics["elapsed"] = round(
+                time.monotonic() - started, 3
+            )
             return None
+    _last_cloud_post_metrics["elapsed"] = round(time.monotonic() - started, 3)
     return None
 
 
@@ -838,16 +941,27 @@ def run_poller():
 
             # Filter to only new events
             new_events = []
+            detected_at: dict[str, float] = {}
             for evt in events:
                 key = f"{evt['pin']}-{evt['timestamp']}"
                 if key not in seen_keys:
                     seen_keys.add(key)
                     new_events.append(evt)
+                    detected_at[key] = time.monotonic()
 
             if new_events:
-                _attach_photos(driver, new_events)
+                photo_elapsed = _attach_photos(driver, new_events)
                 logger.info("Sending %d new event(s) to cloud...", len(new_events))
                 result = _send_to_cloud(new_events)
+                post_metrics = dict(_last_cloud_post_metrics)
+                for evt in new_events:
+                    key = f"{evt['pin']}-{evt['timestamp']}"
+                    _log_event_timing(
+                        evt,
+                        detected_at.get(key, time.monotonic()),
+                        photo_elapsed.get(key, 0.0),
+                        post_metrics,
+                    )
                 if result:
                     for r in result.get("results", []):
                         status = r.get("status", "")
