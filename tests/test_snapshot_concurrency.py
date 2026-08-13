@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -456,6 +457,70 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             await asyncio.wait_for(semaphore.acquire(), timeout=1)
             semaphore.release()
+
+    async def test_rtsp_uses_plain_open_when_timeout_params_are_unavailable(self):
+        calls = []
+
+        class Frame:
+            def __len__(self):
+                return 4
+
+            def tobytes(self):
+                return b"jpeg"
+
+        class Capture:
+            def __init__(self, opened=False):
+                self.opened = opened
+
+            def open(self, *_args):
+                calls.append(("parameterized_open", _args))
+                raise TypeError("timeout params unsupported")
+
+            def isOpened(self):
+                return self.opened
+
+            def read(self):
+                return True, object()
+
+            def release(self):
+                calls.append(("release",))
+
+        class Cv2:
+            CAP_FFMPEG = 1900
+            CAP_PROP_OPEN_TIMEOUT_MSEC = 53
+            CAP_PROP_READ_TIMEOUT_MSEC = 54
+            IMWRITE_JPEG_QUALITY = 1
+
+            def VideoCapture(self, *args):
+                calls.append(("VideoCapture", args))
+                return Capture(opened=len(args) == 2)
+
+            def imencode(self, *_args):
+                return True, Frame()
+
+        previous_warning_state = main._rtsp_timeout_warning_logged
+        main._rtsp_timeout_warning_logged = False
+        try:
+            with patch.dict(sys.modules, {"cv2": Cv2()}), self.assertLogs(
+                main.logger, level="WARNING"
+            ) as logs:
+                frame = main._capture_frame_rtsp(
+                    "192.0.2.13", 554, "admin", "password", 3
+                )
+        finally:
+            main._rtsp_timeout_warning_logged = previous_warning_state
+
+        self.assertEqual(frame, b"jpeg")
+        self.assertEqual(calls[0][0], "VideoCapture")
+        self.assertEqual(calls[1][0], "parameterized_open")
+        self.assertEqual(calls[2], ("release",))
+        self.assertEqual(calls[3], ("VideoCapture", (
+            "rtsp://admin:password@192.0.2.13:554/Streaming/Channels/301",
+            1900,
+        )))
+        self.assertTrue(
+            any("timeout parameters" in line for line in logs.output)
+        )
 
     async def test_two_classroom_cameras_capture_in_parallel(self):
         cameras = [

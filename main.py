@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import faulthandler
+import threading
 faulthandler.enable()  # Print C-level crash tracebacks
 
 import asyncio
@@ -549,6 +550,8 @@ _RTSP_COOLDOWN_SECONDS = max(
     1.0, float(os.environ.get("RTSP_FAILURE_COOLDOWN_SECONDS", "120"))
 )
 _rtsp_cooldowns: dict[str, float] = {}
+_rtsp_timeout_warning_logged = False
+_rtsp_timeout_warning_lock = threading.Lock()
 
 
 def _exception_text(exc: BaseException) -> str:
@@ -573,6 +576,18 @@ def _clear_rtsp_failure(ip: str) -> None:
     _rtsp_cooldowns.pop(ip, None)
 
 
+def _warn_rtsp_timeouts_unsupported() -> None:
+    global _rtsp_timeout_warning_logged
+    with _rtsp_timeout_warning_lock:
+        if _rtsp_timeout_warning_logged:
+            return
+        logger.warning(
+            "[RTSP] OpenCV build does not support timeout parameters; "
+            "using unbounded RTSP open/read calls"
+        )
+        _rtsp_timeout_warning_logged = True
+
+
 def _capture_frame_rtsp(ip: str, port: int, user: str, pwd: str,
                         channel: int) -> bytes | None:
     """Capture a single JPEG frame via RTSP using OpenCV.
@@ -593,13 +608,24 @@ def _capture_frame_rtsp(ip: str, port: int, user: str, pwd: str,
 
     cap = None
     try:
-        cap = cv2.VideoCapture()
-        timeout_params = []
-        for property_name in ("CAP_PROP_OPEN_TIMEOUT_MSEC", "CAP_PROP_READ_TIMEOUT_MSEC"):
-            property_id = getattr(cv2, property_name, None)
-            if property_id is not None:
-                timeout_params.extend((property_id, _RTSP_CAPTURE_TIMEOUT_MILLISECONDS))
-        cap.open(rtsp_url, cv2.CAP_FFMPEG, timeout_params)
+        try:
+            cap = cv2.VideoCapture()
+            timeout_params = []
+            for property_name in (
+                "CAP_PROP_OPEN_TIMEOUT_MSEC",
+                "CAP_PROP_READ_TIMEOUT_MSEC",
+            ):
+                property_id = getattr(cv2, property_name, None)
+                if property_id is not None:
+                    timeout_params.extend(
+                        (property_id, _RTSP_CAPTURE_TIMEOUT_MILLISECONDS)
+                    )
+            cap.open(rtsp_url, cv2.CAP_FFMPEG, timeout_params)
+        except Exception:
+            _warn_rtsp_timeouts_unsupported()
+            if cap is not None:
+                cap.release()
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
         if not cap.isOpened():
             logger.warning("[RTSP] Failed to open %s ch%d", ip, channel)
             return None
