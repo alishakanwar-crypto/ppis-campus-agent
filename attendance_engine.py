@@ -26,6 +26,14 @@ from pathlib import Path
 import httpx
 import numpy as np
 
+_DVR_CAPTURE_LIMIT = max(
+    1, int(os.environ.get("DVR_CAPTURE_CONCURRENCY", "6"))
+)
+_DVR_BACKGROUND_LIMIT = min(
+    max(1, int(os.environ.get("DVR_BACKGROUND_CONCURRENCY", "4"))),
+    max(1, _DVR_CAPTURE_LIMIT - 1),
+)
+
 # Import order matters on Windows: face_recognition must be imported BEFORE
 # cv2 to avoid a silent C-level DLL conflict crash.
 try:
@@ -2389,7 +2397,10 @@ class AttendanceEngine:
             self._dvr_clients[ip] = httpx.AsyncClient(
                 timeout=8.0,
                 auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
-                limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
+                limits=httpx.Limits(
+                    max_connections=_DVR_BACKGROUND_LIMIT,
+                    max_keepalive_connections=_DVR_BACKGROUND_LIMIT,
+                ),
             )
         return self._dvr_clients[ip]
 

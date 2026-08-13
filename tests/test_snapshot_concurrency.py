@@ -24,6 +24,8 @@ class FakeWebSocket:
 class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         main._dvr_capture_limiters.clear()
+        main._live_dvr_clients.clear()
+        main._live_capture_preferences.clear()
 
     async def test_snapshot_uses_direct_main_stream_without_resolution_probe(self):
         requested_urls = []
@@ -90,6 +92,82 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             await main.capture_snapshot(dvr, 3)
 
         self.assertIs(auth_objects[0], auth_objects[1])
+
+    async def test_live_capture_memoizes_working_url_and_auth_then_falls_back(self):
+        requested = []
+
+        class Response:
+            def __init__(self, status_code, content=b""):
+                self.status_code = status_code
+                self.headers = {"content-type": "image/jpeg"}
+                self.content = content
+
+        class Client:
+            calls = 0
+
+            async def get(self, url, auth):
+                requested.append((url, type(auth).__name__))
+                self.calls += 1
+                if self.calls == 1:
+                    return Response(401)
+                return Response(200, b"jpeg")
+
+        dvr = {
+            "ip": "192.0.2.20",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
+            requested.clear()
+            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
+
+        self.assertEqual(len(requested), 1)
+        self.assertIn("/301/picture", requested[0][0])
+        self.assertEqual(requested[0][1], "BasicAuth")
+        requested.clear()
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            await main.capture_snapshot(dvr, 4)
+        self.assertEqual(len(requested), 1)
+        self.assertIn("/401/picture", requested[0][0])
+        self.assertEqual(requested[0][1], "DigestAuth")
+
+    async def test_timeout_on_one_shared_live_client_does_not_break_sibling(self):
+        class Response:
+            status_code = 200
+            headers = {"content-type": "image/jpeg"}
+            content = b"jpeg"
+
+        class Client:
+            calls = 0
+
+            async def get(self, _url, auth):
+                self.calls += 1
+                if self.calls == 1:
+                    await asyncio.sleep(0.1)
+                return Response()
+
+        dvr = {
+            "ip": "192.0.2.22",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()), patch.object(
+            main, "_SNAPSHOT_RETRIES", 1
+        ), patch.object(
+            main, "_SNAPSHOT_CAMERA_TIMEOUT_SECONDS", 0.05
+        ), patch.object(
+            main, "_capture_snapshot_rtsp", new=AsyncMock(return_value=None)
+        ):
+            first, second = await asyncio.gather(
+                main.capture_snapshot(dvr, 3),
+                main.capture_snapshot(dvr, 4),
+            )
+
+        self.assertIsNone(first)
+        self.assertEqual(second, b"jpeg")
 
     async def test_snapshot_retries_transient_timeout_then_succeeds(self):
         class Response:
@@ -420,6 +498,93 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("capture failed")
         await asyncio.wait_for(limiter.acquire(False), timeout=1)
         await limiter.release(False)
+
+    async def test_background_reservation_leaves_capacity_for_live_capture(self):
+        limiter = main._DvrCaptureLimiter(
+            limit=6,
+            background_wait=5,
+            background_limit=4,
+        )
+        for _ in range(4):
+            await limiter.acquire(False)
+
+        live_task = asyncio.create_task(limiter.acquire(True))
+        await asyncio.wait_for(live_task, timeout=0.1)
+        self.assertTrue(live_task.done())
+        await limiter.release(True)
+        for _ in range(4):
+            await limiter.release(False)
+
+    async def test_live_request_budget_is_propagated_to_camera_tasks(self):
+        cameras = [({"ip": "192.0.2.1"}, 1, "TEST C1")]
+        observed = []
+
+        async def capture(_dvr, _channel):
+            observed.append(main._live_request_deadline.get())
+            return b"jpeg"
+
+        websocket = FakeWebSocket()
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            main, "find_all_cameras_for_classroom", return_value=cameras
+        ), patch.object(main, "capture_snapshot", side_effect=capture), patch.object(
+            main, "SNAPSHOT_DIR", Path(directory)
+        ), patch.object(main, "compress_jpeg", side_effect=lambda data: data):
+            started = asyncio.get_running_loop().time()
+            await main._handle_snapshot_request(websocket, "TEST", "request-1")
+
+        self.assertEqual(len(observed), 1)
+        self.assertIsNotNone(observed[0])
+        self.assertGreaterEqual(
+            observed[0] - started,
+            main._SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS - 0.1,
+        )
+
+    async def test_live_client_and_background_pool_limits_match_capture_caps(self):
+        self.assertEqual(
+            attendance_engine._DVR_CAPTURE_LIMIT,
+            main._DVR_CAPTURE_LIMIT,
+        )
+        self.assertEqual(
+            attendance_engine._DVR_BACKGROUND_LIMIT,
+            main._DVR_BACKGROUND_LIMIT,
+        )
+        self.assertEqual(
+            main._DVR_BACKGROUND_LIMIT,
+            main._DvrCaptureLimiter(
+                main._DVR_CAPTURE_LIMIT,
+                main._DVR_BACKGROUND_WAIT_SECONDS,
+                main._DVR_BACKGROUND_LIMIT,
+            )._background_limit,
+        )
+        created = []
+
+        class Client:
+            is_closed = False
+
+        def make_client(*_args, **kwargs):
+            created.append(kwargs["limits"])
+            return Client()
+
+        dvr = {
+            "ip": "192.0.2.21",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(
+            attendance_engine.httpx, "AsyncClient", side_effect=make_client
+        ):
+            engine = attendance_engine.AttendanceEngine()
+            engine._get_dvr_client(dvr)
+
+        self.assertEqual(
+            created[0].max_connections,
+            attendance_engine._DVR_BACKGROUND_LIMIT,
+        )
+        self.assertEqual(
+            created[0].max_keepalive_connections,
+            attendance_engine._DVR_BACKGROUND_LIMIT,
+        )
 
     async def test_abandoned_rtsp_capture_releases_slot_when_worker_finishes(self):
         class RunningFuture(concurrent.futures.Future):
