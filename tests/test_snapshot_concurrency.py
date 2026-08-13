@@ -126,6 +126,48 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(requested), 1)
         self.assertIn("/301/picture", requested[0][0])
         self.assertEqual(requested[0][1], "BasicAuth")
+        requested.clear()
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            await main.capture_snapshot(dvr, 4)
+        self.assertEqual(len(requested), 1)
+        self.assertIn("/401/picture", requested[0][0])
+        self.assertEqual(requested[0][1], "DigestAuth")
+
+    async def test_timeout_on_one_shared_live_client_does_not_break_sibling(self):
+        class Response:
+            status_code = 200
+            headers = {"content-type": "image/jpeg"}
+            content = b"jpeg"
+
+        class Client:
+            calls = 0
+
+            async def get(self, _url, auth):
+                self.calls += 1
+                if self.calls == 1:
+                    await asyncio.sleep(0.1)
+                return Response()
+
+        dvr = {
+            "ip": "192.0.2.22",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()), patch.object(
+            main, "_SNAPSHOT_RETRIES", 1
+        ), patch.object(
+            main, "_SNAPSHOT_CAMERA_TIMEOUT_SECONDS", 0.05
+        ), patch.object(
+            main, "_capture_snapshot_rtsp", new=AsyncMock(return_value=None)
+        ):
+            first, second = await asyncio.gather(
+                main.capture_snapshot(dvr, 3),
+                main.capture_snapshot(dvr, 4),
+            )
+
+        self.assertIsNone(first)
+        self.assertEqual(second, b"jpeg")
 
     async def test_snapshot_retries_transient_timeout_then_succeeds(self):
         class Response:
@@ -463,7 +505,6 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             background_wait=5,
             background_limit=4,
         )
-        background_releases = asyncio.Event()
         for _ in range(4):
             await limiter.acquire(False)
 
@@ -473,7 +514,6 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await limiter.release(True)
         for _ in range(4):
             await limiter.release(False)
-        background_releases.set()
 
     async def test_live_request_budget_is_propagated_to_camera_tasks(self):
         cameras = [({"ip": "192.0.2.1"}, 1, "TEST C1")]
@@ -500,6 +540,14 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_live_client_and_background_pool_limits_match_capture_caps(self):
+        self.assertEqual(
+            attendance_engine._DVR_CAPTURE_LIMIT,
+            main._DVR_CAPTURE_LIMIT,
+        )
+        self.assertEqual(
+            attendance_engine._DVR_BACKGROUND_LIMIT,
+            main._DVR_BACKGROUND_LIMIT,
+        )
         self.assertEqual(
             main._DVR_BACKGROUND_LIMIT,
             main._DvrCaptureLimiter(
@@ -529,10 +577,13 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             engine = attendance_engine.AttendanceEngine()
             engine._get_dvr_client(dvr)
 
-        self.assertEqual(created[0].max_connections, main._DVR_BACKGROUND_LIMIT)
+        self.assertEqual(
+            created[0].max_connections,
+            attendance_engine._DVR_BACKGROUND_LIMIT,
+        )
         self.assertEqual(
             created[0].max_keepalive_connections,
-            main._DVR_BACKGROUND_LIMIT,
+            attendance_engine._DVR_BACKGROUND_LIMIT,
         )
 
     async def test_abandoned_rtsp_capture_releases_slot_when_worker_finishes(self):

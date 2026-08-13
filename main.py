@@ -577,7 +577,7 @@ _rtsp_cooldowns: dict[str, float] = {}
 _rtsp_timeout_warning_logged = False
 _rtsp_timeout_warning_lock = threading.Lock()
 _live_dvr_clients: dict[str, httpx.AsyncClient] = {}
-_live_capture_preferences: dict[str, tuple[str, int]] = {}
+_live_capture_preferences: dict[tuple[str, int], tuple[str, int]] = {}
 _live_dvr_client_lock = asyncio.Lock()
 _live_request_deadline: contextvars.ContextVar[float | None] = (
     contextvars.ContextVar("live_request_deadline", default=None)
@@ -769,16 +769,13 @@ async def _get_live_dvr_client(
         return _live_dvr_clients[ip]
 
 
-async def _discard_live_dvr_client(
+async def _evict_live_dvr_client(
     ip: str, client: httpx.AsyncClient
 ) -> None:
     async with _live_dvr_client_lock:
         if _live_dvr_clients.get(ip) is not client:
             return
         _live_dvr_clients.pop(ip, None)
-    close = getattr(client, "aclose", None)
-    if close is not None:
-        await close()
 
 
 def _response_round_trips(response: httpx.Response) -> int:
@@ -786,11 +783,25 @@ def _response_round_trips(response: httpx.Response) -> int:
     return 1 + len(history)
 
 
+def _live_client_should_evict(exc: BaseException) -> bool:
+    return isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.RemoteProtocolError,
+            httpx.ReadError,
+            httpx.WriteError,
+            ConnectionResetError,
+        ),
+    )
+
+
 async def _capture_snapshot_once(
     dvr: dict,
     channel: int,
     client: httpx.AsyncClient,
-    metrics: dict[str, int] | None = None,
+    metrics: dict[str, object] | None = None,
 ) -> bytes | None:
     ip = dvr["ip"]
     port = dvr.get("port", 80)
@@ -805,7 +816,7 @@ async def _capture_snapshot_once(
     ]
     digest_auth = _digest_auth(ip, user, pwd)
     candidates = []
-    remembered = _live_capture_preferences.get(ip)
+    remembered = _live_capture_preferences.get((ip, channel))
     if remembered is not None:
         candidates.append(remembered)
     candidates.extend(
@@ -813,6 +824,10 @@ async def _capture_snapshot_once(
         for variant in range(len(urls))
         for scheme in ("digest", "basic")
     )
+    candidates = [
+        candidate for candidate in candidates
+        if candidate[1] == 0 or candidate[0] == "digest"
+    ]
     seen: set[tuple[str, int]] = set()
     for scheme, variant in candidates:
         if (scheme, variant) in seen:
@@ -828,7 +843,7 @@ async def _capture_snapshot_once(
             response.status_code == 200
             and response.headers.get("content-type", "").startswith("image")
         ):
-            _live_capture_preferences[ip] = (scheme, variant)
+            _live_capture_preferences[(ip, channel)] = (scheme, variant)
             return response.content
     return None
 
@@ -931,8 +946,8 @@ async def capture_snapshot(
                         round(time.monotonic() - attempt_started, 3)
                     )
                     metrics["exception"] = type(exc).__name__
-                    if not background:
-                        await _discard_live_dvr_client(ip, client)
+                    if not background and _live_client_should_evict(exc):
+                        await _evict_live_dvr_client(ip, client)
                     _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
                     logger.warning(
                         "Snapshot attempt %d/%d failed from %s ch%d: %s",
@@ -949,8 +964,6 @@ async def capture_snapshot(
                         round(time.monotonic() - attempt_started, 3)
                     )
                     metrics["exception"] = type(exc).__name__
-                    if not background:
-                        await _discard_live_dvr_client(ip, client)
                     _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
                     logger.warning(
                         "Snapshot attempt %d/%d timed out from %s ch%d",
@@ -967,8 +980,8 @@ async def capture_snapshot(
                         round(time.monotonic() - attempt_started, 3)
                     )
                     metrics["exception"] = type(exc).__name__
-                    if not background:
-                        await _discard_live_dvr_client(ip, client)
+                    if not background and _live_client_should_evict(exc):
+                        await _evict_live_dvr_client(ip, client)
                     _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
                     logger.error(
                         "Snapshot error from %s ch%d: %s",
