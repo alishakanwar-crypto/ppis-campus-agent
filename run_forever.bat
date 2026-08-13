@@ -10,9 +10,10 @@ REM   - Cleans up old snapshot files to prevent disk fill
 
 title PPIS Campus Agent (24/7)
 cd /d "%~dp0"
-set "LOGFILE=%~dp0campus_agent.log"
+set "LOGFILE=%~dp0wrapper_campus.log"
 
 if not exist "%~dp0.locks\" mkdir "%~dp0.locks" >nul 2>&1
+call :cap_log
 call :run 9>"%~dp0.locks\campus.lock"
 if errorlevel 1 (
     echo [%DATE% %TIME%] WRAPPER: Campus lock is already held; exiting cleanly. >> "%LOGFILE%"
@@ -34,9 +35,8 @@ REM Must match DUPLICATE_INSTANCE_EXIT_CODE in campus_instance.py.
 set "DUPLICATE_EXIT_CODE=75"
 
 :loop
-echo ============================================
-echo [%DATE% %TIME%] Pulling latest code...
-echo ============================================
+call :cap_log
+echo [%DATE% %TIME%] Pulling latest code... >> "%LOGFILE%"
 REM Fetch latest code, but never reset to an unverified stale remote ref.
 git fetch origin >nul 2>&1
 if errorlevel 1 (
@@ -55,23 +55,29 @@ REM Clear bytecode cache to avoid stale .pyc files after code updates
 if exist "%~dp0__pycache__" rmdir /s /q "%~dp0__pycache__" 2>nul
 
 REM Clean up old snapshot files (older than 1 day) to prevent disk fill
-echo [%DATE% %TIME%] Cleaning old snapshots...
+echo [%DATE% %TIME%] Cleaning old snapshots... >> "%LOGFILE%"
 forfiles /p "%~dp0snapshots" /d -1 /m *.* /c "cmd /c del /Q @path" 2>nul
 forfiles /p "%~dp0attendance_snapshots" /d -1 /m *.* /c "cmd /c del /Q @path" 2>nul
 
-echo.
-echo [%DATE% %TIME%] Starting PPIS Campus Agent...
-echo ============================================
 set "REVISION=unknown"
 for /f "delims=" %%H in ('git rev-parse --short HEAD 2^>nul') do set "REVISION=%%H"
 echo [%DATE% %TIME%] Starting revision !REVISION! >> "%LOGFILE%"
 py -3.12 -B main.py
 set "EXIT_CODE=%ERRORLEVEL%"
 if "%EXIT_CODE%"=="%DUPLICATE_EXIT_CODE%" (
-    echo [%DATE% %TIME%] Another campus agent owns the mutex; wrapper exiting cleanly.
+    echo [%DATE% %TIME%] Another campus agent owns the mutex; wrapper exiting cleanly. >> "%LOGFILE%"
     exit /b 0
 )
-echo.
-echo [%DATE% %TIME%] Agent stopped (exit code: %EXIT_CODE%). Restarting in 10 seconds...
+echo [%DATE% %TIME%] Agent stopped (exit code: %EXIT_CODE%). Restarting in 10 seconds... >> "%LOGFILE%"
 timeout /t 10 /nobreak
 goto loop
+
+:cap_log
+if exist "%LOGFILE%" (
+    set "LINES=0"
+    for /f %%a in ('type "%LOGFILE%" ^| find /c /v ""') do set "LINES=%%a"
+    if !LINES! GTR 500 (
+        move /y "%LOGFILE%" "%LOGFILE%.old" >nul 2>&1
+    )
+)
+exit /b 0

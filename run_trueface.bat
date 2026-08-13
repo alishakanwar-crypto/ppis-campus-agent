@@ -6,9 +6,10 @@ REM Auto-restarts if the poller crashes.
 
 title TrueFace 3000 Poller (24/7)
 cd /d "%~dp0"
-set "LOGFILE=%~dp0trueface_poller.log"
+set "LOGFILE=%~dp0wrapper_trueface.log"
 
 if not exist "%~dp0.locks\" mkdir "%~dp0.locks" >nul 2>&1
+call :cap_log
 call :run 9>"%~dp0.locks\trueface.lock"
 if errorlevel 1 (
     echo [%DATE% %TIME%] WRAPPER: TrueFace lock is already held; exiting cleanly. >> "%LOGFILE%"
@@ -23,10 +24,8 @@ REM Must match DUPLICATE_INSTANCE_EXIT_CODE in trueface_instance.py.
 set "DUPLICATE_EXIT_CODE=75"
 
 :loop
-echo.
-echo ============================================
-echo [%DATE% %TIME%] Starting TrueFace Poller...
-echo ============================================
+call :cap_log
+echo [%DATE% %TIME%] Starting TrueFace Poller... >> "%LOGFILE%"
 
 REM Fetch latest code, but never reset to an unverified stale remote ref.
 git fetch origin >nul 2>&1
@@ -49,9 +48,9 @@ set "DUPLICATE_WAIT=0"
 :wait_for_existing_poller
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'python.exe' }; if ($p | Where-Object { $_.CommandLine -match 'trueface_poller' }) { exit 0 } else { exit 1 }" >nul 2>&1
 if !ERRORLEVEL! NEQ 0 goto launch_poller
-echo [%DATE% %TIME%] Existing TrueFace poller is still clearing; waiting... >> "%~dp0trueface_poller.log"
+echo [%DATE% %TIME%] Existing TrueFace poller is still clearing; waiting... >> "%LOGFILE%"
 if !DUPLICATE_WAIT! GEQ 30 (
-    echo [%DATE% %TIME%] Existing poller did not clear after 30 seconds; proceeding and letting the mutex decide. >> "%~dp0trueface_poller.log"
+    echo [%DATE% %TIME%] Existing poller did not clear after 30 seconds; proceeding and letting the mutex decide. >> "%LOGFILE%"
     goto launch_poller
 )
 set /a DUPLICATE_WAIT+=5
@@ -65,10 +64,19 @@ echo [%DATE% %TIME%] Starting revision !REVISION! >> "%LOGFILE%"
 py -3.12 trueface_poller.py
 set "EXIT_CODE=%ERRORLEVEL%"
 if "%EXIT_CODE%"=="%DUPLICATE_EXIT_CODE%" (
-    echo [%DATE% %TIME%] Another TrueFace poller owns the mutex; wrapper exiting cleanly.
+    echo [%DATE% %TIME%] Another TrueFace poller owns the mutex; wrapper exiting cleanly. >> "%LOGFILE%"
     exit /b 0
 )
-echo.
-echo [%DATE% %TIME%] Poller stopped (exit code: %EXIT_CODE%). Restarting in 10 seconds...
+echo [%DATE% %TIME%] Poller stopped (exit code: %EXIT_CODE%). Restarting in 10 seconds... >> "%LOGFILE%"
 timeout /t 10 /nobreak
 goto loop
+
+:cap_log
+if exist "%LOGFILE%" (
+    set "LINES=0"
+    for /f %%a in ('type "%LOGFILE%" ^| find /c /v ""') do set "LINES=%%a"
+    if !LINES! GTR 500 (
+        move /y "%LOGFILE%" "%LOGFILE%.old" >nul 2>&1
+    )
+)
+exit /b 0
