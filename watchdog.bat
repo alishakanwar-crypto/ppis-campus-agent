@@ -12,6 +12,7 @@ REM Log file for watchdog events
 set LOGFILE=%~dp0watchdog.log
 set NEED_AGENT=0
 set NEED_TRUEFACE=0
+set NEED_GATE_COUNTER=0
 
 REM Check if campus agent (main.py) is running. If PowerShell/CIM fails,
 REM the nonzero status deliberately fails open and requests a start.
@@ -28,8 +29,15 @@ if %ERRORLEVEL% NEQ 0 (
     set NEED_TRUEFACE=1
 )
 
-REM If both are running, do nothing
-if "%NEED_AGENT%"=="0" if "%NEED_TRUEFACE%"=="0" exit /b 0
+REM Check if the gate counter is running. If the query fails, fail open and
+REM request a start so native CP Plus counts self-heal.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'python.exe' }; if ($p | Where-Object { $_.CommandLine -match 'gate_counter\.py' }) { exit 0 } else { exit 1 }" >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    set NEED_GATE_COUNTER=1
+)
+
+REM If all three are running, do nothing
+if "%NEED_AGENT%"=="0" if "%NEED_TRUEFACE%"=="0" if "%NEED_GATE_COUNTER%"=="0" exit /b 0
 
 REM Restart campus agent if needed
 if "%NEED_AGENT%"=="1" (
@@ -45,6 +53,13 @@ if "%NEED_TRUEFACE%"=="1" (
     echo [%DATE% %TIME%] WATCHDOG: TrueFace poller not running, restarting... >> "%LOGFILE%"
     start "" /B wscript.exe "%~dp0run_trueface_hidden.vbs"
     echo [%DATE% %TIME%] WATCHDOG: TrueFace poller restart triggered >> "%LOGFILE%"
+)
+
+REM Restart gate counter if needed
+if "%NEED_GATE_COUNTER%"=="1" (
+    echo [%DATE% %TIME%] WATCHDOG: Gate counter not running, restarting... >> "%LOGFILE%"
+    start "" /B wscript.exe "%~dp0run_gate_counter_hidden.vbs"
+    echo [%DATE% %TIME%] WATCHDOG: Gate counter restart triggered >> "%LOGFILE%"
 )
 
 REM Keep log file from growing too large (rotate at 500 lines)

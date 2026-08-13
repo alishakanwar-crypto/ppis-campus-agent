@@ -117,6 +117,204 @@ class TestTrueFaceInstance(unittest.TestCase):
             self.assertTrue(trueface_instance.acquire_single_instance())
             trueface_instance.release_single_instance()
 
+    def test_campus_global_mutex_failure_checks_for_duplicate_before_local_acceptance(self):
+        class FakeFunction:
+            def __init__(self, callback):
+                self.callback = callback
+
+            def __call__(self, *args):
+                return self.callback(*args)
+
+        class FakeCtypes:
+            c_void_p = object
+            c_bool = object
+            c_wchar_p = object
+
+            def __init__(self):
+                self.last_error = 0
+                self.calls = 0
+                self.kernel = type("Kernel", (), {})()
+                self.kernel.CreateMutexW = FakeFunction(self.create_mutex)
+                self.kernel.CloseHandle = FakeFunction(lambda _handle: True)
+
+            def create_mutex(self, *_args):
+                self.calls += 1
+                self.last_error = 5 if self.calls == 1 else 0
+                return None if self.calls == 1 else 401
+
+            def WinDLL(self, *_args, **_kwargs):
+                return self.kernel
+
+            def get_last_error(self):
+                return self.last_error
+
+            def set_last_error(self, value):
+                self.last_error = value
+
+        fake_ctypes = FakeCtypes()
+        with (
+            patch.object(campus_instance.os, "name", "nt"),
+            patch.dict(sys.modules, {"ctypes": fake_ctypes}),
+            patch.object(campus_instance, "_mutex_handle", None),
+            patch.object(
+                campus_instance,
+                "_other_agent_process_exists",
+                return_value=True,
+            ) as scan,
+            self.assertLogs(campus_instance.logger, logging.WARNING) as logs,
+        ):
+            self.assertFalse(campus_instance.acquire_single_instance())
+        scan.assert_called_once_with()
+        self.assertIn("Win32 error 5", "\n".join(logs.output))
+
+    def test_campus_global_mutex_failure_allows_local_when_scan_finds_nothing(self):
+        class FakeFunction:
+            def __init__(self, callback):
+                self.callback = callback
+
+            def __call__(self, *args):
+                return self.callback(*args)
+
+        class FakeCtypes:
+            c_void_p = object
+            c_bool = object
+            c_wchar_p = object
+
+            def __init__(self):
+                self.last_error = 0
+                self.calls = 0
+                self.kernel = type("Kernel", (), {})()
+                self.kernel.CreateMutexW = FakeFunction(self.create_mutex)
+                self.kernel.CloseHandle = FakeFunction(lambda _handle: True)
+
+            def create_mutex(self, *_args):
+                self.calls += 1
+                self.last_error = 5 if self.calls == 1 else 0
+                return None if self.calls == 1 else 401
+
+            def WinDLL(self, *_args, **_kwargs):
+                return self.kernel
+
+            def get_last_error(self):
+                return self.last_error
+
+            def set_last_error(self, value):
+                self.last_error = value
+
+        fake_ctypes = FakeCtypes()
+        with (
+            patch.object(campus_instance.os, "name", "nt"),
+            patch.dict(sys.modules, {"ctypes": fake_ctypes}),
+            patch.object(campus_instance, "_mutex_handle", None),
+            patch.object(
+                campus_instance,
+                "_other_agent_process_exists",
+                return_value=False,
+            ) as scan,
+        ):
+            self.assertTrue(campus_instance.acquire_single_instance())
+            campus_instance.release_single_instance()
+        scan.assert_called_once_with()
+
+    def test_global_mutex_failure_checks_for_duplicate_before_local_acceptance(self):
+        class FakeFunction:
+            def __init__(self, callback):
+                self.callback = callback
+
+            def __call__(self, *args):
+                return self.callback(*args)
+
+        class FakeCtypes:
+            c_void_p = object
+            c_bool = object
+            c_wchar_p = object
+
+            def __init__(self):
+                self.last_error = 0
+                self.calls = 0
+                self.kernel = type("Kernel", (), {})()
+                self.kernel.CreateMutexW = FakeFunction(self.create_mutex)
+                self.kernel.CloseHandle = FakeFunction(lambda _handle: True)
+
+            def create_mutex(self, *_args):
+                self.calls += 1
+                self.last_error = 5 if self.calls == 1 else 0
+                return None if self.calls == 1 else 401
+
+            def WinDLL(self, *_args, **_kwargs):
+                return self.kernel
+
+            def get_last_error(self):
+                return self.last_error
+
+            def set_last_error(self, value):
+                self.last_error = value
+
+        fake_ctypes = FakeCtypes()
+        with (
+            patch.object(trueface_instance.os, "name", "nt"),
+            patch.dict(sys.modules, {"ctypes": fake_ctypes}),
+            patch.object(trueface_instance, "_mutex_handle", None),
+            patch.object(
+                trueface_instance,
+                "_other_poller_process_exists",
+                return_value=True,
+            ) as scan,
+            self.assertLogs(trueface_instance.logger, logging.WARNING) as logs,
+        ):
+            self.assertFalse(trueface_instance.acquire_single_instance())
+        scan.assert_called_once_with()
+        self.assertIn("Win32 error 5", "\n".join(logs.output))
+
+    def test_global_mutex_failure_allows_local_when_scan_finds_nothing(self):
+        class FakeFunction:
+            def __init__(self, callback):
+                self.callback = callback
+
+            def __call__(self, *args):
+                return self.callback(*args)
+
+        class FakeCtypes:
+            c_void_p = object
+            c_bool = object
+            c_wchar_p = object
+
+            def __init__(self):
+                self.last_error = 0
+                self.calls = 0
+                self.kernel = type("Kernel", (), {})()
+                self.kernel.CreateMutexW = FakeFunction(self.create_mutex)
+                self.kernel.CloseHandle = FakeFunction(lambda _handle: True)
+
+            def create_mutex(self, *_args):
+                self.calls += 1
+                self.last_error = 5 if self.calls == 1 else 0
+                return None if self.calls == 1 else 401
+
+            def WinDLL(self, *_args, **_kwargs):
+                return self.kernel
+
+            def get_last_error(self):
+                return self.last_error
+
+            def set_last_error(self, value):
+                self.last_error = value
+
+        fake_ctypes = FakeCtypes()
+        with (
+            patch.object(trueface_instance.os, "name", "nt"),
+            patch.dict(sys.modules, {"ctypes": fake_ctypes}),
+            patch.object(trueface_instance, "_mutex_handle", None),
+            patch.object(
+                trueface_instance,
+                "_other_poller_process_exists",
+                return_value=False,
+            ) as scan,
+        ):
+            self.assertTrue(trueface_instance.acquire_single_instance())
+            trueface_instance.release_single_instance()
+        scan.assert_called_once_with()
+
 
 class TestCampusInstance(unittest.TestCase):
     def test_duplicate_exit_code_is_distinct_from_crash_code(self):

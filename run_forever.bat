@@ -10,6 +10,17 @@ REM   - Cleans up old snapshot files to prevent disk fill
 
 title PPIS Campus Agent (24/7)
 cd /d "%~dp0"
+set "LOGFILE=%~dp0campus_agent.log"
+
+if not exist "%~dp0.locks\" mkdir "%~dp0.locks" >nul 2>&1
+call :run 9>"%~dp0.locks\campus.lock"
+if errorlevel 1 (
+    echo [%DATE% %TIME%] WRAPPER: Campus lock is already held; exiting cleanly. >> "%LOGFILE%"
+    exit /b 0
+)
+exit /b 0
+
+:run
 
 REM Suppress Windows Error Reporting dialogs
 reg add "HKCU\Software\Microsoft\Windows\Windows Error Reporting" /v DontShowUI /t REG_DWORD /d 1 /f >nul 2>&1
@@ -26,10 +37,19 @@ set "DUPLICATE_EXIT_CODE=75"
 echo ============================================
 echo [%DATE% %TIME%] Pulling latest code...
 echo ============================================
-REM Force-sync to latest remote main branch
-git fetch origin 2>nul
-git checkout main 2>nul
-git reset --hard origin/main 2>nul
+REM Fetch latest code, but never reset to an unverified stale remote ref.
+git fetch origin >nul 2>&1
+if errorlevel 1 (
+    echo [%DATE% %TIME%] GIT: Fetch failed; keeping existing working tree. >> "%LOGFILE%"
+) else (
+    git checkout main >nul 2>&1
+    if errorlevel 1 (
+        echo [%DATE% %TIME%] GIT: Checkout main failed; keeping existing working tree. >> "%LOGFILE%"
+    ) else (
+        git reset --hard origin/main >nul 2>&1
+        if errorlevel 1 echo [%DATE% %TIME%] GIT: Reset origin/main failed; keeping existing working tree. >> "%LOGFILE%"
+    )
+)
 
 REM Clear bytecode cache to avoid stale .pyc files after code updates
 if exist "%~dp0__pycache__" rmdir /s /q "%~dp0__pycache__" 2>nul
@@ -42,6 +62,9 @@ forfiles /p "%~dp0attendance_snapshots" /d -1 /m *.* /c "cmd /c del /Q @path" 2>
 echo.
 echo [%DATE% %TIME%] Starting PPIS Campus Agent...
 echo ============================================
+set "REVISION=unknown"
+for /f "delims=" %%H in ('git rev-parse --short HEAD 2^>nul') do set "REVISION=%%H"
+echo [%DATE% %TIME%] Starting revision !REVISION! >> "%LOGFILE%"
 py -3.12 -B main.py
 set "EXIT_CODE=%ERRORLEVEL%"
 if "%EXIT_CODE%"=="%DUPLICATE_EXIT_CODE%" (

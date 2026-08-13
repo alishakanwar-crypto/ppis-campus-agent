@@ -6,6 +6,17 @@ REM Auto-restarts if the poller crashes.
 
 title TrueFace 3000 Poller (24/7)
 cd /d "%~dp0"
+set "LOGFILE=%~dp0trueface_poller.log"
+
+if not exist "%~dp0.locks\" mkdir "%~dp0.locks" >nul 2>&1
+call :run 9>"%~dp0.locks\trueface.lock"
+if errorlevel 1 (
+    echo [%DATE% %TIME%] WRAPPER: TrueFace lock is already held; exiting cleanly. >> "%LOGFILE%"
+    exit /b 0
+)
+exit /b 0
+
+:run
 
 set PYTHONDONTWRITEBYTECODE=1
 REM Must match DUPLICATE_INSTANCE_EXIT_CODE in trueface_instance.py.
@@ -17,9 +28,19 @@ echo ============================================
 echo [%DATE% %TIME%] Starting TrueFace Poller...
 echo ============================================
 
-REM Pull latest code
-git fetch origin 2>nul
-git reset --hard origin/main 2>nul
+REM Fetch latest code, but never reset to an unverified stale remote ref.
+git fetch origin >nul 2>&1
+if errorlevel 1 (
+    echo [%DATE% %TIME%] GIT: Fetch failed; keeping existing working tree. >> "%LOGFILE%"
+) else (
+    git checkout main >nul 2>&1
+    if errorlevel 1 (
+        echo [%DATE% %TIME%] GIT: Checkout main failed; keeping existing working tree. >> "%LOGFILE%"
+    ) else (
+        git reset --hard origin/main >nul 2>&1
+        if errorlevel 1 echo [%DATE% %TIME%] GIT: Reset origin/main failed; keeping existing working tree. >> "%LOGFILE%"
+    )
+)
 
 REM The Python mutex is the authoritative single-instance guard. This
 REM check only waits for a process that is still shutting down; it must
@@ -38,6 +59,9 @@ timeout /t 5 /nobreak >nul
 goto wait_for_existing_poller
 
 :launch_poller
+set "REVISION=unknown"
+for /f "delims=" %%H in ('git rev-parse --short HEAD 2^>nul') do set "REVISION=%%H"
+echo [%DATE% %TIME%] Starting revision !REVISION! >> "%LOGFILE%"
 py -3.12 trueface_poller.py
 set "EXIT_CODE=%ERRORLEVEL%"
 if "%EXIT_CODE%"=="%DUPLICATE_EXIT_CODE%" (

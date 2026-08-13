@@ -54,10 +54,19 @@ def acquire_single_instance() -> bool:
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel32.CloseHandle.restype = ctypes.c_bool
 
-        for mutex_name in _MUTEX_NAMES:
+        global_mutex_failed = False
+        for index, mutex_name in enumerate(_MUTEX_NAMES):
             ctypes.set_last_error(0)
             handle = kernel32.CreateMutexW(None, True, mutex_name)
             if not handle:
+                error_code = ctypes.get_last_error()
+                logger.warning(
+                    "CreateMutexW failed for %s (Win32 error %s)",
+                    mutex_name,
+                    error_code,
+                )
+                if index == 0:
+                    global_mutex_failed = True
                 continue
             if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
                 kernel32.CloseHandle(handle)
@@ -67,6 +76,18 @@ def acquire_single_instance() -> bool:
                     mutex_name,
                 )
                 return False
+            if global_mutex_failed:
+                if _other_agent_process_exists():
+                    kernel32.CloseHandle(handle)
+                    logger.error(
+                        "Another campus agent instance is already running "
+                        "(fallback process check after Global mutex failure); exiting."
+                    )
+                    return False
+                logger.warning(
+                    "Global campus-agent mutex unavailable; Local mutex acquired "
+                    "and fallback process check found no duplicate."
+                )
             _mutex_handle = (kernel32, handle)
             atexit.register(release_single_instance)
             logger.info("Acquired campus-agent instance mutex %s", mutex_name)

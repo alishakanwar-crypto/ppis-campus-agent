@@ -6,6 +6,7 @@ attendance_snapshots/
 *.db
 agent.lock
 .agent_lock
+.locks/
 
 # Per-machine local config and persistent counter state.
 # Not tracked so restart scripts (git reset --hard) never overwrite them.
