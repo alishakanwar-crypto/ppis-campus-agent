@@ -22,13 +22,19 @@ class TrueFaceCloudLatencyTests(unittest.TestCase):
             result = trueface_poller._send_to_cloud(events)
 
         self.assertIsNone(result)
-        self.assertEqual(failed_post.call_count, 3)
+        self.assertEqual(failed_post.call_count, 2)
         self.assertEqual(trueface_poller._pending_events, events)
         worst_case = (
-            3 * trueface_poller.CLOUD_POST_TIMEOUT_SECONDS
-            + 2 * trueface_poller.CLOUD_RETRY_BACKOFF_SECONDS
+            trueface_poller.CLOUD_POST_ATTEMPTS
+            * trueface_poller.CLOUD_POST_TIMEOUT_SECONDS
+            + (trueface_poller.CLOUD_POST_ATTEMPTS - 1)
+            * trueface_poller.CLOUD_RETRY_BACKOFF_SECONDS
         )
-        self.assertLessEqual(worst_case, 15)
+        self.assertEqual(
+            worst_case,
+            2 * 8 + 0.5,
+        )
+        self.assertLessEqual(worst_case, 18)
 
     def test_requeued_events_are_sent_once_with_new_events(self):
         pending = [{"pin": "7", "timestamp": "2026-06-01 07:00:00"}]

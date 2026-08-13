@@ -51,10 +51,13 @@ POLL_INTERVAL = int(os.environ.get("TRUEFACE_POLL_SECONDS", "3"))
 SCAN_DELAY = 1.5  # seconds to wait after clicking Query before reading table
 SELENIUM_TIMEOUT_SECONDS = 30
 CLOUD_POST_TIMEOUT_SECONDS = max(
-    0.1, float(os.environ.get("TRUEFACE_CLOUD_TIMEOUT_SECONDS", "4"))
+    0.1, float(os.environ.get("TRUEFACE_CLOUD_TIMEOUT_SECONDS", "8"))
 )
 CLOUD_RETRY_BACKOFF_SECONDS = max(
     0.0, float(os.environ.get("TRUEFACE_CLOUD_RETRY_BACKOFF_SECONDS", "0.5"))
+)
+CLOUD_POST_ATTEMPTS = max(
+    1, int(os.environ.get("TRUEFACE_CLOUD_ATTEMPTS", "2"))
 )
 PHOTO_FETCH_TIMEOUT_SECONDS = max(
     0.1, float(os.environ.get("TRUEFACE_PHOTO_TIMEOUT_SECONDS", "8"))
@@ -801,7 +804,7 @@ def _send_to_cloud(events: list[dict]) -> dict | None:
         events = _pending_events + events
         _pending_events = []
 
-    for attempt in range(3):
+    for attempt in range(CLOUD_POST_ATTEMPTS):
         _last_cloud_post_metrics["attempts"] = attempt + 1
         try:
             resp = httpx.post(
@@ -822,7 +825,7 @@ def _send_to_cloud(events: list[dict]) -> dict | None:
                     return {}
             else:
                 logger.error("Cloud API error: HTTP %d — %s", resp.status_code, resp.text[:200])
-                if attempt < 2:
+                if attempt + 1 < CLOUD_POST_ATTEMPTS:
                     time.sleep(CLOUD_RETRY_BACKOFF_SECONDS)
                     continue
                 _last_cloud_post_metrics["outcome"] = "http_error"
@@ -831,8 +834,13 @@ def _send_to_cloud(events: list[dict]) -> dict | None:
                 )
                 return None
         except Exception as e:
-            logger.error("Cloud API request failed (attempt %d/3): %s", attempt + 1, e)
-            if attempt < 2:
+            logger.error(
+                "Cloud API request failed (attempt %d/%d): %s",
+                attempt + 1,
+                CLOUD_POST_ATTEMPTS,
+                e,
+            )
+            if attempt + 1 < CLOUD_POST_ATTEMPTS:
                 time.sleep(CLOUD_RETRY_BACKOFF_SECONDS)
                 continue
             # Save events for retry on next poll cycle
@@ -968,10 +976,21 @@ def run_poller():
                         name = r.get("name", r.get("pin", ""))
                         t = r.get("time", "")
                         wa = r.get("whatsapp", "")
+                        wa_display = (
+                            "queued (background send)"
+                            if wa == "queued"
+                            else str(wa)
+                        )
                         if status == "arrival":
-                            logger.info(">>> ARRIVAL: %s at %s | WhatsApp: %s", name, t, wa)
+                            logger.info(
+                                ">>> ARRIVAL: %s at %s | WhatsApp: %s",
+                                name, t, wa_display,
+                            )
                         elif status == "departure":
-                            logger.info(">>> DEPARTURE: %s at %s | WhatsApp: %s", name, t, wa)
+                            logger.info(
+                                ">>> DEPARTURE: %s at %s | WhatsApp: %s",
+                                name, t, wa_display,
+                            )
                         elif status == "updated_departure":
                             logger.info("Updated departure: %s at %s", name, t)
                         elif status == "skipped":
