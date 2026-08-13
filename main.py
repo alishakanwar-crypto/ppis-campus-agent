@@ -449,6 +449,82 @@ _last_capture_error: str = ""
 _digest_auth_cache: dict[tuple[str, str, str], httpx.DigestAuth] = {}
 
 
+class _DvrCaptureLimiter:
+    def __init__(self, limit: int, background_wait: float):
+        self._semaphore = asyncio.Semaphore(limit)
+        self._condition = asyncio.Condition()
+        self._live_waiting = 0
+        self._live_active = 0
+        self._background_wait = background_wait
+
+    async def __aenter__(self):
+        await self.acquire(False)
+        return self
+
+    async def __aexit__(self, *_args):
+        await self.release(False)
+
+    async def acquire(self, live: bool) -> None:
+        if live:
+            async with self._condition:
+                self._live_waiting += 1
+            acquired = False
+            try:
+                await self._semaphore.acquire()
+                acquired = True
+            finally:
+                async with self._condition:
+                    self._live_waiting -= 1
+                    if acquired:
+                        self._live_active += 1
+                    self._condition.notify_all()
+            if not acquired:
+                raise asyncio.CancelledError
+            return
+
+        async with self._condition:
+            try:
+                await asyncio.wait_for(
+                    self._condition.wait_for(
+                        lambda: self._live_waiting == 0 and self._live_active == 0
+                    ),
+                    timeout=self._background_wait,
+                )
+            except asyncio.TimeoutError:
+                pass
+        await self._semaphore.acquire()
+
+    async def release(self, live: bool) -> None:
+        self._semaphore.release()
+        if live:
+            async with self._condition:
+                self._live_active -= 1
+                self._condition.notify_all()
+
+
+_DVR_CAPTURE_LIMIT = max(
+    1, int(os.environ.get("DVR_CAPTURE_CONCURRENCY", "3"))
+)
+_DVR_BACKGROUND_WAIT_SECONDS = max(
+    0.1, float(os.environ.get("DVR_BACKGROUND_WAIT_SECONDS", "5"))
+)
+_dvr_capture_limiters: dict[str, _DvrCaptureLimiter] = {}
+_dvr_capture_limiters_lock = asyncio.Lock()
+
+
+async def _dvr_limiter(ip: str) -> _DvrCaptureLimiter:
+    limiter = _dvr_capture_limiters.get(ip)
+    if limiter is None:
+        async with _dvr_capture_limiters_lock:
+            limiter = _dvr_capture_limiters.get(ip)
+            if limiter is None:
+                limiter = _DvrCaptureLimiter(
+                    _DVR_CAPTURE_LIMIT, _DVR_BACKGROUND_WAIT_SECONDS
+                )
+                _dvr_capture_limiters[ip] = limiter
+    return limiter
+
+
 def _digest_auth(ip: str, user: str, password: str) -> httpx.DigestAuth:
     key = (ip, user, password)
     auth = _digest_auth_cache.get(key)
@@ -513,7 +589,51 @@ async def _capture_snapshot_rtsp(dvr: dict, channel: int) -> bytes | None:
         dvr["ip"], 554, dvr["username"], dvr["password"], channel)
 
 
-async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
+_SNAPSHOT_RETRIES = max(1, int(os.environ.get("SNAPSHOT_RETRIES", "3")))
+_SNAPSHOT_RETRY_BACKOFF_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_RETRY_BACKOFF_SECONDS", "0.4"))
+)
+_SNAPSHOT_CONNECT_TIMEOUT_SECONDS = max(
+    1.0, float(os.environ.get("SNAPSHOT_CONNECT_TIMEOUT_SECONDS", "5"))
+)
+_SNAPSHOT_HTTP_TIMEOUT_SECONDS = max(
+    _SNAPSHOT_CONNECT_TIMEOUT_SECONDS,
+    float(os.environ.get("SNAPSHOT_HTTP_TIMEOUT_SECONDS", "6")),
+)
+
+
+async def _capture_snapshot_once(
+    dvr: dict, channel: int, client: httpx.AsyncClient
+) -> bytes | None:
+    ip = dvr["ip"]
+    port = dvr.get("port", 80)
+    user = dvr["username"]
+    pwd = dvr["password"]
+    stream_channel = channel * 100 + 1
+    url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+    digest_auth = _digest_auth(ip, user, pwd)
+    resp = await client.get(url, auth=digest_auth)
+    if resp.status_code == 401:
+        resp = await client.get(url, auth=httpx.BasicAuth(user, pwd))
+    if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+        return resp.content
+
+    alt_stream = channel * 100 + 2
+    alt_url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{alt_stream}/picture"
+    resp2 = await client.get(alt_url, auth=digest_auth)
+    if resp2.status_code == 200 and resp2.headers.get("content-type", "").startswith("image"):
+        return resp2.content
+
+    alt_url2 = f"http://{ip}:{port}/Streaming/channels/{stream_channel}/picture"
+    resp3 = await client.get(alt_url2, auth=digest_auth)
+    if resp3.status_code == 200 and resp3.headers.get("content-type", "").startswith("image"):
+        return resp3.content
+    return None
+
+
+async def capture_snapshot(
+    dvr: dict, channel: int, *, background: bool = False
+) -> bytes | None:
     """Capture a JPEG snapshot from a Hikvision NVR via ISAPI.
 
     Hikvision DS-9664NI-ST / DS-7632NXI-K2 supports:
@@ -525,14 +645,7 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
     """
     global _last_capture_error
     ip = dvr["ip"]
-    port = dvr.get("port", 80)
-    user = dvr["username"]
-    pwd = dvr["password"]
-
-    # Hikvision uses channelNo * 100 + 1 for main stream snapshot
     stream_channel = channel * 100 + 1
-
-    url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
     capture_started = time.monotonic()
     logger.info(
         "Capturing snapshot from %s channel %d (stream %d)",
@@ -541,78 +654,81 @@ async def capture_snapshot(dvr: dict, channel: int) -> bytes | None:
         stream_channel,
     )
 
+    limiter = await _dvr_limiter(ip)
+    await limiter.acquire(not background)
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(8.0, connect=3.0)
-        ) as client:
-            # Try digest auth first (Hikvision default), then basic
-            digest_auth = _digest_auth(ip, user, pwd)
-            resp = await client.get(url, auth=digest_auth)
-            if resp.status_code == 401:
-                resp = await client.get(url, auth=httpx.BasicAuth(user, pwd))
-
-            if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-                logger.info(
-                    "Snapshot captured: %d bytes from %s ch%d in %.2fs",
-                    len(resp.content),
-                    ip,
-                    channel,
-                    time.monotonic() - capture_started,
-                )
-                _last_capture_error = ""
-                return resp.content
-            else:
-                err = (f"HTTP {resp.status_code}, content-type="
-                       f"{resp.headers.get('content-type', 'unknown')}")
-                logger.error(f"Snapshot failed from {ip} ch{channel}: {err}")
-                _last_capture_error = f"{ip} ch{channel}: {err}"
-                # Try alternate URL format (sub-stream: channel*100 + 2)
-                alt_stream = channel * 100 + 2
-                alt_url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{alt_stream}/picture"
-                resp2 = await client.get(alt_url, auth=digest_auth)
-                if resp2.status_code == 200 and resp2.headers.get("content-type", "").startswith("image"):
-                    logger.info(f"Snapshot captured (sub-stream): {len(resp2.content)} bytes")
-                    _last_capture_error = ""
-                    return resp2.content
-
-                # Try without /ISAPI prefix
-                alt_url2 = f"http://{ip}:{port}/Streaming/channels/{stream_channel}/picture"
-                resp3 = await client.get(alt_url2, auth=digest_auth)
-                if resp3.status_code == 200 and resp3.headers.get("content-type", "").startswith("image"):
-                    logger.info(f"Snapshot captured (alt2 URL): {len(resp3.content)} bytes")
-                    _last_capture_error = ""
-                    return resp3.content
-
-                # RTSP fallback for DVRs with broken ISAPI auth
-                if ip in _RTSP_FALLBACK_IPS:
-                    logger.info(f"ISAPI failed on {ip} ch{channel}, trying RTSP fallback")
-                    rtsp_frame = await _capture_snapshot_rtsp(dvr, channel)
+        capture_deadline = capture_started + _SNAPSHOT_CAMERA_TIMEOUT_SECONDS
+        timeout = httpx.Timeout(
+            _SNAPSHOT_HTTP_TIMEOUT_SECONDS,
+            connect=_SNAPSHOT_CONNECT_TIMEOUT_SECONDS,
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for attempt in range(_SNAPSHOT_RETRIES):
+                remaining = capture_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    snapshot = await asyncio.wait_for(
+                        _capture_snapshot_once(dvr, channel, client),
+                        timeout=min(_SNAPSHOT_HTTP_TIMEOUT_SECONDS, remaining),
+                    )
+                    if snapshot:
+                        logger.info(
+                            "Snapshot captured: %d bytes from %s ch%d in %.2fs",
+                            len(snapshot), ip, channel,
+                            time.monotonic() - capture_started,
+                        )
+                        _last_capture_error = ""
+                        return snapshot
+                    _last_capture_error = f"{ip} ch{channel}: ISAPI capture failed"
+                    if attempt < _SNAPSHOT_RETRIES - 1:
+                        await asyncio.sleep(min(
+                            _SNAPSHOT_RETRY_BACKOFF_SECONDS,
+                            max(0.0, capture_deadline - time.monotonic()),
+                        ))
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+                    _last_capture_error = (
+                        f"{ip} ch{channel}: {type(exc).__name__} ({exc})"
+                    )
+                    logger.warning(
+                        "Snapshot attempt %d/%d failed from %s ch%d: %s",
+                        attempt + 1, _SNAPSHOT_RETRIES, ip, channel, exc,
+                    )
+                    if attempt < _SNAPSHOT_RETRIES - 1:
+                        await asyncio.sleep(min(
+                            _SNAPSHOT_RETRY_BACKOFF_SECONDS,
+                            max(0.0, capture_deadline - time.monotonic()),
+                        ))
+                except asyncio.TimeoutError as exc:
+                    _last_capture_error = f"{ip} ch{channel}: snapshot_timeout ({exc})"
+                    logger.warning(
+                        "Snapshot attempt %d/%d timed out from %s ch%d",
+                        attempt + 1, _SNAPSHOT_RETRIES, ip, channel,
+                    )
+                    if attempt < _SNAPSHOT_RETRIES - 1:
+                        await asyncio.sleep(min(
+                            _SNAPSHOT_RETRY_BACKOFF_SECONDS,
+                            max(0.0, capture_deadline - time.monotonic()),
+                        ))
+                except Exception as exc:
+                    _last_capture_error = f"{ip} ch{channel}: {type(exc).__name__}: {exc}"
+                    logger.error("Snapshot error from %s ch%d: %s", ip, channel, exc)
+                    break
+            remaining = capture_deadline - time.monotonic()
+            if remaining > 0:
+                logger.info("ISAPI exhausted for %s ch%d, trying RTSP fallback", ip, channel)
+                try:
+                    rtsp_frame = await asyncio.wait_for(
+                        _capture_snapshot_rtsp(dvr, channel), timeout=remaining
+                    )
                     if rtsp_frame:
                         _last_capture_error = ""
                         return rtsp_frame
-
-                return None
-    except httpx.ConnectError as e:
-        _last_capture_error = f"{ip} ch{channel}: connection_refused ({e})"
-        logger.error(f"Snapshot connection error from {ip} ch{channel}: {e}")
-    except httpx.ConnectTimeout as e:
-        _last_capture_error = f"{ip} ch{channel}: connect_timeout ({e})"
-        logger.error(f"Snapshot connect timeout from {ip} ch{channel}: {e}")
-    except httpx.ReadTimeout as e:
-        _last_capture_error = f"{ip} ch{channel}: read_timeout ({e})"
-        logger.error(f"Snapshot read timeout from {ip} ch{channel}: {e}")
-    except Exception as e:
-        _last_capture_error = f"{ip} ch{channel}: {type(e).__name__}: {e}"
-        logger.error(f"Snapshot error from {ip} ch{channel}: {e}")
-
-    # Final RTSP fallback after any ISAPI error
-    if ip in _RTSP_FALLBACK_IPS:
-        logger.info(f"ISAPI error on {ip} ch{channel}, trying RTSP fallback")
-        rtsp_frame = await _capture_snapshot_rtsp(dvr, channel)
-        if rtsp_frame:
-            _last_capture_error = ""
-            return rtsp_frame
-    return None
+                except asyncio.TimeoutError:
+                    logger.warning("RTSP fallback timed out from %s ch%d", ip, channel)
+            return None
+    finally:
+        await limiter.release(not background)
 
 
 async def test_dvr_connection(dvr: dict) -> dict:
@@ -789,7 +905,7 @@ _snapshot_request_semaphore = asyncio.Semaphore(
     max(1, int(os.environ.get("SNAPSHOT_CONCURRENT_REQUESTS", "2")))
 )
 _SNAPSHOT_CAMERA_TIMEOUT_SECONDS = max(
-    1.0, float(os.environ.get("SNAPSHOT_CAMERA_TIMEOUT_SECONDS", "12"))
+    1.0, float(os.environ.get("SNAPSHOT_CAMERA_TIMEOUT_SECONDS", "25"))
 )
 
 

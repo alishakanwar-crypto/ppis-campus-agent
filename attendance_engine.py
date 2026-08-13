@@ -2401,59 +2401,20 @@ class AttendanceEngine:
         Probes the camera's native resolution on first call and requests
         the highest available quality (up to 4MP if the camera supports it).
         """
-        ip = dvr["ip"]
-        port = dvr.get("port", 80)
-
-        client = self._get_dvr_client(dvr)
-
-        # Probe native resolution on first capture (cached per channel)
-        native_res = await _probe_channel_resolution(client, ip, port, channel)
-        if native_res:
-            req_w, req_h = native_res
-        else:
-            req_w, req_h = 1920, 1080  # default fallback
-
-        stream_channel = channel * 100 + 1
-        url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
-               f"?snapShotImageType=JPEG"
-               f"&videoResolutionWidth={req_w}&videoResolutionHeight={req_h}")
-
-        for attempt in range(max_retries):
-            try:
-                resp = await client.get(url)
-                if resp.status_code == 200 and resp.headers.get(
-                        "content-type", "").startswith("image"):
-                    cam_key = f"{ip}:{channel}"
-                    self._camera_errors.pop(cam_key, None)
-                    return resp.content
-                cam_key = f"{ip}:{channel}"
-                self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
-                ct = resp.headers.get("content-type", "unknown")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1)
-                else:
-                    self.add_debug_log(
-                        "dvr_error",
-                        f"Capture failed from {ip} ch{channel} after "
-                        f"{max_retries} attempts: HTTP {resp.status_code} "
-                        f"(content-type={ct})")
-            except Exception as e:
-                cam_key = f"{ip}:{channel}"
-                self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1)
-                else:
-                    self.add_debug_log("dvr_error",
-                                       f"Capture failed from {ip} ch{channel} "
-                                       f"after {max_retries} attempts: {e}")
-        # RTSP fallback for DVRs with broken ISAPI auth (e.g. DVR 4)
         try:
-            from main import _RTSP_FALLBACK_IPS, _capture_snapshot_rtsp
-            if ip in _RTSP_FALLBACK_IPS:
-                return await _capture_snapshot_rtsp(dvr, channel)
-        except Exception:
-            pass
-        return None
+            from main import capture_snapshot
+            frame = await capture_snapshot(dvr, channel, background=True)
+            cam_key = f"{dvr['ip']}:{channel}"
+            if frame:
+                self._camera_errors.pop(cam_key, None)
+            else:
+                self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
+            return frame
+        except Exception as e:
+            self.add_debug_log(
+                "dvr_error", f"Capture failed from {dvr['ip']} ch{channel}: {e}"
+            )
+            return None
 
     async def scan_camera(self, dvr: dict, channel: int,
                           camera_label: str = "",
