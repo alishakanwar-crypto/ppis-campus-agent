@@ -211,7 +211,6 @@ class TeacherSightingTracker:
         self.agent_secret = agent_secret
         self.running = False
         self._task: asyncio.Task | None = None
-        self._dvr_clients: dict[str, httpx.AsyncClient] = {}
         self._teacher_encodings: dict[str, dict] = {}
         self._all_encodings: dict[str, dict] = {}  # all registered faces
         # Dedup: (person_id, camera_label) → last_sighting_timestamp
@@ -235,48 +234,12 @@ class TeacherSightingTracker:
         logger.info(f"[SIGHTING] Loaded {len(self._teacher_encodings)} teacher faces, "
                      f"{len(self._all_encodings)} total known faces")
 
-    def _get_dvr_client(self, dvr: dict) -> httpx.AsyncClient:
-        ip = dvr["ip"]
-        if ip not in self._dvr_clients:
-            self._dvr_clients[ip] = httpx.AsyncClient(
-                timeout=15,
-                auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
-                limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
-            )
-        return self._dvr_clients[ip]
-
     async def _capture_frame(self, dvr: dict, channel: int) -> bytes | None:
-        """Capture a single JPEG frame from a DVR camera via ISAPI (RTSP fallback for DVR 4)."""
-        ip = dvr["ip"]
-        port = dvr.get("port", 80)
-        client = self._get_dvr_client(dvr)
-        stream_channel = channel * 100 + 1
-        url = (f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
-               f"?snapShotImageType=JPEG")
         try:
-            resp = await client.get(url)
-            if resp.status_code == 200 and resp.headers.get(
-                    "content-type", "").startswith("image"):
-                return resp.content
-            if resp.status_code == 401:
-                basic = httpx.BasicAuth(dvr["username"], dvr["password"])
-                resp2 = await client.get(url, auth=basic)
-                if resp2.status_code == 200 and resp2.headers.get(
-                        "content-type", "").startswith("image"):
-                    return resp2.content
-                logger.warning(
-                    f"[SIGHTING] 401 Unauthorized on {ip} ch{channel} "
-                    f"(digest+basic failed) — trying RTSP fallback")
-                # RTSP fallback for DVRs with broken ISAPI auth
-                from main import _RTSP_FALLBACK_IPS, _capture_snapshot_rtsp
-                if ip in _RTSP_FALLBACK_IPS:
-                    return await _capture_snapshot_rtsp(dvr, channel)
+            from main import capture_snapshot
+            return await capture_snapshot(dvr, channel, background=True)
         except Exception as e:
-            logger.debug(f"[SIGHTING] Capture failed {ip} ch{channel}: {e}")
-            # RTSP fallback on connection errors too
-            from main import _RTSP_FALLBACK_IPS, _capture_snapshot_rtsp
-            if ip in _RTSP_FALLBACK_IPS:
-                return await _capture_snapshot_rtsp(dvr, channel)
+            logger.debug(f"[SIGHTING] Capture failed {dvr['ip']} ch{channel}: {e}")
         return None
 
     def _decode_image(self, image_bytes: bytes):

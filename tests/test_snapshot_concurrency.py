@@ -3,8 +3,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+import attendance_engine
 import main
 
 
@@ -19,6 +20,9 @@ class FakeWebSocket:
 
 
 class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        main._dvr_capture_limiters.clear()
+
     async def test_snapshot_uses_direct_main_stream_without_resolution_probe(self):
         requested_urls = []
 
@@ -84,6 +88,184 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             await main.capture_snapshot(dvr, 3)
 
         self.assertIs(auth_objects[0], auth_objects[1])
+
+    async def test_snapshot_retries_transient_timeout_then_succeeds(self):
+        class Response:
+            status_code = 200
+            headers = {"content-type": "image/jpeg"}
+            content = b"jpeg"
+
+        class Client:
+            def __init__(self):
+                self.calls = 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def get(self, _url, auth):
+                self.calls += 1
+                if self.calls == 1:
+                    raise main.httpx.ConnectTimeout("busy")
+                return Response()
+
+        dvr = {
+            "ip": "192.0.2.3",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        client = Client()
+        with patch.object(main.httpx, "AsyncClient", return_value=client), patch.object(
+            main, "_SNAPSHOT_RETRIES", 2
+        ), patch.object(main, "_SNAPSHOT_RETRY_BACKOFF_SECONDS", 0):
+            snapshot = await main.capture_snapshot(dvr, 3)
+
+        self.assertEqual(snapshot, b"jpeg")
+        self.assertEqual(client.calls, 2)
+
+    async def test_snapshot_exhaustion_uses_rtsp_fallback(self):
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def get(self, _url, auth):
+                raise main.httpx.ReadTimeout("busy")
+
+        dvr = {
+            "ip": "192.0.2.4",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()), patch.object(
+            main, "_SNAPSHOT_RETRIES", 2
+        ), patch.object(main, "_SNAPSHOT_RETRY_BACKOFF_SECONDS", 0), patch.object(
+            main, "_capture_snapshot_rtsp", new=AsyncMock(return_value=b"rtsp")
+        ) as fallback:
+            snapshot = await main.capture_snapshot(dvr, 3)
+
+        self.assertEqual(snapshot, b"rtsp")
+        fallback.assert_awaited_once_with(dvr, 3)
+
+    async def test_background_capture_uses_short_budget_and_no_general_rtsp(self):
+        class Client:
+            def __init__(self):
+                self.calls = 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def get(self, _url, auth):
+                self.calls += 1
+                raise main.httpx.ConnectTimeout("busy")
+
+        dvr = {
+            "ip": "192.0.2.5",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        client = Client()
+        with patch.object(main.httpx, "AsyncClient", return_value=client), patch.object(
+            main, "_SNAPSHOT_RETRIES", 3
+        ), patch.object(main, "_SNAPSHOT_BACKGROUND_RETRIES", 1), patch.object(
+            main, "_SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS", 1
+        ), patch.object(main, "_SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS", 0), patch.object(
+            main, "_capture_snapshot_rtsp", new=AsyncMock()
+        ) as fallback:
+            snapshot = await main.capture_snapshot(dvr, 3, background=True)
+
+        self.assertIsNone(snapshot)
+        self.assertEqual(client.calls, 1)
+        fallback.assert_not_awaited()
+
+    async def test_attendance_capture_keeps_native_resolution_request(self):
+        class Response:
+            status_code = 200
+            headers = {"content-type": "image/jpeg"}
+            content = b"high-resolution-jpeg"
+
+        class Client:
+            async def get(self, url):
+                requested_urls.append(url)
+                return Response()
+
+        class Limiter:
+            async def release(self, _background):
+                return None
+
+        requested_urls = []
+        dvr = {
+            "ip": "192.0.2.6",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        engine = attendance_engine.AttendanceEngine()
+        engine._get_dvr_client = lambda _dvr: Client()
+        attendance_engine._channel_resolution_cache.clear()
+        with patch.object(
+            main, "_acquire_dvr_capture", new=AsyncMock(return_value=Limiter())
+        ), patch.object(
+            attendance_engine, "_probe_channel_resolution",
+            new=AsyncMock(return_value=(3840, 2160)),
+        ), patch.object(
+            main, "_SNAPSHOT_BACKGROUND_RETRIES", 1
+        ):
+            frame = await engine.capture_frame_from_dvr(dvr, 7)
+
+        self.assertEqual(frame, b"high-resolution-jpeg")
+        self.assertEqual(
+            requested_urls,
+            [
+                "http://192.0.2.6:80/ISAPI/Streaming/channels/701/picture"
+                "?snapShotImageType=JPEG"
+                "&videoResolutionWidth=3840&videoResolutionHeight=2160"
+            ],
+        )
+
+    async def test_live_capture_has_priority_and_limiter_releases_on_error(self):
+        limiter = main._DvrCaptureLimiter(limit=1, background_wait=0.05)
+        live_started = asyncio.Event()
+        release_live = asyncio.Event()
+        background_started = asyncio.Event()
+
+        async def live_capture():
+            await limiter.acquire(True)
+            live_started.set()
+            try:
+                await release_live.wait()
+            finally:
+                await limiter.release(True)
+
+        async def background_capture():
+            await limiter.acquire(False)
+            background_started.set()
+            await limiter.release(False)
+
+        live_task = asyncio.create_task(live_capture())
+        await live_started.wait()
+        background_task = asyncio.create_task(background_capture())
+        await asyncio.sleep(0)
+        self.assertFalse(background_started.is_set())
+        release_live.set()
+        await asyncio.wait_for(asyncio.gather(live_task, background_task), timeout=1)
+        self.assertTrue(background_started.is_set())
+
+        with self.assertRaises(RuntimeError):
+            async with limiter:
+                raise RuntimeError("capture failed")
+        await asyncio.wait_for(limiter.acquire(False), timeout=1)
+        await limiter.release(False)
 
     async def test_two_classroom_cameras_capture_in_parallel(self):
         cameras = [
