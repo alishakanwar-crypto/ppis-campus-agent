@@ -12,6 +12,7 @@ Features:
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import faulthandler
 import threading
 faulthandler.enable()  # Print C-level crash tracebacks
@@ -452,8 +453,18 @@ _digest_auth_cache: dict[tuple[str, str, str], httpx.DigestAuth] = {}
 
 
 class _DvrCaptureLimiter:
-    def __init__(self, limit: int, background_wait: float):
+    def __init__(
+        self,
+        limit: int,
+        background_wait: float,
+        background_limit: int | None = None,
+    ):
         self._semaphore = asyncio.Semaphore(limit)
+        self._background_limit = min(
+            max(1, background_limit if background_limit is not None else limit - 1),
+            max(1, limit - 1),
+        )
+        self._background_semaphore = asyncio.Semaphore(self._background_limit)
         self._condition = asyncio.Condition()
         self._live_waiting = 0
         self._live_active = 0
@@ -494,7 +505,12 @@ class _DvrCaptureLimiter:
                 )
             except asyncio.TimeoutError:
                 pass
-        await self._semaphore.acquire()
+        await self._background_semaphore.acquire()
+        try:
+            await self._semaphore.acquire()
+        except BaseException:
+            self._background_semaphore.release()
+            raise
 
     async def release(self, live: bool) -> None:
         self._semaphore.release()
@@ -502,6 +518,8 @@ class _DvrCaptureLimiter:
             async with self._condition:
                 self._live_active -= 1
                 self._condition.notify_all()
+        else:
+            self._background_semaphore.release()
 
 
 _DVR_CAPTURE_LIMIT = max(
@@ -509,6 +527,10 @@ _DVR_CAPTURE_LIMIT = max(
 )
 _DVR_BACKGROUND_WAIT_SECONDS = max(
     0.1, float(os.environ.get("DVR_BACKGROUND_WAIT_SECONDS", "5"))
+)
+_DVR_BACKGROUND_LIMIT = min(
+    max(1, int(os.environ.get("DVR_BACKGROUND_CONCURRENCY", "4"))),
+    max(1, _DVR_CAPTURE_LIMIT - 1),
 )
 _dvr_capture_limiters: dict[str, _DvrCaptureLimiter] = {}
 _dvr_capture_limiters_lock = asyncio.Lock()
@@ -521,7 +543,9 @@ async def _dvr_limiter(ip: str) -> _DvrCaptureLimiter:
             limiter = _dvr_capture_limiters.get(ip)
             if limiter is None:
                 limiter = _DvrCaptureLimiter(
-                    _DVR_CAPTURE_LIMIT, _DVR_BACKGROUND_WAIT_SECONDS
+                    _DVR_CAPTURE_LIMIT,
+                    _DVR_BACKGROUND_WAIT_SECONDS,
+                    _DVR_BACKGROUND_LIMIT,
                 )
                 _dvr_capture_limiters[ip] = limiter
     return limiter
@@ -552,6 +576,15 @@ _RTSP_COOLDOWN_SECONDS = max(
 _rtsp_cooldowns: dict[str, float] = {}
 _rtsp_timeout_warning_logged = False
 _rtsp_timeout_warning_lock = threading.Lock()
+_live_dvr_clients: dict[str, httpx.AsyncClient] = {}
+_live_capture_preferences: dict[str, tuple[str, int]] = {}
+_live_dvr_client_lock = asyncio.Lock()
+_live_request_deadline: contextvars.ContextVar[float | None] = (
+    contextvars.ContextVar("live_request_deadline", default=None)
+)
+_live_request_classroom: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "live_request_classroom", default=""
+)
 
 
 def _exception_text(exc: BaseException) -> str:
@@ -686,7 +719,7 @@ _SNAPSHOT_CONNECT_TIMEOUT_SECONDS = max(
 )
 _SNAPSHOT_HTTP_TIMEOUT_SECONDS = max(
     _SNAPSHOT_CONNECT_TIMEOUT_SECONDS,
-    float(os.environ.get("SNAPSHOT_HTTP_TIMEOUT_SECONDS", "6")),
+    float(os.environ.get("SNAPSHOT_HTTP_TIMEOUT_SECONDS", "10")),
 )
 _SNAPSHOT_BACKGROUND_RETRIES = max(
     1, int(os.environ.get("SNAPSHOT_BACKGROUND_RETRIES", "1"))
@@ -714,10 +747,50 @@ _rtsp_capture_executor = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="ppis-rtsp",
 )
 _rtsp_capture_semaphore = asyncio.Semaphore(_RTSP_CAPTURE_CONCURRENCY)
+_SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS = max(
+    1.0, float(os.environ.get("SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS", "50"))
+)
+
+
+async def _get_live_dvr_client(
+    dvr: dict, timeout: httpx.Timeout
+) -> httpx.AsyncClient:
+    ip = dvr["ip"]
+    async with _live_dvr_client_lock:
+        client = _live_dvr_clients.get(ip)
+        if client is None or getattr(client, "is_closed", False):
+            _live_dvr_clients[ip] = httpx.AsyncClient(
+                timeout=timeout,
+                limits=httpx.Limits(
+                    max_connections=_DVR_CAPTURE_LIMIT,
+                    max_keepalive_connections=_DVR_CAPTURE_LIMIT,
+                ),
+            )
+        return _live_dvr_clients[ip]
+
+
+async def _discard_live_dvr_client(
+    ip: str, client: httpx.AsyncClient
+) -> None:
+    async with _live_dvr_client_lock:
+        if _live_dvr_clients.get(ip) is not client:
+            return
+        _live_dvr_clients.pop(ip, None)
+    close = getattr(client, "aclose", None)
+    if close is not None:
+        await close()
+
+
+def _response_round_trips(response: httpx.Response) -> int:
+    history = getattr(response, "history", ())
+    return 1 + len(history)
 
 
 async def _capture_snapshot_once(
-    dvr: dict, channel: int, client: httpx.AsyncClient
+    dvr: dict,
+    channel: int,
+    client: httpx.AsyncClient,
+    metrics: dict[str, int] | None = None,
 ) -> bytes | None:
     ip = dvr["ip"]
     port = dvr.get("port", 80)
@@ -725,28 +798,48 @@ async def _capture_snapshot_once(
     pwd = dvr["password"]
     stream_channel = channel * 100 + 1
     url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+    urls = [
+        url,
+        f"http://{ip}:{port}/ISAPI/Streaming/channels/{channel * 100 + 2}/picture",
+        f"http://{ip}:{port}/Streaming/channels/{stream_channel}/picture",
+    ]
     digest_auth = _digest_auth(ip, user, pwd)
-    resp = await client.get(url, auth=digest_auth)
-    if resp.status_code == 401:
-        resp = await client.get(url, auth=httpx.BasicAuth(user, pwd))
-    if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-        return resp.content
-
-    alt_stream = channel * 100 + 2
-    alt_url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{alt_stream}/picture"
-    resp2 = await client.get(alt_url, auth=digest_auth)
-    if resp2.status_code == 200 and resp2.headers.get("content-type", "").startswith("image"):
-        return resp2.content
-
-    alt_url2 = f"http://{ip}:{port}/Streaming/channels/{stream_channel}/picture"
-    resp3 = await client.get(alt_url2, auth=digest_auth)
-    if resp3.status_code == 200 and resp3.headers.get("content-type", "").startswith("image"):
-        return resp3.content
+    candidates = []
+    remembered = _live_capture_preferences.get(ip)
+    if remembered is not None:
+        candidates.append(remembered)
+    candidates.extend(
+        (scheme, variant)
+        for variant in range(len(urls))
+        for scheme in ("digest", "basic")
+    )
+    seen: set[tuple[str, int]] = set()
+    for scheme, variant in candidates:
+        if (scheme, variant) in seen:
+            continue
+        seen.add((scheme, variant))
+        auth = digest_auth if scheme == "digest" else httpx.BasicAuth(user, pwd)
+        response = await client.get(urls[variant], auth=auth)
+        if metrics is not None:
+            metrics["round_trips"] = (
+                metrics.get("round_trips", 0) + _response_round_trips(response)
+            )
+        if (
+            response.status_code == 200
+            and response.headers.get("content-type", "").startswith("image")
+        ):
+            _live_capture_preferences[ip] = (scheme, variant)
+            return response.content
     return None
 
 
 async def capture_snapshot(
-    dvr: dict, channel: int, *, background: bool = False
+    dvr: dict,
+    channel: int,
+    *,
+    background: bool = False,
+    classroom: str = "",
+    deadline: float | None = None,
 ) -> bytes | None:
     """Capture a JPEG snapshot from a Hikvision NVR via ISAPI.
 
@@ -768,7 +861,16 @@ async def capture_snapshot(
         stream_channel,
     )
 
+    limiter_wait_started = time.monotonic()
     limiter = await _acquire_dvr_capture(ip, background)
+    limiter_wait = time.monotonic() - limiter_wait_started
+    metrics: dict[str, object] = {
+        "round_trips": 0,
+        "attempt_elapsed": [],
+        "rtsp": False,
+        "outcome": "failed",
+        "exception": "",
+    }
     try:
         retries = _SNAPSHOT_BACKGROUND_RETRIES if background else _SNAPSHOT_RETRIES
         camera_timeout = (
@@ -783,20 +885,30 @@ async def capture_snapshot(
             _SNAPSHOT_BACKGROUND_CONNECT_TIMEOUT_SECONDS
             if background else _SNAPSHOT_CONNECT_TIMEOUT_SECONDS
         )
+        request_deadline = deadline if deadline is not None else _live_request_deadline.get()
         capture_deadline = capture_started + camera_timeout
+        if not background and request_deadline is not None:
+            capture_deadline = min(capture_deadline, request_deadline)
         timeout = httpx.Timeout(
             http_timeout,
             connect=connect_timeout,
         )
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        client = await _get_live_dvr_client(dvr, timeout) if not background else None
+        if background:
+            client = httpx.AsyncClient(timeout=timeout)
+        try:
             for attempt in range(retries):
                 remaining = capture_deadline - time.monotonic()
                 if remaining <= 0:
                     break
+                attempt_started = time.monotonic()
                 try:
                     snapshot = await asyncio.wait_for(
-                        _capture_snapshot_once(dvr, channel, client),
+                        _capture_snapshot_once(dvr, channel, client, metrics),
                         timeout=min(http_timeout, remaining),
+                    )
+                    metrics["attempt_elapsed"].append(
+                        round(time.monotonic() - attempt_started, 3)
                     )
                     if snapshot:
                         logger.info(
@@ -805,6 +917,7 @@ async def capture_snapshot(
                             time.monotonic() - capture_started,
                         )
                         _last_capture_error = ""
+                        metrics["outcome"] = "success"
                         return snapshot
                     _last_capture_error = f"{ip} ch{channel}: ISAPI capture failed"
                     if attempt < retries - 1:
@@ -814,6 +927,12 @@ async def capture_snapshot(
                             max(0.0, capture_deadline - time.monotonic()),
                         ))
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+                    metrics["attempt_elapsed"].append(
+                        round(time.monotonic() - attempt_started, 3)
+                    )
+                    metrics["exception"] = type(exc).__name__
+                    if not background:
+                        await _discard_live_dvr_client(ip, client)
                     _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
                     logger.warning(
                         "Snapshot attempt %d/%d failed from %s ch%d: %s",
@@ -826,6 +945,12 @@ async def capture_snapshot(
                             max(0.0, capture_deadline - time.monotonic()),
                         ))
                 except asyncio.TimeoutError as exc:
+                    metrics["attempt_elapsed"].append(
+                        round(time.monotonic() - attempt_started, 3)
+                    )
+                    metrics["exception"] = type(exc).__name__
+                    if not background:
+                        await _discard_live_dvr_client(ip, client)
                     _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
                     logger.warning(
                         "Snapshot attempt %d/%d timed out from %s ch%d",
@@ -838,6 +963,12 @@ async def capture_snapshot(
                             max(0.0, capture_deadline - time.monotonic()),
                         ))
                 except Exception as exc:
+                    metrics["attempt_elapsed"].append(
+                        round(time.monotonic() - attempt_started, 3)
+                    )
+                    metrics["exception"] = type(exc).__name__
+                    if not background:
+                        await _discard_live_dvr_client(ip, client)
                     _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
                     logger.error(
                         "Snapshot error from %s ch%d: %s",
@@ -863,12 +994,16 @@ async def capture_snapshot(
                         _capture_snapshot_rtsp(dvr, channel), timeout=remaining
                     )
                     if rtsp_frame:
+                        metrics["rtsp"] = True
+                        metrics["outcome"] = "success"
                         _clear_rtsp_failure(ip)
                         _last_capture_error = ""
                         return rtsp_frame
                     _mark_rtsp_failure(ip)
+                    metrics["rtsp"] = True
                 except asyncio.TimeoutError:
                     _mark_rtsp_failure(ip)
+                    metrics["rtsp"] = True
                     logger.warning(
                         "RTSP fallback timed out from %s ch%d",
                         ip,
@@ -876,6 +1011,8 @@ async def capture_snapshot(
                     )
                 except Exception as exc:
                     _mark_rtsp_failure(ip)
+                    metrics["rtsp"] = True
+                    metrics["exception"] = type(exc).__name__
                     logger.warning(
                         "RTSP fallback failed from %s ch%d: %s",
                         ip,
@@ -889,8 +1026,28 @@ async def capture_snapshot(
                     channel,
                 )
             return None
+        finally:
+            if background and client is not None:
+                close = getattr(client, "aclose", None)
+                if close is not None:
+                    await close()
     finally:
         await limiter.release(not background)
+        if not background:
+            logger.info(
+                "[LIVE] snapshot classroom=%s ip=%s channel=%d "
+                "limiter_wait=%.3fs http_round_trips=%d attempt_elapsed=%s "
+                "rtsp=%s outcome=%s exception=%s",
+                classroom or _live_request_classroom.get() or "-",
+                ip,
+                channel,
+                limiter_wait,
+                metrics["round_trips"],
+                metrics["attempt_elapsed"],
+                metrics["rtsp"],
+                metrics["outcome"],
+                metrics["exception"] or "-",
+            )
 
 
 async def test_dvr_connection(dvr: dict) -> dict:
@@ -1067,7 +1224,7 @@ _snapshot_request_semaphore = asyncio.Semaphore(
     max(1, int(os.environ.get("SNAPSHOT_CONCURRENT_REQUESTS", "2")))
 )
 _SNAPSHOT_CAMERA_TIMEOUT_SECONDS = max(
-    1.0, float(os.environ.get("SNAPSHOT_CAMERA_TIMEOUT_SECONDS", "25"))
+    1.0, float(os.environ.get("SNAPSHOT_CAMERA_TIMEOUT_SECONDS", "40"))
 )
 
 
@@ -1244,14 +1401,18 @@ async def _capture_classroom_camera(
 ) -> tuple[bytes, str, str] | None:
     dvr, channel, desc = camera
     try:
+        request_deadline = _live_request_deadline.get()
+        timeout = _SNAPSHOT_CAMERA_TIMEOUT_SECONDS
+        if request_deadline is not None:
+            timeout = max(0.1, min(timeout, request_deadline - time.monotonic()))
         snapshot = await asyncio.wait_for(
             capture_snapshot(dvr, channel),
-            timeout=_SNAPSHOT_CAMERA_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except asyncio.TimeoutError:
         logger.warning(
             "Snapshot timed out after %.1fs from DVR %s channel %d (%s)",
-            _SNAPSHOT_CAMERA_TIMEOUT_SECONDS,
+            timeout,
             dvr["ip"],
             channel,
             desc,
@@ -1290,6 +1451,10 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
 
 async def _handle_snapshot_request(ws, classroom: str, request_id: str):
     request_started = time.monotonic()
+    request_token = _live_request_deadline.set(
+        request_started + _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS
+    )
+    classroom_token = _live_request_classroom.set(classroom)
     all_cameras = find_all_cameras_for_classroom(classroom)
 
     if not all_cameras:
@@ -1299,6 +1464,8 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
             "success": False,
             "error": f"No camera mapped for classroom: {classroom}",
         }))
+        _live_request_deadline.reset(request_token)
+        _live_request_classroom.reset(classroom_token)
         return
 
     logger.info(f"Capturing from {len(all_cameras)} camera(s) for {classroom}")
@@ -1348,6 +1515,8 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
             "error": f"Failed to capture snapshot from any camera for {classroom}",
             "detail": _last_capture_error,
         }))
+        _live_request_deadline.reset(request_token)
+        _live_request_classroom.reset(classroom_token)
         return
 
     # Send completion message
@@ -1364,6 +1533,8 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         sent_count,
         time.monotonic() - request_started,
     )
+    _live_request_deadline.reset(request_token)
+    _live_request_classroom.reset(classroom_token)
 
 
 # ---------------------------------------------------------------------------

@@ -2384,12 +2384,17 @@ class AttendanceEngine:
 
     def _get_dvr_client(self, dvr: dict) -> httpx.AsyncClient:
         """Get or create a persistent HTTP client for a DVR (connection pooling)."""
+        from main import _DVR_BACKGROUND_LIMIT
+
         ip = dvr["ip"]
         if ip not in self._dvr_clients or self._dvr_clients[ip].is_closed:
             self._dvr_clients[ip] = httpx.AsyncClient(
                 timeout=8.0,
                 auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
-                limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
+                limits=httpx.Limits(
+                    max_connections=_DVR_BACKGROUND_LIMIT,
+                    max_keepalive_connections=_DVR_BACKGROUND_LIMIT,
+                ),
             )
         return self._dvr_clients[ip]
 
