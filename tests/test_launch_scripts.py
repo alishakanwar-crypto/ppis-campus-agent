@@ -44,6 +44,28 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertNotIn("run_hidden.vbs", script)
         self.assertEqual(script.count("run_watchdog_hidden.vbs"), 5)
 
+    def test_installer_echoes_inside_blocks_cannot_close_the_block(self):
+        # An unescaped ')' in `echo ... (XML method)` ended the if-block early,
+        # so the fallback ran too and overwrote the XML-defined task.
+        for line in _read("install_autostart.bat").splitlines():
+            if line.startswith((" ", "\t")) and line.strip().startswith("echo "):
+                self.assertNotIn(")", line, line)
+
+    def test_installer_replaces_legacy_duplicate_tasks(self):
+        script = _read("install_autostart.bat")
+        for task in ("PPIS Agent Autostart", "PPIS TrueFace Poller"):
+            self.assertIn(f'schtasks /delete /tn "{task}" /f', script)
+        self.assertIn("nightly_restart.bat", script)
+        self.assertIn("/sc daily /st 03:00", script)
+
+    def test_nightly_restart_is_unattended_and_pull_safe(self):
+        script = _read("nightly_restart.bat")
+        self.assertNotIn("\npause", script)
+        rerun = script.index('call "!SELF_COPY!" --from-temp')
+        pull = script.index("git reset --hard origin/main")
+        self.assertLess(rerun, pull)
+        self.assertIn('call "!AGENT_DIR!watchdog.bat"', script)
+
     def test_watchdog_detects_launcher_hosted_processes(self):
         script = _read("watchdog.bat")
         self.assertEqual(
