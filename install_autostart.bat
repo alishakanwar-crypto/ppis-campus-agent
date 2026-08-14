@@ -84,13 +84,13 @@ echo ^</Task^>
 
 schtasks /create /tn "PPIS Campus Agent" /xml "%XMLFILE%" /f >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
-    echo       Boot/Logon task created (XML method)
+    echo       Boot/Logon task created - XML method
     set TASK_OK=1
 ) else (
     echo       XML method failed, trying simple command...
     schtasks /create /tn "PPIS Campus Agent" /tr "wscript.exe \"%AGENT_DIR%run_watchdog_hidden.vbs\"" /sc onlogon /rl highest /f >nul 2>&1
     if !ERRORLEVEL! EQU 0 (
-        echo       Logon task created (simple method)
+        echo       Logon task created - simple method
         set TASK_OK=1
     ) else (
         echo       WARNING: Could not create scheduled task
@@ -146,13 +146,13 @@ echo ^</Task^>
 
 schtasks /create /tn "PPIS Campus Agent Watchdog" /xml "%XMLFILE2%" /f >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
-    echo       Watchdog task created (XML method)
+    echo       Watchdog task created - XML method
     set WATCHDOG_OK=1
 ) else (
     echo       XML method failed, trying simple command...
     schtasks /create /tn "PPIS Campus Agent Watchdog" /tr "wscript.exe \"%AGENT_DIR%run_watchdog_hidden.vbs\"" /sc minute /mo 5 /f >nul 2>&1
     if !ERRORLEVEL! EQU 0 (
-        echo       Watchdog task created (simple method)
+        echo       Watchdog task created - simple method
         set WATCHDOG_OK=1
     ) else (
         echo       WARNING: Could not create watchdog task
@@ -162,10 +162,22 @@ del "%XMLFILE2%" >nul 2>&1
 
 REM ── Remove the legacy startup-folder launcher ──────────────────
 
-echo [4/6] Removing duplicate startup-folder launcher...
+echo [4/6] Creating nightly refresh task (03:00 IST)...
+schtasks /delete /tn "PPIS Nightly Restart" /f >nul 2>&1
+schtasks /create /tn "PPIS Nightly Restart" /tr "cmd.exe /c \"%AGENT_DIR%nightly_restart.bat\"" /sc daily /st 03:00 /rl highest /f >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo       Nightly refresh task created
+) else (
+    echo       WARNING: Could not create nightly refresh task
+)
+
+echo       Removing duplicate launchers...
 set STARTUP_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
 if exist "%STARTUP_DIR%\PPIS Agent.vbs" del "%STARTUP_DIR%\PPIS Agent.vbs" >nul 2>&1
-echo       Legacy startup-folder launcher removed
+REM Superseded by "PPIS Campus Agent" + watchdog; leaving them starts duplicates
+schtasks /delete /tn "PPIS Agent Autostart" /f >nul 2>&1
+schtasks /delete /tn "PPIS TrueFace Poller" /f >nul 2>&1
+echo       Legacy launchers removed
 
 REM ── Verify tasks ───────────────────────────────────────────────
 
@@ -187,6 +199,9 @@ if !ERRORLEVEL! EQU 0 (
 )
 
 echo       [OK] Startup folder:  DISABLED (single scheduled launcher)
+
+REM Print the real triggers so a botched task definition is visible here.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "foreach ($t in 'PPIS Campus Agent','PPIS Campus Agent Watchdog') { $task = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue; if ($task) { foreach ($trig in $task.Triggers) { Write-Host ('      ' + $t + ' trigger: ' + $trig.CimClass.CimClassName) } } }" 2>nul
 
 REM ── Start the agent NOW ───────────────────────────────────────
 
