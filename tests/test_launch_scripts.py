@@ -32,6 +32,18 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertIn("WRAPPER: launched", script)
         self.assertIn("\ncall :run\n", script)
 
+    def test_watchdog_kills_a_wedged_poller_with_a_stale_log(self):
+        script = _read("watchdog.bat")
+        self.assertIn("AddMinutes(-15)", script)
+        stale_kill = script.index("poller is wedged")
+        restart = script.index('if "%NEED_TRUEFACE%"=="1" (')
+        self.assertLess(stale_kill, restart)
+
+    def test_autostart_task_starts_every_process(self):
+        script = _read("install_autostart.bat")
+        self.assertNotIn("run_hidden.vbs", script)
+        self.assertEqual(script.count("run_watchdog_hidden.vbs"), 5)
+
     def test_watchdog_detects_launcher_hosted_processes(self):
         script = _read("watchdog.bat")
         self.assertEqual(
