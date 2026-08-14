@@ -62,6 +62,13 @@ CLOUD_POST_ATTEMPTS = max(
 PHOTO_FETCH_TIMEOUT_SECONDS = max(
     0.1, float(os.environ.get("TRUEFACE_PHOTO_TIMEOUT_SECONDS", "8"))
 )
+HEARTBEAT_API = os.environ.get(
+    "TRUEFACE_CLOUD_HEARTBEAT_API",
+    CLOUD_API.replace("/api/trueface/event", "/api/trueface/heartbeat"),
+)
+HEARTBEAT_INTERVAL_SECONDS = max(
+    0.0, float(os.environ.get("TRUEFACE_HEARTBEAT_SECONDS", "60"))
+)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -865,6 +872,25 @@ def _reset_daily():
         logger.info("New day: %s — reset seen events", today)
 
 
+_last_heartbeat_at = 0.0
+
+
+def _send_heartbeat() -> None:
+    """Tell the cloud the poller is alive, even when no faces are scanned."""
+    global _last_heartbeat_at
+
+    if not HEARTBEAT_INTERVAL_SECONDS or not HEARTBEAT_API:
+        return
+    now = time.monotonic()
+    if _last_heartbeat_at and now - _last_heartbeat_at < HEARTBEAT_INTERVAL_SECONDS:
+        return
+    _last_heartbeat_at = now
+    try:
+        httpx.post(HEARTBEAT_API, timeout=CLOUD_POST_TIMEOUT_SECONDS)
+    except Exception as e:
+        logger.warning("Heartbeat post failed: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Main polling loop
 # ---------------------------------------------------------------------------
@@ -897,10 +923,25 @@ def run_poller():
                 time.sleep(60)
                 continue
 
+            _send_heartbeat()
+
             # Create driver if needed
             if driver is None:
                 logger.info("Starting headless Chrome...")
-                driver = _create_driver()
+                browser_start = time.monotonic()
+                try:
+                    driver = _create_driver()
+                except Exception as e:
+                    logger.error(
+                        "Chrome startup failed after %.1fs: %s — retrying in 30s",
+                        time.monotonic() - browser_start, e,
+                    )
+                    driver = None
+                    time.sleep(30)
+                    continue
+                logger.info(
+                    "Headless Chrome ready in %.1fs", time.monotonic() - browser_start
+                )
                 if not _login(driver):
                     logger.error("Login failed — retrying in 30s")
                     try:
