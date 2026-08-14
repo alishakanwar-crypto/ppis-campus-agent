@@ -26,11 +26,11 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertLess(rerun, pull)
         self.assertIn('if /I "%~1"=="--from-temp" (\n    cd /d "%~2"', script)
 
-    def test_wrapper_logs_before_taking_lock(self):
+    def test_wrapper_does_not_gate_the_poller_behind_a_file_lock(self):
         script = _read("run_trueface.bat")
-        launch_log = script.index("WRAPPER: launched")
-        lock_call = script.index('call :run 9>"%~dp0.locks\\trueface.lock"')
-        self.assertLess(launch_log, lock_call)
+        self.assertNotIn("9>", script.split(":run", 1)[0])
+        self.assertIn("WRAPPER: launched", script)
+        self.assertIn("\ncall :run\n", script)
 
     def test_watchdog_detects_launcher_hosted_processes(self):
         script = _read("watchdog.bat")

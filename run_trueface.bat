@@ -8,15 +8,14 @@ title TrueFace 3000 Poller (24/7)
 cd /d "%~dp0"
 set "LOGFILE=%~dp0wrapper_trueface.log"
 
-if not exist "%~dp0.locks\" mkdir "%~dp0.locks" >nul 2>&1
+REM No file lock here: a leftover handle on .locks\trueface.lock made cmd
+REM skip `call :run 9>lock` without setting ERRORLEVEL, so the wrapper exited
+REM silently and the poller stayed down. The Python mutex in
+REM trueface_instance.py is the authoritative single-instance guard; a
+REM duplicate exits with DUPLICATE_EXIT_CODE and the wrapper stops cleanly.
 call :cap_log
-echo [%DATE% %TIME%] WRAPPER: launched, taking lock... >> "%LOGFILE%"
-call :run 9>"%~dp0.locks\trueface.lock"
-if errorlevel 1 (
-    echo [%DATE% %TIME%] WRAPPER: TrueFace lock is already held; exiting cleanly. >> "%LOGFILE%"
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('py.exe','python.exe','pythonw.exe','cmd.exe') } | ForEach-Object { '[LOCK HOLDER CANDIDATE] ' + $_.ProcessId + ' ' + $_.CommandLine }" >> "%LOGFILE%" 2>&1
-    exit /b 0
-)
+echo [%DATE% %TIME%] WRAPPER: launched >> "%LOGFILE%"
+call :run
 exit /b 0
 
 :run
