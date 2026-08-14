@@ -21,13 +21,17 @@ echo [Step 1/5] Killing hidden batch file processes...
 powershell -Command "Get-WmiObject Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object { $_.CommandLine -match 'run_forever|run_trueface|run_gate_counter|run_chairman_mood' } | ForEach-Object { Write-Host ('  Killed cmd.exe PID ' + $_.ProcessId); $_.Terminate() | Out-Null }" 2>nul
 timeout /t 3 /nobreak >nul
 
-REM --- Step 2: Kill all python.exe processes (loop until none remain) ---
+REM --- Step 2: Kill all Python processes (loop until none remain) ---
+REM py.exe / pythonw.exe must go too: a surviving launcher keeps the
+REM wrapper lock handles open, which makes later wrapper starts no-op.
 echo [Step 2/5] Killing all Python processes...
 set "RETRIES=0"
 :kill_loop
-tasklist /FI "IMAGENAME eq python.exe" 2>nul | findstr /I "python.exe" >nul
+tasklist /FI "IMAGENAME eq python.exe" /FI "IMAGENAME eq py.exe" /FI "IMAGENAME eq pythonw.exe" 2>nul | findstr /I "python.exe py.exe pythonw.exe" >nul
 if !ERRORLEVEL! EQU 0 (
     taskkill /F /IM python.exe >nul 2>&1
+    taskkill /F /IM py.exe >nul 2>&1
+    taskkill /F /IM pythonw.exe >nul 2>&1
     set /a RETRIES+=1
     if !RETRIES! GEQ 10 (
         echo   WARNING: Could not kill all Python processes after 10 attempts.
@@ -79,6 +83,7 @@ timeout /t 20 /nobreak >nul
 echo   Starting TrueFace Poller...
 wscript.exe run_trueface_hidden.vbs
 timeout /t 10 /nobreak >nul
+call :verify_trueface
 
 echo   Starting Gate Counter...
 wscript.exe run_gate_counter_hidden.vbs
@@ -107,3 +112,14 @@ echo ========================================================
 echo   Done! You can close this window now.
 echo ========================================================
 pause
+exit /b 0
+
+REM --- Retry the TrueFace poller once, visibly, if it did not come up ---
+:verify_trueface
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'trueface_poller' }; if ($p) { exit 0 } else { exit 1 }" >nul 2>&1
+if !ERRORLEVEL! EQU 0 exit /b 0
+echo   TrueFace poller did not start; retrying and showing the error...
+if exist ".locks\trueface.lock" del ".locks\trueface.lock" >nul 2>&1
+start "TrueFace Poller" /min cmd /c "run_trueface.bat"
+timeout /t 15 /nobreak >nul
+exit /b 0

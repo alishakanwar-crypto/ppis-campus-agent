@@ -16,7 +16,7 @@ set NEED_GATE_COUNTER=0
 
 REM Check if campus agent (main.py) is running. If PowerShell/CIM fails,
 REM the nonzero status deliberately fails open and requests a start.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'python.exe' }; if ($p | Where-Object { $_.CommandLine -match 'main.py' }) { exit 0 } else { exit 1 }" >nul 2>&1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('python.exe','py.exe','pythonw.exe') }; if ($p | Where-Object { $_.CommandLine -match 'main.py' }) { exit 0 } else { exit 1 }" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     set NEED_AGENT=1
 )
@@ -24,14 +24,14 @@ if %ERRORLEVEL% NEQ 0 (
 REM Check if TrueFace poller (trueface_poller.py) is running. If the
 REM process query fails, request a start; the Python mutex remains
 REM authoritative if an old process is still shutting down.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'python.exe' }; if ($p | Where-Object { $_.CommandLine -match 'trueface_poller' }) { exit 0 } else { exit 1 }" >nul 2>&1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('python.exe','py.exe','pythonw.exe') }; if ($p | Where-Object { $_.CommandLine -match 'trueface_poller' }) { exit 0 } else { exit 1 }" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     set NEED_TRUEFACE=1
 )
 
 REM Check if the gate counter is running. If the query fails, fail open and
 REM request a start so native CP Plus counts self-heal.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'python.exe' }; if ($p | Where-Object { $_.CommandLine -match 'gate_counter\.py' }) { exit 0 } else { exit 1 }" >nul 2>&1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('python.exe','py.exe','pythonw.exe') }; if ($p | Where-Object { $_.CommandLine -match 'gate_counter\.py' }) { exit 0 } else { exit 1 }" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     set NEED_GATE_COUNTER=1
 )
