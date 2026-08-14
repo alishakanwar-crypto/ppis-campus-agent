@@ -873,15 +873,28 @@ def _reset_daily():
 
 
 _last_heartbeat_at = 0.0
+_last_liveness_log_at = 0.0
+# The watchdog treats a log with no new line for a while as a wedged poller,
+# so the loop leaves a periodic mark even when nobody is scanning.
+LIVENESS_LOG_INTERVAL_SECONDS = max(
+    0.0, float(os.environ.get("TRUEFACE_LIVENESS_LOG_SECONDS", "300"))
+)
 
 
 def _send_heartbeat() -> None:
     """Tell the cloud the poller is alive, even when no faces are scanned."""
-    global _last_heartbeat_at
+    global _last_heartbeat_at, _last_liveness_log_at
+
+    now = time.monotonic()
+    if LIVENESS_LOG_INTERVAL_SECONDS and (
+        not _last_liveness_log_at
+        or now - _last_liveness_log_at >= LIVENESS_LOG_INTERVAL_SECONDS
+    ):
+        _last_liveness_log_at = now
+        logger.info("Poller alive — %s IST", datetime.now(IST).strftime("%H:%M:%S"))
 
     if not HEARTBEAT_INTERVAL_SECONDS or not HEARTBEAT_API:
         return
-    now = time.monotonic()
     if _last_heartbeat_at and now - _last_heartbeat_at < HEARTBEAT_INTERVAL_SECONDS:
         return
     _last_heartbeat_at = now

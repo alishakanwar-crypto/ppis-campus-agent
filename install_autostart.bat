@@ -75,7 +75,7 @@ echo   ^</Settings^>
 echo   ^<Actions Context="Author"^>
 echo     ^<Exec^>
 echo       ^<Command^>wscript.exe^</Command^>
-echo       ^<Arguments^>"!AGENT_DIR!run_hidden.vbs"^</Arguments^>
+echo       ^<Arguments^>"!AGENT_DIR!run_watchdog_hidden.vbs"^</Arguments^>
 echo       ^<WorkingDirectory^>!AGENT_DIR!^</WorkingDirectory^>
 echo     ^</Exec^>
 echo   ^</Actions^>
@@ -88,7 +88,7 @@ if !ERRORLEVEL! EQU 0 (
     set TASK_OK=1
 ) else (
     echo       XML method failed, trying simple command...
-    schtasks /create /tn "PPIS Campus Agent" /tr "wscript.exe \"%AGENT_DIR%run_hidden.vbs\"" /sc onlogon /rl highest /f >nul 2>&1
+    schtasks /create /tn "PPIS Campus Agent" /tr "wscript.exe \"%AGENT_DIR%run_watchdog_hidden.vbs\"" /sc onlogon /rl highest /f >nul 2>&1
     if !ERRORLEVEL! EQU 0 (
         echo       Logon task created (simple method)
         set TASK_OK=1
@@ -191,8 +191,10 @@ echo       [OK] Startup folder:  DISABLED (single scheduled launcher)
 REM ── Start the agent NOW ───────────────────────────────────────
 
 echo.
-echo [6/6] Starting the agent now...
-start "" wscript.exe "%AGENT_DIR%run_hidden.vbs"
+echo [6/6] Starting the agents now...
+REM The watchdog starts every missing process, not just the campus agent, so
+REM boot/logon brings up TrueFace and the gate counter too.
+start "" wscript.exe "%AGENT_DIR%run_watchdog_hidden.vbs"
 
 echo.
 echo ============================================================

@@ -36,6 +36,19 @@ if %ERRORLEVEL% NEQ 0 (
     set NEED_GATE_COUNTER=1
 )
 
+REM A running poller can still be wedged (hung Chrome startup, dead login).
+REM trueface_poller.py marks the log every 5 minutes, so a log with no new
+REM line for 15 minutes means wedged: kill it and let the restart below run.
+if "%NEED_TRUEFACE%"=="0" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$f='%~dp0trueface_poller.log'; if (-not (Test-Path $f)) { exit 0 }; if ((Get-Item $f).LastWriteTime -lt (Get-Date).AddMinutes(-15)) { exit 1 }; exit 0" >nul 2>&1
+    if !ERRORLEVEL! EQU 1 (
+        echo [%DATE% %TIME%] WATCHDOG: TrueFace log stale for 15 min; poller is wedged, killing it... >> "%LOGFILE%"
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'trueface_poller' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+        timeout /t 3 /nobreak >nul
+        set NEED_TRUEFACE=1
+    )
+)
+
 REM If all three are running, do nothing
 if "%NEED_AGENT%"=="0" if "%NEED_TRUEFACE%"=="0" if "%NEED_GATE_COUNTER%"=="0" exit /b 0
 
