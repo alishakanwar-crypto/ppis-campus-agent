@@ -19,6 +19,13 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertIn(":verify_trueface", script)
         self.assertIn("run_trueface.bat", script)
 
+    def test_restart_reruns_itself_from_temp_before_pulling(self):
+        script = _read("restart_all.bat")
+        rerun = script.index('call "!SELF_COPY!" --from-temp')
+        pull = script.index("git reset --hard origin/main")
+        self.assertLess(rerun, pull)
+        self.assertIn('if /I "%~1"=="--from-temp" (\n    cd /d "%~2"', script)
+
     def test_wrapper_logs_before_taking_lock(self):
         script = _read("run_trueface.bat")
         launch_log = script.index("WRAPPER: launched")

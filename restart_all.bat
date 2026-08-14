@@ -9,7 +9,23 @@ REM  Usage: Right-click > Run as Administrator
 REM         (Admin is needed to kill processes started by other windows)
 REM ================================================================
 
-cd /d "%~dp0"
+REM Re-run from a temp copy: step 3 pulls code, and rewriting the script
+REM cmd.exe is still reading by byte offset corrupts the rest of the run.
+if /I not "%~1"=="--from-temp" (
+    set "SELF_COPY=%TEMP%\ppis_restart_all.bat"
+    copy /y "%~f0" "!SELF_COPY!" >nul 2>&1
+    if exist "!SELF_COPY!" (
+        call "!SELF_COPY!" --from-temp "%~dp0"
+        exit /b !ERRORLEVEL!
+    )
+    echo   WARNING: Could not copy this script to %TEMP%; running in place.
+)
+
+if /I "%~1"=="--from-temp" (
+    cd /d "%~2"
+) else (
+    cd /d "%~dp0"
+)
 echo.
 echo ========================================================
 echo   PPIS Campus Agent — Restarting All Processes
