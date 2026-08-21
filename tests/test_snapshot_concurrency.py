@@ -135,6 +135,31 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("videoResolutionWidth=1920", requested_urls[0])
 
+    async def test_repeat_fallback_captures_do_not_postpone_the_retry(self):
+        class Response:
+            def __init__(self, status_code):
+                self.status_code = status_code
+                self.headers = {"content-type": "image/jpeg"}
+                self.content = b"jpeg"
+
+        class Client:
+            async def get(self, url, auth):
+                return Response(200 if "/302/picture" in url else 401)
+
+        dvr = {
+            "ip": "192.0.2.32",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        key = ("192.0.2.32", 3)
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            await main.capture_snapshot(dvr, 3)
+            chosen_at = main._live_capture_preference_age[key]
+            await main.capture_snapshot(dvr, 3)
+
+        self.assertEqual(main._live_capture_preference_age[key], chosen_at)
+
     async def test_digest_auth_is_reused_for_repeat_snapshots(self):
         auth_objects = []
 
