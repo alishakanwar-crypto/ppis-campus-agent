@@ -26,8 +26,9 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         main._dvr_capture_limiters.clear()
         main._live_dvr_clients.clear()
         main._live_capture_preferences.clear()
+        main._live_capture_preference_age.clear()
 
-    async def test_snapshot_uses_direct_main_stream_without_resolution_probe(self):
+    async def test_snapshot_asks_the_main_stream_for_a_full_size_picture(self):
         requested_urls = []
 
         class Response:
@@ -58,8 +59,81 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot, b"jpeg")
         self.assertEqual(
             requested_urls,
-            ["http://192.0.2.1:80/ISAPI/Streaming/channels/301/picture"],
+            [
+                "http://192.0.2.1:80/ISAPI/Streaming/channels/301/picture"
+                "?snapShotImageType=JPEG"
+                "&videoResolutionWidth=1920&videoResolutionHeight=1080"
+            ],
         )
+
+    async def test_snapshot_falls_back_to_the_default_size_picture(self):
+        requested_urls = []
+
+        class Response:
+            def __init__(self, status_code):
+                self.status_code = status_code
+                self.headers = {"content-type": "image/jpeg"}
+                self.content = b"jpeg"
+
+        class Client:
+            async def get(self, url, auth):
+                requested_urls.append(url)
+                # The DVR rejects the size parameters but serves its default.
+                return Response(400 if "videoResolutionWidth" in url else 200)
+
+        dvr = {
+            "ip": "192.0.2.30",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
+            requested_urls.clear()
+            # The working URL is remembered, so no repeat of the rejected one.
+            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
+
+        self.assertEqual(
+            requested_urls,
+            ["http://192.0.2.30:80/ISAPI/Streaming/channels/301/picture"],
+        )
+
+    async def test_sub_stream_fallback_is_retried_on_the_main_stream_later(self):
+        requested_urls = []
+
+        class Response:
+            def __init__(self, status_code):
+                self.status_code = status_code
+                self.headers = {"content-type": "image/jpeg"}
+                self.content = b"jpeg"
+
+        class Client:
+            main_stream_ok = False
+
+            async def get(self, url, auth):
+                requested_urls.append(url)
+                if "/302/picture" in url:
+                    return Response(200)
+                return Response(200 if Client.main_stream_ok else 401)
+
+        dvr = {
+            "ip": "192.0.2.31",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
+            self.assertIn("/302/picture", requested_urls[-1])
+
+            Client.main_stream_ok = True
+            main._live_capture_preference_age[("192.0.2.31", 3)] = (
+                main.time.monotonic() - main._LIVE_CAPTURE_FALLBACK_TTL_SECONDS - 1
+            )
+            requested_urls.clear()
+            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
+
+        self.assertIn("videoResolutionWidth=1920", requested_urls[0])
 
     async def test_digest_auth_is_reused_for_repeat_snapshots(self):
         auth_objects = []
