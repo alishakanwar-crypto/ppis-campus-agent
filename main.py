@@ -578,6 +578,16 @@ _rtsp_timeout_warning_logged = False
 _rtsp_timeout_warning_lock = threading.Lock()
 _live_dvr_clients: dict[str, httpx.AsyncClient] = {}
 _live_capture_preferences: dict[tuple[str, int], tuple[str, int]] = {}
+_live_capture_preference_age: dict[tuple[str, int], float] = {}
+# Hikvision returns a small default JPEG (704x480) unless the wanted size is
+# asked for, which parents see as a blurred classroom photo.
+_LIVE_SNAPSHOT_WIDTH = max(0, int(os.environ.get("SNAPSHOT_WIDTH", "1920")))
+_LIVE_SNAPSHOT_HEIGHT = max(0, int(os.environ.get("SNAPSHOT_HEIGHT", "1080")))
+# How long a fallback (smaller/sub-stream) capture stays preferred before the
+# full-size main stream is tried again.
+_LIVE_CAPTURE_FALLBACK_TTL_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_FALLBACK_TTL_SECONDS", "900"))
+)
 _live_dvr_client_lock = asyncio.Lock()
 _live_request_deadline: contextvars.ContextVar[float | None] = (
     contextvars.ContextVar("live_request_deadline", default=None)
@@ -809,14 +819,28 @@ async def _capture_snapshot_once(
     pwd = dvr["password"]
     stream_channel = channel * 100 + 1
     url = f"http://{ip}:{port}/ISAPI/Streaming/channels/{stream_channel}/picture"
+    full_size = url
+    if _LIVE_SNAPSHOT_WIDTH and _LIVE_SNAPSHOT_HEIGHT:
+        full_size = (
+            f"{url}?snapShotImageType=JPEG"
+            f"&videoResolutionWidth={_LIVE_SNAPSHOT_WIDTH}"
+            f"&videoResolutionHeight={_LIVE_SNAPSHOT_HEIGHT}"
+        )
     urls = [
+        full_size,
         url,
         f"http://{ip}:{port}/ISAPI/Streaming/channels/{channel * 100 + 2}/picture",
         f"http://{ip}:{port}/Streaming/channels/{stream_channel}/picture",
     ]
     digest_auth = _digest_auth(ip, user, pwd)
     candidates = []
-    remembered = _live_capture_preferences.get((ip, channel))
+    key = (ip, channel)
+    remembered = _live_capture_preferences.get(key)
+    if remembered is not None and remembered[1] != 0:
+        age = time.monotonic() - _live_capture_preference_age.get(key, 0.0)
+        if age > _LIVE_CAPTURE_FALLBACK_TTL_SECONDS:
+            _live_capture_preferences.pop(key, None)
+            remembered = None
     if remembered is not None:
         candidates.append(remembered)
     candidates.extend(
@@ -826,7 +850,7 @@ async def _capture_snapshot_once(
     )
     candidates = [
         candidate for candidate in candidates
-        if candidate[1] == 0 or candidate[0] == "digest"
+        if candidate[1] <= 1 or candidate[0] == "digest"
     ]
     seen: set[tuple[str, int]] = set()
     for scheme, variant in candidates:
@@ -843,7 +867,8 @@ async def _capture_snapshot_once(
             response.status_code == 200
             and response.headers.get("content-type", "").startswith("image")
         ):
-            _live_capture_preferences[(ip, channel)] = (scheme, variant)
+            _live_capture_preferences[key] = (scheme, variant)
+            _live_capture_preference_age[key] = time.monotonic()
             return response.content
     return None
 
