@@ -2390,6 +2390,38 @@ class AttendanceEngine:
         except Exception as e:
             logger.warning(f"Camera status report failed (non-fatal): {e}")
 
+    async def _report_engine_status_to_backend(self, phase: str, cycle: int,
+                                               classroom_cams: int):
+        """Publish the scanner's own counters so the cloud can see it working."""
+        try:
+            stats = self._classwise_stats
+            payload = {
+                "phase": phase,
+                "cycle_count": cycle,
+                "total_cameras": stats.get("total_cameras", 0),
+                "cameras_scanned": stats.get("cameras_scanned", 0),
+                "classroom_cameras": classroom_cams,
+                "faces_loaded": len(self.known_faces_insightface) or len(self.known_faces),
+                "grades_with_faces": len(self._grade_face_cache),
+                "faces_detected_total": stats.get("faces_detected_total", 0),
+                "attendance_marked_today": stats.get("attendance_marked_today", 0),
+                "errors": stats.get("errors", 0),
+                "recognizer": self._health.get("face_engine", ""),
+                "failsafe": self._failsafe_reason if self._failsafe_active else "",
+            }
+            api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
+            headers = {}
+            agent_secret = os.environ.get("AGENT_SECRET", "")
+            if agent_secret:
+                headers["X-Agent-Secret"] = agent_secret
+            async with httpx.AsyncClient(timeout=15) as client:
+                await client.post(
+                    f"{api_url}/api/dashboard/attendance/engine-status",
+                    json=payload, headers=headers,
+                )
+        except Exception as e:
+            logger.warning(f"Engine status report failed (non-fatal): {e}")
+
     def _get_dvr_client(self, dvr: dict) -> httpx.AsyncClient:
         """Get or create a persistent HTTP client for a DVR (connection pooling)."""
         ip = dvr["ip"]
@@ -3094,6 +3126,18 @@ class AttendanceEngine:
                 # Report camera status to backend every 10 cycles
                 if cycle % 10 == 0:
                     await self._report_camera_status_to_backend(cameras)
+
+                # Tell the cloud what the scanner is doing every 5 cycles.
+                # Without this a stalled scanner and an empty school look the
+                # same from outside: both simply report nobody present.
+                if cycle % 5 == 0:
+                    await self._report_engine_status_to_backend(
+                        phase=("teacher+student" if in_teacher_phase and in_student_phase
+                               else "teacher" if in_teacher_phase
+                               else "student" if in_student_phase else "idle"),
+                        cycle=cycle,
+                        classroom_cams=len(student_phase_cams_classroom),
+                    )
 
                 # Periodic memory cleanup every 10 cycles
                 if cycle % 10 == 0:
