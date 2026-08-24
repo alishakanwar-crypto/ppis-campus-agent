@@ -2823,6 +2823,11 @@ class AttendanceEngine:
                                            f"No scanning, no notifications.")
                     if cycle % 30 == 0:
                         self.cleanup_memory(aggressive=True)
+                    if cycle % 5 == 0:
+                        await self._report_engine_status_to_backend(
+                            phase="off_day", cycle=cycle,
+                            classroom_cams=len(student_phase_cams_classroom),
+                        )
                     await asyncio.sleep(60)
                     continue
                 if self._is_holiday_today():
@@ -2832,6 +2837,11 @@ class AttendanceEngine:
                                            "No scanning, no notifications.")
                     if cycle % 30 == 0:
                         self.cleanup_memory(aggressive=True)
+                    if cycle % 5 == 0:
+                        await self._report_engine_status_to_backend(
+                            phase="holiday", cycle=cycle,
+                            classroom_cams=len(student_phase_cams_classroom),
+                        )
                     await asyncio.sleep(60)
                     continue
 
@@ -2917,6 +2927,11 @@ class AttendanceEngine:
                     # Memory cleanup during idle — every 5 minutes (10 idle cycles)
                     if cycle % 10 == 0:
                         self.cleanup_memory(aggressive=True)
+                    if cycle % 5 == 0:
+                        await self._report_engine_status_to_backend(
+                            phase="idle", cycle=cycle,
+                            classroom_cams=len(student_phase_cams_classroom),
+                        )
                     await asyncio.sleep(30)
                     continue
 
@@ -3106,6 +3121,11 @@ class AttendanceEngine:
                                                  ).isoformat()})
                     except Exception:
                         pass
+                    if cycle % 5 == 0:
+                        await self._report_engine_status_to_backend(
+                            phase="failsafe", cycle=cycle,
+                            classroom_cams=len(student_phase_cams_classroom),
+                        )
                     await asyncio.sleep(60)
                     continue
 
@@ -3134,7 +3154,7 @@ class AttendanceEngine:
                     await self._report_engine_status_to_backend(
                         phase=("teacher+student" if in_teacher_phase and in_student_phase
                                else "teacher" if in_teacher_phase
-                               else "student" if in_student_phase else "idle"),
+                               else "student" if in_student_phase else "scanning"),
                         cycle=cycle,
                         classroom_cams=len(student_phase_cams_classroom),
                     )
