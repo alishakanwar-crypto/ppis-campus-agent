@@ -1136,8 +1136,8 @@ async def discover_dvr_channel_names() -> int:
     typed in again.
     """
     dvrs = config.get("dvrs", [])
-    discovered = 0
-    for dvr_index, dvr in enumerate(dvrs):
+
+    async def _read_one(dvr_index: int, dvr: dict) -> int:
         ip = dvr.get("ip")
         port = dvr.get("port", 80)
         url = f"http://{ip}:{port}/ISAPI/System/Video/inputs/channels"
@@ -1152,7 +1152,7 @@ async def discover_dvr_channel_names() -> int:
                     "Channel name discovery on %s returned HTTP %s",
                     ip, resp.status_code,
                 )
-                continue
+                return 0
             names: dict[str, int] = {}
             for block in re.findall(
                 r"<VideoInputChannel[^>]*>(.*?)</VideoInputChannel>",
@@ -1168,9 +1168,18 @@ async def discover_dvr_channel_names() -> int:
                     names[name] = int(id_match.group(1))
             if names:
                 _discovered_dvr_channels[dvr_index] = names
-                discovered += len(names)
+            return len(names)
         except Exception as exc:
             logger.warning("Channel name discovery failed for %s: %s", ip, exc)
+            return 0
+
+    # The recorders are read in parallel: one unreachable recorder would
+    # otherwise hold up the rest for its whole timeout.
+    counts = await asyncio.gather(
+        *(_read_one(i, dvr) for i, dvr in enumerate(dvrs)),
+        return_exceptions=True,
+    )
+    discovered = sum(c for c in counts if isinstance(c, int))
     logger.info(
         "Discovered %d camera channel name(s) across %d DVR(s)",
         discovered, len(_discovered_dvr_channels),
@@ -1968,14 +1977,20 @@ async def lifespan(app: FastAPI):
         f"Config loaded: {len(config.get('dvrs', []))} DVRs, "
         f"{len(config.get('camera_mapping', {}))} camera mappings"
     )
-    try:
-        await discover_dvr_channel_names()
-    except Exception as e:
-        logger.error(f"Channel name discovery failed (non-fatal): {e}")
     # Start WebSocket client FIRST — connects to backend immediately
     # so snapshot requests work even during face sync
     logger.info("Starting WebSocket client task...")
     _restart_websocket_task_if_needed()
+
+    # Read the DVRs' channel names in the background: an early snapshot request
+    # is served from the mapping and only gains the second angle once this ends.
+    async def _discover_channels_in_background():
+        try:
+            await discover_dvr_channel_names()
+        except Exception as e:
+            logger.error(f"Channel name discovery failed (non-fatal): {e}")
+
+    asyncio.create_task(_discover_channels_in_background())
 
     # Clean up known junk/duplicate face entries before syncing
     cleanup_junk_face_entries()
