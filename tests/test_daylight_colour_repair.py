@@ -52,11 +52,11 @@ class DaylightColourRepairTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         main._COLOUR_REPAIR_ATTEMPTED.clear()
 
-    def _client(self, put_status=200):
+    def _client(self, put_status=200, mode="night"):
         client = AsyncMock()
         client.get = AsyncMock(
             return_value=FakeResponse(
-                text="<IrcutFilter><IrcutFilterType>night</IrcutFilterType>"
+                text=f"<IrcutFilter><IrcutFilterType>{mode}</IrcutFilterType>"
                      "</IrcutFilter>"
             )
         )
@@ -66,8 +66,8 @@ class DaylightColourRepairTests(unittest.IsolatedAsyncioTestCase):
         return client
 
     async def _repair(self, snapshot, *, now=NOON_IST, put_status=200,
-                      recaptured=COLOUR):
-        client = self._client(put_status)
+                      recaptured=COLOUR, mode="night"):
+        client = self._client(put_status, mode)
         with patch.object(main.httpx, "AsyncClient", return_value=client), \
              patch.object(main, "capture_snapshot",
                           AsyncMock(return_value=recaptured)) as capture, \
@@ -109,6 +109,22 @@ class DaylightColourRepairTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_still_grey_camera_delivers_the_recapture(self):
         result, _, _ = await self._repair(GREY, recaptured=GREYSCALE_MODE)
         self.assertEqual(result, GREYSCALE_MODE)
+
+    async def test_a_camera_left_on_auto_is_reported_as_low_light(self):
+        with self.assertLogs(main.logger, level="WARNING") as logs:
+            await self._repair(GREY, recaptured=GREYSCALE_MODE, mode="auto")
+        self.assertTrue(
+            any("light level is too low" in line for line in logs.output),
+            logs.output,
+        )
+
+    async def test_a_stuck_filter_is_reported_as_a_camera_fault(self):
+        with self.assertLogs(main.logger, level="WARNING") as logs:
+            await self._repair(GREY, recaptured=GREYSCALE_MODE, mode="night")
+        self.assertTrue(
+            any("needs attention on the camera" in line for line in logs.output),
+            logs.output,
+        )
 
 
 if __name__ == "__main__":
