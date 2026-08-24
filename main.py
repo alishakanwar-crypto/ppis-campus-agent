@@ -1568,8 +1568,13 @@ def _image_has_no_colour(data: bytes) -> bool | None:
     return coloured <= len(pixels) * 0.02
 
 
-async def _restore_daylight_colour(dvr: dict, channel: int, desc: str) -> bool:
-    """Take a camera out of night mode so daytime pictures are in colour."""
+async def _restore_daylight_colour(
+    dvr: dict, channel: int, desc: str
+) -> tuple[bool, str]:
+    """Take a camera out of night mode so daytime pictures are in colour.
+
+    Returns (setting accepted, day/night mode the recorder reported).
+    """
     ip = dvr["ip"]
     url = (
         f"http://{ip}:{dvr.get('port', 80)}"
@@ -1582,6 +1587,7 @@ async def _restore_daylight_colour(dvr: dict, channel: int, desc: str) -> bool:
         "<nightToDayFilterLevel>4</nightToDayFilterLevel>"
         "</IrcutFilter>"
     )
+    reported = "unknown"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             current = await client.get(url, auth=auth)
@@ -1589,11 +1595,12 @@ async def _restore_daylight_colour(dvr: dict, channel: int, desc: str) -> bool:
                 mode = re.search(
                     r"<IrcutFilterType>(.*?)</IrcutFilterType>", current.text
                 )
+                if mode:
+                    reported = mode.group(1).strip().lower()
                 logger.warning(
                     "%s (ch%d on %s) returned a colourless daytime picture; "
                     "recorder reports day/night mode %s",
-                    desc, channel, ip,
-                    mode.group(1).strip() if mode else "unknown",
+                    desc, channel, ip, reported,
                 )
             else:
                 logger.warning(
@@ -1611,17 +1618,17 @@ async def _restore_daylight_colour(dvr: dict, channel: int, desc: str) -> bool:
         logger.warning(
             "Could not restore daylight colour on %s ch%d: %s", ip, channel, exc
         )
-        return False
+        return False, reported
     if resp.status_code == 200:
         logger.info(
             "Set %s (ch%d on %s) back to automatic day/night", desc, channel, ip
         )
-        return True
+        return True, reported
     logger.warning(
         "Recorder refused the day/night change for %s ch%d (HTTP %s): %s",
         desc, channel, resp.status_code, resp.text[:200],
     )
-    return False
+    return False, reported
 
 
 async def _repair_colour_if_night_mode(
@@ -1650,7 +1657,8 @@ async def _repair_colour_if_night_mode(
         # recapture: fix the camera in the background so the next photo is fine.
         asyncio.create_task(_restore_daylight_colour(dvr, channel, desc))
         return snapshot
-    if not await _restore_daylight_colour(dvr, channel, desc):
+    changed, reported_mode = await _restore_daylight_colour(dvr, channel, desc)
+    if not changed:
         return snapshot
     await asyncio.sleep(2.0)
     try:
@@ -1660,11 +1668,21 @@ async def _repair_colour_if_night_mode(
     if retry and _image_has_no_colour(retry) is not True:
         logger.info("Recaptured %s in colour after leaving night mode", desc)
         return retry
-    logger.warning(
-        "%s is still colourless after the day/night reset — its infrared filter "
-        "likely needs attention on the camera itself",
-        desc,
-    )
+    if reported_mode == "auto":
+        # The camera was already deciding for itself, so it chose infrared
+        # because the room was too dim — lights, not settings.
+        logger.warning(
+            "%s is on automatic day/night and still shooting infrared: the room "
+            "light level is too low for a colour picture",
+            desc,
+        )
+    else:
+        logger.warning(
+            "%s is still colourless after the day/night reset (recorder mode "
+            "%s) — its infrared filter likely needs attention on the camera "
+            "itself",
+            desc, reported_mode,
+        )
     return retry or snapshot
 
 
