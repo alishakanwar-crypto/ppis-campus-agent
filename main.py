@@ -867,8 +867,11 @@ async def _capture_snapshot_once(
             response.status_code == 200
             and response.headers.get("content-type", "").startswith("image")
         ):
+            if _live_capture_preferences.get(key) != (scheme, variant):
+                # Age the choice from when it was made, so a busy camera stuck
+                # on a fallback still retries the full-size stream.
+                _live_capture_preference_age[key] = time.monotonic()
             _live_capture_preferences[key] = (scheme, variant)
-            _live_capture_preference_age[key] = time.monotonic()
             return response.content
     return None
 
