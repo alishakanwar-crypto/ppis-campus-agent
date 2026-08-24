@@ -24,6 +24,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import subprocess
 import sys
 import time
@@ -1114,6 +1115,94 @@ async def test_dvr_connection(dvr: dict) -> dict:
         return {"status": "error", "ip": ip, "error": str(e)}
 
 
+# Channel names read from each DVR, so a classroom whose second camera was
+# never entered in the mapping is still captured: {dvr_index: {name: channel}}
+_discovered_dvr_channels: dict[int, dict[str, int]] = {}
+
+
+def _camera_name_base(description: str) -> str:
+    """'G8B C1' -> 'G8B'; the part identifying the room, not the angle."""
+    return re.sub(
+        r"\s*C\s*\d+\s*$", "", (description or "").strip(), flags=re.IGNORECASE
+    ).upper()
+
+
+async def discover_dvr_channel_names() -> int:
+    """Read every DVR's channel names so both cameras of a room are known.
+
+    Half the classrooms were mapped with only their C1 channel, so parents got
+    one angle of those rooms while the C2 camera sat unused on the recorder.
+    The names are already on the DVR ('G8B C2'), so they are read rather than
+    typed in again.
+    """
+    dvrs = config.get("dvrs", [])
+    discovered = 0
+    for dvr_index, dvr in enumerate(dvrs):
+        ip = dvr.get("ip")
+        port = dvr.get("port", 80)
+        url = f"http://{ip}:{port}/ISAPI/System/Video/inputs/channels"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    url,
+                    auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
+                )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Channel name discovery on %s returned HTTP %s",
+                    ip, resp.status_code,
+                )
+                continue
+            names: dict[str, int] = {}
+            for block in re.findall(
+                r"<VideoInputChannel[^>]*>(.*?)</VideoInputChannel>",
+                resp.text,
+                flags=re.DOTALL,
+            ):
+                id_match = re.search(r"<id>\s*(\d+)\s*</id>", block)
+                name_match = re.search(r"<name>(.*?)</name>", block, re.DOTALL)
+                if not id_match or not name_match:
+                    continue
+                name = name_match.group(1).strip().upper()
+                if name:
+                    names[name] = int(id_match.group(1))
+            if names:
+                _discovered_dvr_channels[dvr_index] = names
+                discovered += len(names)
+        except Exception as exc:
+            logger.warning("Channel name discovery failed for %s: %s", ip, exc)
+    logger.info(
+        "Discovered %d camera channel name(s) across %d DVR(s)",
+        discovered, len(_discovered_dvr_channels),
+    )
+    return discovered
+
+
+def _sibling_cameras_from_dvr(
+    resolved: list[tuple[dict, int, str]]
+) -> list[tuple[dict, int, str]]:
+    """Other angles of the same room, taken from the DVR's own channel names."""
+    dvrs = config.get("dvrs", [])
+    known_channels = {(dvr.get("ip"), channel) for dvr, channel, _ in resolved}
+    bases = {_camera_name_base(desc) for _, _, desc in resolved if desc}
+    bases.discard("")
+    if not bases:
+        return []
+    extra: list[tuple[dict, int, str]] = []
+    for dvr_index, names in _discovered_dvr_channels.items():
+        if not (0 <= dvr_index < len(dvrs)):
+            continue
+        dvr = dvrs[dvr_index]
+        for name, channel in names.items():
+            if _camera_name_base(name) not in bases:
+                continue
+            if (dvr.get("ip"), channel) in known_channels:
+                continue
+            known_channels.add((dvr.get("ip"), channel))
+            extra.append((dvr, channel, name))
+    return extra
+
+
 def find_camera_for_classroom(classroom: str) -> tuple[dict, int, str] | None:
     """Look up the DVR, channel number, and description for a given classroom (returns best/first camera)."""
     result = find_all_cameras_for_classroom(classroom)
@@ -1243,11 +1332,17 @@ def find_all_cameras_for_classroom(classroom: str) -> list[tuple[dict, int, str]
     all_vals = _find_all_vals(classroom_upper)
     if all_vals:
         all_results = []
+        seen: set[tuple[str, int]] = set()
         for val in all_vals:
             resolved = _resolve_entry(val)
-            if resolved:
-                all_results.extend(resolved)
+            for dvr, channel, desc in resolved or []:
+                key = (dvr.get("ip", ""), channel)
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_results.append((dvr, channel, desc))
         if all_results:
+            all_results.extend(_sibling_cameras_from_dvr(all_results))
             return all_results
 
     logger.warning(f"No camera mapping found for: {classroom!r}")
@@ -1873,6 +1968,10 @@ async def lifespan(app: FastAPI):
         f"Config loaded: {len(config.get('dvrs', []))} DVRs, "
         f"{len(config.get('camera_mapping', {}))} camera mappings"
     )
+    try:
+        await discover_dvr_channel_names()
+    except Exception as e:
+        logger.error(f"Channel name discovery failed (non-fatal): {e}")
     # Start WebSocket client FIRST — connects to backend immediately
     # so snapshot requests work even during face sync
     logger.info("Starting WebSocket client task...")
