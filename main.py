@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # Suppress Windows crash dialogs so the process exits silently on errors
@@ -1540,6 +1540,134 @@ async def websocket_client():
         ws_backoff = min(ws_backoff * 2, 60)
 
 
+_IST = timezone(timedelta(hours=5, minutes=30))
+_DAYLIGHT_HOURS_IST = (7, 18)
+_COLOUR_REPAIR_ATTEMPTED: dict[tuple[str, int], str] = {}
+
+
+def _image_has_no_colour(data: bytes) -> bool | None:
+    """True when a JPEG carries no colour, i.e. the camera is in night mode.
+
+    Returns None when the picture cannot be inspected.
+    """
+    if Image is None:
+        return None
+    try:
+        img = Image.open(io.BytesIO(data))
+        if img.mode in ("L", "1", "I", "F"):
+            return True
+        pixels = list(img.convert("RGB").resize((64, 36)).getdata())
+    except Exception as exc:
+        logger.debug("Colour check failed: %s", exc)
+        return None
+    if not pixels:
+        return None
+    coloured = sum(
+        1 for r, g, b in pixels if max(r, g, b) - min(r, g, b) > 24
+    )
+    return coloured <= len(pixels) * 0.02
+
+
+async def _restore_daylight_colour(dvr: dict, channel: int, desc: str) -> bool:
+    """Take a camera out of night mode so daytime pictures are in colour."""
+    ip = dvr["ip"]
+    url = (
+        f"http://{ip}:{dvr.get('port', 80)}"
+        f"/ISAPI/Image/channels/{channel}/ircutFilter"
+    )
+    auth = httpx.DigestAuth(dvr["username"], dvr["password"])
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<IrcutFilter><IrcutFilterType>auto</IrcutFilterType>"
+        "<nightToDayFilterLevel>4</nightToDayFilterLevel>"
+        "</IrcutFilter>"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            current = await client.get(url, auth=auth)
+            if current.status_code == 200:
+                mode = re.search(
+                    r"<IrcutFilterType>(.*?)</IrcutFilterType>", current.text
+                )
+                logger.warning(
+                    "%s (ch%d on %s) returned a colourless daytime picture; "
+                    "recorder reports day/night mode %s",
+                    desc, channel, ip,
+                    mode.group(1).strip() if mode else "unknown",
+                )
+            else:
+                logger.warning(
+                    "%s (ch%d on %s) returned a colourless daytime picture; "
+                    "day/night settings unreadable (HTTP %s)",
+                    desc, channel, ip, current.status_code,
+                )
+            resp = await client.put(
+                url,
+                content=body,
+                headers={"Content-Type": "application/xml"},
+                auth=auth,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Could not restore daylight colour on %s ch%d: %s", ip, channel, exc
+        )
+        return False
+    if resp.status_code == 200:
+        logger.info(
+            "Set %s (ch%d on %s) back to automatic day/night", desc, channel, ip
+        )
+        return True
+    logger.warning(
+        "Recorder refused the day/night change for %s ch%d (HTTP %s): %s",
+        desc, channel, resp.status_code, resp.text[:200],
+    )
+    return False
+
+
+async def _repair_colour_if_night_mode(
+    snapshot: bytes,
+    camera: tuple[dict, int, str],
+) -> bytes:
+    """Recapture in colour when a camera is stuck in night mode during the day.
+
+    Only ever tried once per camera per day, and only in daylight hours (IST).
+    """
+    dvr, channel, desc = camera
+    now = datetime.now(_IST)
+    if not _DAYLIGHT_HOURS_IST[0] <= now.hour < _DAYLIGHT_HOURS_IST[1]:
+        return snapshot
+    key = (dvr["ip"], channel)
+    today = now.strftime("%Y-%m-%d")
+    if _COLOUR_REPAIR_ATTEMPTED.get(key) == today:
+        return snapshot
+    if _image_has_no_colour(snapshot) is not True:
+        return snapshot
+
+    _COLOUR_REPAIR_ATTEMPTED[key] = today
+    deadline = _live_request_deadline.get()
+    if deadline is not None and deadline - time.monotonic() < 20.0:
+        # Not enough of the parent's request budget left to wait for a colour
+        # recapture: fix the camera in the background so the next photo is fine.
+        asyncio.create_task(_restore_daylight_colour(dvr, channel, desc))
+        return snapshot
+    if not await _restore_daylight_colour(dvr, channel, desc):
+        return snapshot
+    await asyncio.sleep(2.0)
+    try:
+        retry = await asyncio.wait_for(capture_snapshot(dvr, channel), timeout=15.0)
+    except asyncio.TimeoutError:
+        return snapshot
+    if retry and _image_has_no_colour(retry) is not True:
+        logger.info("Recaptured %s in colour after leaving night mode", desc)
+        return retry
+    logger.warning(
+        "%s is still colourless after the day/night reset — its infrared filter "
+        "likely needs attention on the camera itself",
+        desc,
+    )
+    return retry or snapshot
+
+
 async def _capture_classroom_camera(
     classroom: str,
     camera: tuple[dict, int, str],
@@ -1568,6 +1696,8 @@ async def _capture_classroom_camera(
             f"Failed to capture from DVR {dvr['ip']} channel {channel} ({desc})"
         )
         return None
+
+    snapshot = await _repair_colour_if_night_mode(snapshot, camera)
 
     ts = int(time.time() * 1000)
     cam_label = desc.split()[-1] if desc else f"ch{channel}"
