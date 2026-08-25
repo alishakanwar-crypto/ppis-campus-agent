@@ -620,6 +620,93 @@ def _clear_rtsp_failure(ip: str) -> None:
     _rtsp_cooldowns.pop(ip, None)
 
 
+# A recorder that refuses our credentials locks the account for a while after a
+# handful of rejected logins, so retrying keeps it locked and every classroom on
+# it stays dark. Back off instead and take the RTSP road.
+_ISAPI_AUTH_COOLDOWN_SECONDS = max(
+    60.0, float(os.environ.get("ISAPI_AUTH_COOLDOWN_SECONDS", "1200"))
+)
+_ISAPI_TIMEOUT_COOLDOWN_SECONDS = max(
+    10.0, float(os.environ.get("ISAPI_TIMEOUT_COOLDOWN_SECONDS", "120"))
+)
+_ISAPI_TIMEOUTS_BEFORE_BACKOFF = max(
+    1, int(os.environ.get("ISAPI_TIMEOUTS_BEFORE_BACKOFF", "3"))
+)
+_AUTH_REJECTIONS_BEFORE_GIVING_UP = max(
+    1, int(os.environ.get("ISAPI_AUTH_REJECTIONS_BEFORE_GIVING_UP", "2"))
+)
+# Time held back from the ISAPI attempts so the RTSP fallback still gets a turn.
+_RTSP_RESERVE_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_RTSP_RESERVE_SECONDS", "8"))
+)
+_isapi_cooldowns: dict[str, tuple[float, str]] = {}
+_isapi_consecutive_timeouts: dict[str, int] = {}
+
+
+class _DvrAuthRejected(Exception):
+    """The recorder refused our credentials, usually a login lockout."""
+
+
+def _isapi_cooldown(ip: str) -> str:
+    """Why ISAPI is being skipped for this recorder, '' when it is usable."""
+    entry = _isapi_cooldowns.get(ip)
+    if entry is None:
+        return ""
+    expires_at, reason = entry
+    if expires_at <= time.monotonic():
+        _isapi_cooldowns.pop(ip, None)
+        return ""
+    return reason
+
+
+def _mark_isapi_auth_rejected(ip: str) -> None:
+    _isapi_cooldowns[ip] = (
+        time.monotonic() + _ISAPI_AUTH_COOLDOWN_SECONDS,
+        "credentials refused",
+    )
+    _isapi_consecutive_timeouts.pop(ip, None)
+    logger.error(
+        "%s refused our login; pausing its ISAPI snapshots for %.0f minutes so "
+        "the recorder's lockout can clear, using RTSP meanwhile",
+        ip,
+        _ISAPI_AUTH_COOLDOWN_SECONDS / 60.0,
+    )
+
+
+def _mark_isapi_timeout(ip: str) -> None:
+    count = _isapi_consecutive_timeouts.get(ip, 0) + 1
+    _isapi_consecutive_timeouts[ip] = count
+    if count < _ISAPI_TIMEOUTS_BEFORE_BACKOFF or _isapi_cooldown(ip):
+        return
+    _isapi_cooldowns[ip] = (
+        time.monotonic() + _ISAPI_TIMEOUT_COOLDOWN_SECONDS,
+        "not answering",
+    )
+    logger.warning(
+        "%s failed %d captures in a row; going straight to RTSP for %.0fs",
+        ip, count, _ISAPI_TIMEOUT_COOLDOWN_SECONDS,
+    )
+
+
+def _clear_isapi_failures(ip: str) -> None:
+    _isapi_consecutive_timeouts.pop(ip, None)
+    if _isapi_cooldowns.pop(ip, None) is not None:
+        logger.info("%s is answering ISAPI again", ip)
+
+
+def dvr_snapshot_health() -> list[dict]:
+    """Recorders whose direct snapshot path is currently being avoided."""
+    return [
+        {
+            "ip": ip,
+            "reason": reason,
+            "seconds_remaining": round(max(0.0, expires_at - time.monotonic()), 1),
+        }
+        for ip, (expires_at, reason) in sorted(_isapi_cooldowns.items())
+        if expires_at > time.monotonic()
+    ]
+
+
 def _warn_rtsp_timeouts_unsupported() -> None:
     global _rtsp_timeout_warning_logged
     with _rtsp_timeout_warning_lock:
@@ -854,6 +941,9 @@ async def _capture_snapshot_once(
         if candidate[1] <= 1 or candidate[0] == "digest"
     ]
     seen: set[tuple[str, int]] = set()
+    auth_rejections = 0
+    other_replies = 0
+    last_rejection = 0
     for scheme, variant in candidates:
         if (scheme, variant) in seen:
             continue
@@ -864,6 +954,11 @@ async def _capture_snapshot_once(
             metrics["round_trips"] = (
                 metrics.get("round_trips", 0) + _response_round_trips(response)
             )
+        if response.status_code in (401, 403):
+            auth_rejections += 1
+            last_rejection = response.status_code
+            continue
+        other_replies += 1
         if (
             response.status_code == 200
             and response.headers.get("content-type", "").startswith("image")
@@ -874,6 +969,15 @@ async def _capture_snapshot_once(
                 _live_capture_preference_age[key] = time.monotonic()
             _live_capture_preferences[key] = (scheme, variant)
             return response.content
+    if (
+        not other_replies
+        and auth_rejections >= _AUTH_REJECTIONS_BEFORE_GIVING_UP
+    ):
+        # Every door was locked, so the credentials are wrong for this
+        # recorder; hammering it only deepens its login lockout.
+        raise _DvrAuthRejected(
+            f"{ip} rejected our credentials (HTTP {last_rejection})"
+        )
     return None
 
 
@@ -940,9 +1044,31 @@ async def capture_snapshot(
         client = await _get_live_dvr_client(dvr, timeout) if not background else None
         if background:
             client = httpx.AsyncClient(timeout=timeout)
+        # Keep part of the budget for the RTSP fallback, otherwise a recorder
+        # that never answers eats the whole request and the parent gets nothing.
+        isapi_deadline = capture_deadline
+        if not background:
+            isapi_deadline -= min(
+                _RTSP_RESERVE_SECONDS, max(0.0, camera_timeout * 0.5)
+            )
+        cooldown_reason = _isapi_cooldown(ip)
+        # While a recorder is on cooldown the RTSP road is the one worth taking,
+        # unless that has just failed too — then one direct try beats no picture.
+        skip_isapi = bool(cooldown_reason) and not _rtsp_cooldown_active(ip)
+        if cooldown_reason:
+            logger.info(
+                "%s ch%d: recorder is %s, %s",
+                ip, channel, cooldown_reason,
+                "using RTSP" if skip_isapi else "trying ISAPI once anyway",
+            )
+            _last_capture_error = f"{ip} ch{channel}: ISAPI paused ({cooldown_reason})"
+        if skip_isapi:
+            attempts = 0
+        else:
+            attempts = 1 if cooldown_reason else retries
         try:
-            for attempt in range(retries):
-                remaining = capture_deadline - time.monotonic()
+            for attempt in range(attempts):
+                remaining = isapi_deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 attempt_started = time.monotonic()
@@ -962,47 +1088,58 @@ async def capture_snapshot(
                         )
                         _last_capture_error = ""
                         metrics["outcome"] = "success"
+                        _clear_isapi_failures(ip)
                         return snapshot
                     _last_capture_error = f"{ip} ch{channel}: ISAPI capture failed"
-                    if attempt < retries - 1:
+                    if attempt < attempts - 1:
                         await asyncio.sleep(min(
                             _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
                             else _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
-                            max(0.0, capture_deadline - time.monotonic()),
+                            max(0.0, isapi_deadline - time.monotonic()),
                         ))
+                except _DvrAuthRejected as exc:
+                    metrics["attempt_elapsed"].append(
+                        round(time.monotonic() - attempt_started, 3)
+                    )
+                    metrics["exception"] = type(exc).__name__
+                    _last_capture_error = f"{ip} ch{channel}: {exc}"
+                    _mark_isapi_auth_rejected(ip)
+                    break
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
                     metrics["attempt_elapsed"].append(
                         round(time.monotonic() - attempt_started, 3)
                     )
                     metrics["exception"] = type(exc).__name__
+                    _mark_isapi_timeout(ip)
                     if not background and _live_client_should_evict(exc):
                         await _evict_live_dvr_client(ip, client)
                     _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
                     logger.warning(
                         "Snapshot attempt %d/%d failed from %s ch%d: %s",
-                        attempt + 1, retries, ip, channel, _exception_text(exc),
+                        attempt + 1, attempts, ip, channel, _exception_text(exc),
                     )
-                    if attempt < retries - 1:
+                    if attempt < attempts - 1:
                         await asyncio.sleep(min(
                             _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
                             else _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
-                            max(0.0, capture_deadline - time.monotonic()),
+                            max(0.0, isapi_deadline - time.monotonic()),
                         ))
                 except asyncio.TimeoutError as exc:
                     metrics["attempt_elapsed"].append(
                         round(time.monotonic() - attempt_started, 3)
                     )
                     metrics["exception"] = type(exc).__name__
+                    _mark_isapi_timeout(ip)
                     _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
                     logger.warning(
                         "Snapshot attempt %d/%d timed out from %s ch%d",
-                        attempt + 1, retries, ip, channel,
+                        attempt + 1, attempts, ip, channel,
                     )
-                    if attempt < retries - 1:
+                    if attempt < attempts - 1:
                         await asyncio.sleep(min(
                             _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
                             else _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
-                            max(0.0, capture_deadline - time.monotonic()),
+                            max(0.0, isapi_deadline - time.monotonic()),
                         ))
                 except Exception as exc:
                     metrics["attempt_elapsed"].append(
@@ -1018,16 +1155,20 @@ async def capture_snapshot(
                         channel,
                         _exception_text(exc),
                     )
-                    if attempt < retries - 1:
+                    if attempt < attempts - 1:
                         await asyncio.sleep(min(
                             _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
                             else _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
-                            max(0.0, capture_deadline - time.monotonic()),
+                            max(0.0, isapi_deadline - time.monotonic()),
                         ))
             remaining = capture_deadline - time.monotonic()
             if (
                 remaining > 0
-                and (not background or ip in _RTSP_FALLBACK_IPS)
+                and (
+                    not background
+                    or ip in _RTSP_FALLBACK_IPS
+                    or _isapi_cooldown(ip)
+                )
                 and not _rtsp_cooldown_active(ip)
             ):
                 logger.info("ISAPI exhausted for %s ch%d, trying RTSP fallback", ip, channel)
@@ -1412,6 +1553,7 @@ async def websocket_client():
                     "type": "agent_hello",
                     "dvr_count": len(config.get("dvrs", [])),
                     "camera_count": len(config.get("camera_mapping", {})),
+                    "dvr_health": dvr_snapshot_health(),
                 }))
 
                 async for message in ws:
@@ -1430,7 +1572,10 @@ async def websocket_client():
                             task.add_done_callback(_snapshot_task_done)
 
                         elif msg_type == "ping":
-                            await ws.send(json.dumps({"type": "pong"}))
+                            await ws.send(json.dumps({
+                                "type": "pong",
+                                "dvr_health": dvr_snapshot_health(),
+                            }))
 
                         elif msg_type == "test_connection":
                             dvr_idx = data.get("dvr_index", 0)
