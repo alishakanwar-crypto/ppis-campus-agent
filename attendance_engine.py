@@ -2452,15 +2452,31 @@ class AttendanceEngine:
             _RTSP_FALLBACK_IPS,
             _acquire_dvr_capture,
             _capture_snapshot_rtsp,
+            _clear_isapi_failures,
             _exception_text,
+            _isapi_cooldown,
+            _mark_isapi_auth_rejected,
+            _mark_isapi_timeout,
         )
 
         ip = dvr["ip"]
         port = dvr.get("port", 80)
         cam_key = f"{ip}:{channel}"
+        # A recorder that has locked us out must be left alone: the scanner
+        # touches every camera every cycle, so retrying here would keep
+        # refreshing the lockout and parents' snapshots would never recover.
+        on_cooldown = bool(_isapi_cooldown(ip))
         limiter = await _acquire_dvr_capture(ip, background=True)
         started = time.monotonic()
         try:
+            if on_cooldown:
+                try:
+                    return await asyncio.wait_for(
+                        _capture_snapshot_rtsp(dvr, channel),
+                        timeout=_SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS,
+                    )
+                except Exception:
+                    return None
             client = self._get_dvr_client(dvr)
             deadline = started + _SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS
             remaining = deadline - time.monotonic()
@@ -2489,6 +2505,7 @@ class AttendanceEngine:
             )
 
             attempts = min(max_retries, _SNAPSHOT_BACKGROUND_RETRIES)
+            isapi_failed = False
             for attempt in range(attempts):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -2501,10 +2518,15 @@ class AttendanceEngine:
                     if resp.status_code == 200 and resp.headers.get(
                             "content-type", "").startswith("image"):
                         self._camera_errors.pop(cam_key, None)
+                        _clear_isapi_failures(ip)
                         return resp.content
                     self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
+                    if resp.status_code in (401, 403):
+                        _mark_isapi_auth_rejected(ip)
+                        break
                 except Exception as exc:
                     self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
+                    isapi_failed = True
                     if attempt == attempts - 1:
                         self.add_debug_log(
                             "dvr_error",
@@ -2516,6 +2538,10 @@ class AttendanceEngine:
                         _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
                         max(0.0, deadline - time.monotonic()),
                     ))
+
+            # Once per scan of this camera, not once per retry.
+            if isapi_failed:
+                _mark_isapi_timeout(ip)
 
             remaining = deadline - time.monotonic()
             if ip in _RTSP_FALLBACK_IPS and remaining > 0:
