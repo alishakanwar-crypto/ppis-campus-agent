@@ -1062,6 +1062,7 @@ async def capture_snapshot(
                 "using RTSP" if skip_isapi else "trying ISAPI once anyway",
             )
             _last_capture_error = f"{ip} ch{channel}: ISAPI paused ({cooldown_reason})"
+        isapi_timed_out = False
         if skip_isapi:
             attempts = 0
         else:
@@ -1110,7 +1111,7 @@ async def capture_snapshot(
                         round(time.monotonic() - attempt_started, 3)
                     )
                     metrics["exception"] = type(exc).__name__
-                    _mark_isapi_timeout(ip)
+                    isapi_timed_out = True
                     if not background and _live_client_should_evict(exc):
                         await _evict_live_dvr_client(ip, client)
                     _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
@@ -1129,7 +1130,7 @@ async def capture_snapshot(
                         round(time.monotonic() - attempt_started, 3)
                     )
                     metrics["exception"] = type(exc).__name__
-                    _mark_isapi_timeout(ip)
+                    isapi_timed_out = True
                     _last_capture_error = f"{ip} ch{channel}: {_exception_text(exc)}"
                     logger.warning(
                         "Snapshot attempt %d/%d timed out from %s ch%d",
@@ -1161,6 +1162,11 @@ async def capture_snapshot(
                             else _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
                             max(0.0, isapi_deadline - time.monotonic()),
                         ))
+            # Once per request, not once per retry: three retries inside one
+            # slow request must not look like three failing requests.
+            if isapi_timed_out:
+                _mark_isapi_timeout(ip)
+
             remaining = capture_deadline - time.monotonic()
             if (
                 remaining > 0

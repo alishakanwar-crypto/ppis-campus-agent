@@ -2505,6 +2505,7 @@ class AttendanceEngine:
             )
 
             attempts = min(max_retries, _SNAPSHOT_BACKGROUND_RETRIES)
+            isapi_failed = False
             for attempt in range(attempts):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -2525,7 +2526,7 @@ class AttendanceEngine:
                         break
                 except Exception as exc:
                     self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
-                    _mark_isapi_timeout(ip)
+                    isapi_failed = True
                     if attempt == attempts - 1:
                         self.add_debug_log(
                             "dvr_error",
@@ -2537,6 +2538,10 @@ class AttendanceEngine:
                         _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS,
                         max(0.0, deadline - time.monotonic()),
                     ))
+
+            # Once per scan of this camera, not once per retry.
+            if isapi_failed:
+                _mark_isapi_timeout(ip)
 
             remaining = deadline - time.monotonic()
             if ip in _RTSP_FALLBACK_IPS and remaining > 0:

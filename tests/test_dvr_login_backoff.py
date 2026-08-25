@@ -117,6 +117,14 @@ class DvrLoginBackoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.requests, requests_before)
         self.assertEqual(main._isapi_cooldown("192.0.2.90"), "not answering")
 
+    async def test_one_slow_request_does_not_bypass_a_healthy_recorder(self):
+        client = TimingOutClient()
+        with patch.object(main, "_get_live_dvr_client", return_value=client), \
+                patch.object(main, "_capture_snapshot_rtsp", return_value=None):
+            await main.capture_snapshot(DVR, 8)
+
+        self.assertEqual(main._isapi_cooldown("192.0.2.90"), "")
+
     async def test_a_silent_recorder_leaves_time_for_the_rtsp_fallback(self):
         attempted = []
 
