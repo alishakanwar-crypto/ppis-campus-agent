@@ -1505,6 +1505,12 @@ def find_all_cameras_for_classroom(classroom: str) -> list[tuple[dict, int, str]
 
 ws_connection = None
 ws_task = None
+_ws_last_activity = 0.0
+_ws_disconnected_since = 0.0
+_ws_recycles = 0
+_WS_STALE_SECONDS = max(
+    60.0, float(os.environ.get("WS_STALE_SECONDS", "180"))
+)
 _snapshot_tasks: set[asyncio.Task] = set()
 _snapshot_request_semaphore = asyncio.Semaphore(
     max(1, int(os.environ.get("SNAPSHOT_CONCURRENT_REQUESTS", "2")))
@@ -1524,6 +1530,86 @@ def _snapshot_task_done(task: asyncio.Task) -> None:
             _exception_text(exc),
             exc_info=True,
         )
+
+
+def _note_ws_activity() -> None:
+    global _ws_last_activity, _ws_disconnected_since
+    _ws_last_activity = time.monotonic()
+    _ws_disconnected_since = 0.0
+
+
+def _ws_looks_connected() -> bool:
+    ws = ws_connection
+    return ws is not None and getattr(ws, "open", False)
+
+
+def ws_link_health() -> dict:
+    """What the agent believes about its link to the cloud."""
+    silent_for = (
+        round(time.monotonic() - _ws_last_activity, 1)
+        if _ws_last_activity
+        else None
+    )
+    return {
+        "connected": _ws_looks_connected(),
+        "silent_seconds": silent_for,
+        "recycles": _ws_recycles,
+    }
+
+
+async def _recycle_websocket(reason: str) -> None:
+    """Tear the cloud link down and build a fresh one.
+
+    The socket can look open to us long after the cloud has stopped seeing
+    us, and parents' requests then land nowhere. Rebuilding is cheap.
+    """
+    global ws_connection, ws_task, _ws_recycles
+    _ws_recycles += 1
+    logger.error("WATCHDOG: recycling the cloud link (%s)", reason)
+    task = ws_task
+    ws_connection = None
+    ws_task = None
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("Old cloud link ended with %s", _exception_text(exc))
+    ws_task = asyncio.create_task(websocket_client())
+    _note_ws_activity()
+
+
+async def _cloud_says_we_are_connected() -> bool | None:
+    """The cloud's own view of our link, None when we cannot ask."""
+    api_url = (
+        attendance_engine.whatsapp_api_url
+        or "https://ppis-whatsapp-bot.fly.dev"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(f"{api_url}/api/agent/health")
+            if response.status_code != 200:
+                return None
+            return bool(response.json().get("connected"))
+    except Exception:
+        return None
+
+
+async def _repair_cloud_link_if_needed() -> None:
+    """Force a reconnect when the cloud cannot see us any more."""
+    global _ws_disconnected_since
+    if not _ws_looks_connected():
+        if not _ws_disconnected_since:
+            _ws_disconnected_since = time.monotonic()
+        elif time.monotonic() - _ws_disconnected_since > _WS_STALE_SECONDS:
+            await _recycle_websocket("no cloud link for over 3 minutes")
+        return
+    if await _cloud_says_we_are_connected() is False:
+        # Our socket looks fine but the cloud has stopped seeing us, so the
+        # connection is half-open and every parent request is being lost.
+        await _recycle_websocket("cloud reports the agent as offline")
 
 
 async def websocket_client():
@@ -1546,6 +1632,7 @@ async def websocket_client():
             ) as ws:
                 ws_connection = ws
                 ws_backoff = 5  # Reset backoff on successful connect
+                _note_ws_activity()
                 logger.info("Connected to cloud bot WebSocket")
 
                 # Send hello
@@ -1557,6 +1644,7 @@ async def websocket_client():
                 }))
 
                 async for message in ws:
+                    _note_ws_activity()
                     try:
                         data = json.loads(message)
                         msg_type = data.get("type", "")
@@ -2070,7 +2158,8 @@ async def _health_watchdog():
     while True:
         await asyncio.sleep(60)
         try:
-            _restart_websocket_task_if_needed()
+            if not _restart_websocket_task_if_needed():
+                await _repair_cloud_link_if_needed()
 
             # --- Check 1: Classwise monitoring alive ---
             if attendance_engine._health.get("auto_start_enabled", True):
@@ -2375,6 +2464,7 @@ async def get_config():
         "cloud_bot_url": config.get("cloud_bot_url", ""),
         "config_source": "cloud" if config.get("_from_cloud") else "local",
         "ws_connected": ws_connection is not None and ws_connection.open if ws_connection else False,
+        "ws_link": ws_link_health(),
     }
 
 
