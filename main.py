@@ -637,6 +637,32 @@ _live_request_classroom: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
+_PROCESS_STARTED_AT = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+
+
+def _running_commit() -> str:
+    """Short git commit this process was started from, '' when unknown.
+
+    A restart that fails to kill the old process leaves it serving stale code,
+    which is indistinguishable from a bad fix unless the cloud can see this.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _process_started_at_ist() -> str:
+    return _PROCESS_STARTED_AT.strftime("%d-%m-%Y %H:%M:%S IST")
+
+
 def _exception_text(exc: BaseException) -> str:
     """Return a useful description even when str(exc) is empty."""
     detail = str(exc).strip()
@@ -1761,6 +1787,8 @@ async def websocket_client():
                     "dvr_count": len(config.get("dvrs", [])),
                     "camera_count": len(config.get("camera_mapping", {})),
                     "dvr_health": dvr_snapshot_health(),
+                    "code_commit": _running_commit(),
+                    "started_at_ist": _process_started_at_ist(),
                 }))
 
                 async for message in ws:

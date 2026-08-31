@@ -40,21 +40,24 @@ timeout /t 3 /nobreak >nul
 REM --- Step 2: Kill all Python processes (loop until none remain) ---
 REM py.exe / pythonw.exe must go too: a surviving launcher keeps the
 REM wrapper lock handles open, which makes later wrapper starts no-op.
+REM tasklist ANDs several /FI IMAGENAME filters, so the old check could never
+REM match and the kill was skipped: agents survived and kept running old code.
 echo [Step 2/5] Killing all Python processes...
 set "RETRIES=0"
 :kill_loop
-tasklist /FI "IMAGENAME eq python.exe" /FI "IMAGENAME eq py.exe" /FI "IMAGENAME eq pythonw.exe" 2>nul | findstr /I "python.exe py.exe pythonw.exe" >nul
-if !ERRORLEVEL! EQU 0 (
-    taskkill /F /IM python.exe >nul 2>&1
-    taskkill /F /IM py.exe >nul 2>&1
-    taskkill /F /IM pythonw.exe >nul 2>&1
+taskkill /F /IM python.exe >nul 2>&1
+taskkill /F /IM py.exe >nul 2>&1
+taskkill /F /IM pythonw.exe >nul 2>&1
+timeout /t 2 /nobreak >nul
+call :count_python
+if !PYCOUNT! GTR 0 (
     set /a RETRIES+=1
     if !RETRIES! GEQ 10 (
-        echo   WARNING: Could not kill all Python processes after 10 attempts.
-        echo   Please close Task Manager and try running as Administrator.
+        echo   WARNING: !PYCOUNT! Python process^(es^) survived 10 kill attempts.
+        echo   Run this script as Administrator - the agents are still on old code.
         goto start_agents
     )
-    timeout /t 2 /nobreak >nul
+    echo   !PYCOUNT! Python process^(es^) still alive, killing again...
     goto kill_loop
 )
 echo   All Python processes terminated.
@@ -114,20 +117,37 @@ tasklist /FI "IMAGENAME eq python.exe"
 echo.
 
 REM Count python processes
-set "COUNT=0"
-for /f %%a in ('tasklist /FI "IMAGENAME eq python.exe" ^| findstr /I "python.exe" ^| find /c /v ""') do set COUNT=%%a
+call :count_python
+set "COUNT=!PYCOUNT!"
 echo   Python processes running: !COUNT!
+REM A process older than this run is one the kill step missed: it is still
+REM executing the code from before the pull, so say so instead of "success".
+set "STALE=0"
+for /f %%a in ('powershell.exe -NoProfile -Command "@(Get-Process python,py,pythonw -ErrorAction SilentlyContinue ^| Where-Object { $_.StartTime -lt (Get-Date).AddMinutes(-3) }).Count"') do set STALE=%%a
+if !STALE! GTR 0 (
+    echo   [WARNING] !STALE! process^(es^) survived the restart and still run the OLD code.
+    powershell.exe -NoProfile -Command "Get-Process python,py,pythonw -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -lt (Get-Date).AddMinutes(-3) } | ForEach-Object { Write-Host ('    stale PID ' + $_.Id + ' started ' + $_.StartTime) }"
+    echo   Re-run this script as Administrator.
+    goto verified
+)
 if !COUNT! EQU 3 (
     echo   [OK] All 3 agents started successfully!
 ) else (
     echo   [WARNING] Expected 3 processes but found !COUNT!.
     echo   Check Task Manager for details.
 )
+:verified
 echo.
 echo ========================================================
 echo   Done! You can close this window now.
 echo ========================================================
 pause
+exit /b 0
+
+REM --- Count every Python process, including launcher-hosted ones ---
+:count_python
+set "PYCOUNT=0"
+for /f %%a in ('powershell.exe -NoProfile -Command "@(Get-Process python,py,pythonw -ErrorAction SilentlyContinue).Count"') do set PYCOUNT=%%a
 exit /b 0
 
 REM --- Retry the TrueFace poller once, visibly, if it did not come up ---
