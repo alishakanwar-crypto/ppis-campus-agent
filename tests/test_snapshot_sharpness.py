@@ -1,3 +1,4 @@
+import asyncio
 import io
 import os
 import unittest
@@ -89,6 +90,61 @@ class SnapshotSharpnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("look soft" in line for line in logs.output), logs.output
         )
+
+    async def test_a_probe_that_hangs_does_not_lose_the_picture_in_hand(self):
+        """A slow second door must not cost the parent the soft picture we have."""
+        requested: list[str] = []
+        soft = jpeg(1280, 720)
+
+        class Response:
+            status_code = 200
+            headers = {"content-type": "image/jpeg"}
+            content = soft
+
+        class Client:
+            async def get(_self, url, auth):
+                requested.append(url)
+                if len(requested) > 1:
+                    await asyncio.sleep(30)
+                return Response()
+
+        dvr = {
+            "ip": "192.0.2.52",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(main, "_LIVE_CAPTURE_PROBE_BUDGET_SECONDS", 0.2), \
+                patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            self.assertEqual(await main.capture_snapshot(dvr, 3), soft)
+
+    async def test_probing_stops_once_the_budget_is_spent(self):
+        """A recorder that answers slowly is not probed a second time."""
+        requested: list[str] = []
+        soft = jpeg(1280, 720)
+
+        class Response:
+            status_code = 200
+            headers = {"content-type": "image/jpeg"}
+            content = soft
+
+        class Client:
+            async def get(_self, url, auth):
+                requested.append(url)
+                await asyncio.sleep(0.3)
+                return Response()
+
+        dvr = {
+            "ip": "192.0.2.53",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(main, "_LIVE_CAPTURE_PROBE_BUDGET_SECONDS", 0.2), \
+                patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            self.assertEqual(await main.capture_snapshot(dvr, 3), soft)
+
+        self.assertEqual(len(requested), 1)
 
     async def test_a_parents_picture_is_not_squeezed_to_a_thumbnail(self):
         picture = jpeg(1920, 1080, quality=95)

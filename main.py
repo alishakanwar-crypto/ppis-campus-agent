@@ -615,6 +615,11 @@ _LIVE_CAPTURE_FALLBACK_TTL_SECONDS = max(
 _LIVE_CAPTURE_PROBE_PICTURES = max(
     1, int(os.environ.get("SNAPSHOT_PROBE_PICTURES", "3"))
 )
+# Time the extra sharpness probes may take. A picture in hand always beats a
+# sharper one the parent never receives.
+_LIVE_CAPTURE_PROBE_BUDGET_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_PROBE_BUDGET_SECONDS", "2"))
+)
 # A parent's photo is worth the bytes: WhatsApp accepts images up to 5 MB, so
 # only squeeze quality when the picture is far bigger than that.
 _LIVE_SNAPSHOT_MAX_BYTES = max(
@@ -997,6 +1002,7 @@ async def _capture_snapshot_once(
     best: tuple[str, int, bytes, int] | None = None
     pictures = 0
     sized_variants: set[int] = set()
+    started = time.monotonic()
 
     def keep(scheme: str, variant: int, picture: bytes, pixels: int) -> bytes:
         if _live_capture_preferences.get(key) != (scheme, variant):
@@ -1024,7 +1030,21 @@ async def _capture_snapshot_once(
             continue
         seen.add((scheme, variant))
         auth = digest_auth if scheme == "digest" else httpx.BasicAuth(user, pwd)
-        response = await client.get(urls[variant], auth=auth)
+        if best is not None:
+            # Probing for something sharper must never cost the picture we have.
+            try:
+                response = await asyncio.wait_for(
+                    client.get(urls[variant], auth=auth),
+                    timeout=max(
+                        0.1,
+                        _LIVE_CAPTURE_PROBE_BUDGET_SECONDS
+                        - (time.monotonic() - started),
+                    ),
+                )
+            except (asyncio.TimeoutError, httpx.HTTPError):
+                return keep(*best)
+        else:
+            response = await client.get(urls[variant], auth=auth)
         if metrics is not None:
             metrics["round_trips"] = (
                 metrics.get("round_trips", 0) + _response_round_trips(response)
@@ -1048,6 +1068,7 @@ async def _capture_snapshot_once(
                 or pixels >= wanted_pixels
                 or (known_best and pixels >= known_best)
                 or pictures >= _LIVE_CAPTURE_PROBE_PICTURES
+                or time.monotonic() - started >= _LIVE_CAPTURE_PROBE_BUDGET_SECONDS
             ):
                 # As sharp as this channel is known to get, so take it.
                 return keep(*best)
