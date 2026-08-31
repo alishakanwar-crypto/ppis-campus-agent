@@ -2472,7 +2472,7 @@ class AttendanceEngine:
             if on_cooldown:
                 try:
                     return await asyncio.wait_for(
-                        _capture_snapshot_rtsp(dvr, channel),
+                        _capture_snapshot_rtsp(dvr, channel, background=True),
                         timeout=_SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS,
                     )
                 except Exception:
@@ -2547,7 +2547,8 @@ class AttendanceEngine:
             if ip in _RTSP_FALLBACK_IPS and remaining > 0:
                 try:
                     return await asyncio.wait_for(
-                        _capture_snapshot_rtsp(dvr, channel), timeout=remaining
+                        _capture_snapshot_rtsp(dvr, channel, background=True),
+                        timeout=remaining,
                     )
                 except asyncio.TimeoutError:
                     pass
