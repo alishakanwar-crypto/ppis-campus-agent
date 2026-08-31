@@ -415,6 +415,23 @@ config = load_config_local()
 # Hikvision ISAPI — Snapshot capture
 # ---------------------------------------------------------------------------
 
+def _jpeg_size(data: bytes) -> tuple[int, int]:
+    """Pixel size of a JPEG, or (0, 0) when it cannot be read."""
+    if Image is None:
+        return 0, 0
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            return img.width, img.height
+    except Exception:
+        return 0, 0
+
+
+def _jpeg_pixels(data: bytes) -> int:
+    """Pixel count of a JPEG, or 0 when it cannot be read."""
+    width, height = _jpeg_size(data)
+    return width * height
+
+
 def compress_jpeg(data: bytes, max_bytes: int = 200_000, quality_start: int = 70) -> bytes:
     """Compress a JPEG image to fit within max_bytes.
     
@@ -580,6 +597,10 @@ _rtsp_timeout_warning_lock = threading.Lock()
 _live_dvr_clients: dict[str, httpx.AsyncClient] = {}
 _live_capture_preferences: dict[tuple[str, int], tuple[str, int]] = {}
 _live_capture_preference_age: dict[tuple[str, int], float] = {}
+# Largest picture a channel has ever handed us, so a camera that simply cannot
+# do 1080p is not re-probed on every parent request.
+_live_capture_best_pixels: dict[tuple[str, int], int] = {}
+_live_capture_size_logged: set[tuple[str, int]] = set()
 # Hikvision returns a small default JPEG (704x480) unless the wanted size is
 # asked for, which parents see as a blurred classroom photo.
 _LIVE_SNAPSHOT_WIDTH = max(0, int(os.environ.get("SNAPSHOT_WIDTH", "1920")))
@@ -588,6 +609,19 @@ _LIVE_SNAPSHOT_HEIGHT = max(0, int(os.environ.get("SNAPSHOT_HEIGHT", "1080")))
 # full-size main stream is tried again.
 _LIVE_CAPTURE_FALLBACK_TTL_SECONDS = max(
     0.0, float(os.environ.get("SNAPSHOT_FALLBACK_TTL_SECONDS", "900"))
+)
+# How many differently-shaped pictures to collect from a channel we have never
+# measured before settling on its sharpest one.
+_LIVE_CAPTURE_PROBE_PICTURES = max(
+    1, int(os.environ.get("SNAPSHOT_PROBE_PICTURES", "3"))
+)
+# A parent's photo is worth the bytes: WhatsApp accepts images up to 5 MB, so
+# only squeeze quality when the picture is far bigger than that.
+_LIVE_SNAPSHOT_MAX_BYTES = max(
+    100_000, int(os.environ.get("SNAPSHOT_MAX_BYTES", "1500000"))
+)
+_LIVE_SNAPSHOT_JPEG_QUALITY = min(
+    95, max(40, int(os.environ.get("SNAPSHOT_JPEG_QUALITY", "92")))
 )
 _live_dvr_client_lock = asyncio.Lock()
 _live_request_deadline: contextvars.ContextVar[float | None] = (
@@ -941,6 +975,7 @@ async def _capture_snapshot_once(
         age = time.monotonic() - _live_capture_preference_age.get(key, 0.0)
         if age > _LIVE_CAPTURE_FALLBACK_TTL_SECONDS:
             _live_capture_preferences.pop(key, None)
+            _live_capture_best_pixels.pop(key, None)
             remembered = None
     if remembered is not None:
         candidates.append(remembered)
@@ -957,8 +992,35 @@ async def _capture_snapshot_once(
     auth_rejections = 0
     other_replies = 0
     last_rejection = 0
+    wanted_pixels = _LIVE_SNAPSHOT_WIDTH * _LIVE_SNAPSHOT_HEIGHT
+    known_best = _live_capture_best_pixels.get(key, 0)
+    best: tuple[str, int, bytes, int] | None = None
+    pictures = 0
+    sized_variants: set[int] = set()
+
+    def keep(scheme: str, variant: int, picture: bytes, pixels: int) -> bytes:
+        if _live_capture_preferences.get(key) != (scheme, variant):
+            # Age the choice from when it was made, so a busy camera stuck
+            # on a fallback still retries the full-size stream.
+            _live_capture_preference_age[key] = time.monotonic()
+        _live_capture_preferences[key] = (scheme, variant)
+        _live_capture_best_pixels[key] = max(known_best, pixels)
+        if (
+            pixels
+            and wanted_pixels
+            and pixels < wanted_pixels
+            and key not in _live_capture_size_logged
+        ):
+            _live_capture_size_logged.add(key)
+            logger.warning(
+                "%s ch%d only serves %d pixels, less than the %d asked for: "
+                "the parent's photo will look soft",
+                ip, channel, pixels, wanted_pixels,
+            )
+        return picture
+
     for scheme, variant in candidates:
-        if (scheme, variant) in seen:
+        if (scheme, variant) in seen or variant in sized_variants:
             continue
         seen.add((scheme, variant))
         auth = digest_auth if scheme == "digest" else httpx.BasicAuth(user, pwd)
@@ -976,12 +1038,24 @@ async def _capture_snapshot_once(
             response.status_code == 200
             and response.headers.get("content-type", "").startswith("image")
         ):
-            if _live_capture_preferences.get(key) != (scheme, variant):
-                # Age the choice from when it was made, so a busy camera stuck
-                # on a fallback still retries the full-size stream.
-                _live_capture_preference_age[key] = time.monotonic()
-            _live_capture_preferences[key] = (scheme, variant)
-            return response.content
+            pixels = _jpeg_pixels(response.content)
+            sized_variants.add(variant)
+            if best is None or pixels > best[3]:
+                best = (scheme, variant, response.content, pixels)
+            pictures += 1
+            if (
+                not pixels
+                or pixels >= wanted_pixels
+                or (known_best and pixels >= known_best)
+                or pictures >= _LIVE_CAPTURE_PROBE_PICTURES
+            ):
+                # As sharp as this channel is known to get, so take it.
+                return keep(*best)
+            # Undersized on a channel we have never sized up: the sub-stream may
+            # have answered where the main stream should have, so try one more
+            # door before settling for a soft picture.
+    if best is not None:
+        return keep(*best)
     if (
         not other_replies
         and auth_rejections >= _AUTH_REJECTIONS_BEFORE_GIVING_UP
@@ -2042,8 +2116,13 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
             continue
 
         raw_data, filename, desc = result
-        compressed = compress_jpeg(raw_data)
+        compressed = compress_jpeg(
+            raw_data,
+            max_bytes=_LIVE_SNAPSHOT_MAX_BYTES,
+            quality_start=_LIVE_SNAPSHOT_JPEG_QUALITY,
+        )
         b64 = base64.b64encode(compressed).decode("ascii")
+        width, height = _jpeg_size(compressed)
         await ws.send(json.dumps({
             "type": "snapshot_image",
             "request_id": request_id,
@@ -2053,15 +2132,19 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
             "filename": filename,
             "image_base64": b64,
             "size_bytes": len(compressed),
+            "width": width,
+            "height": height,
             "description": desc,
         }))
         sent_count += 1
         logger.info(
-            "Sent image %d/%d: %s (%d bytes) - %s in %.2fs",
+            "Sent image %d/%d: %s (%d bytes, %dx%d) - %s in %.2fs",
             sent_count,
             expected_total,
             filename,
             len(compressed),
+            width,
+            height,
             desc,
             time.monotonic() - request_started,
         )

@@ -628,7 +628,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             main, "find_all_cameras_for_classroom", return_value=cameras
         ), patch.object(main, "capture_snapshot", side_effect=capture), patch.object(
             main, "SNAPSHOT_DIR", Path(directory)
-        ), patch.object(main, "compress_jpeg", side_effect=lambda data: data):
+        ), patch.object(main, "compress_jpeg", side_effect=lambda data, **_: data):
             started = asyncio.get_running_loop().time()
             await main._handle_snapshot_request(websocket, "TEST", "request-1")
 
@@ -809,7 +809,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             main, "find_all_cameras_for_classroom", return_value=cameras
         ), patch.object(main, "capture_snapshot", side_effect=capture), patch.object(
             main, "SNAPSHOT_DIR", Path(directory)
-        ), patch.object(main, "compress_jpeg", side_effect=lambda data: data):
+        ), patch.object(main, "compress_jpeg", side_effect=lambda data, **_: data):
             await main._handle_snapshot_request(websocket, "TEST", "request-1")
 
         self.assertEqual(max_active_captures, 2)
@@ -839,7 +839,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             main, "find_all_cameras_for_classroom", return_value=cameras
         ), patch.object(main, "capture_snapshot", side_effect=capture), patch.object(
             main, "SNAPSHOT_DIR", Path(directory)
-        ), patch.object(main, "compress_jpeg", side_effect=lambda data: data):
+        ), patch.object(main, "compress_jpeg", side_effect=lambda data, **_: data):
             request_task = asyncio.create_task(
                 main._handle_snapshot_request(websocket, "TEST", "request-1")
             )
@@ -875,7 +875,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             main, "find_all_cameras_for_classroom", return_value=cameras
         ), patch.object(main, "capture_snapshot", side_effect=capture), patch.object(
             main, "SNAPSHOT_DIR", Path(directory)
-        ), patch.object(main, "compress_jpeg", side_effect=lambda data: data):
+        ), patch.object(main, "compress_jpeg", side_effect=lambda data, **_: data):
             await asyncio.gather(
                 main.handle_snapshot_request(first_websocket, "TEST A", "request-1"),
                 main.handle_snapshot_request(second_websocket, "TEST B", "request-2"),
@@ -901,7 +901,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             main, "find_all_cameras_for_classroom", return_value=cameras
         ), patch.object(main, "capture_snapshot", side_effect=capture), patch.object(
             main, "SNAPSHOT_DIR", Path(directory)
-        ), patch.object(main, "compress_jpeg", side_effect=lambda data: data), patch.object(
+        ), patch.object(main, "compress_jpeg", side_effect=lambda data, **_: data), patch.object(
             main, "_SNAPSHOT_CAMERA_TIMEOUT_SECONDS", 0.01
         ):
             await main._handle_snapshot_request(websocket, "TEST", "request-1")
