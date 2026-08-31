@@ -26,6 +26,20 @@ class RestartKillsOldProcessesTests(unittest.TestCase):
         self.assertIn(":count_python", script)
         self.assertIn("Get-Process python,py,pythonw", script)
 
+    def test_success_is_judged_per_agent_not_by_a_process_count(self):
+        """An agent may spawn helper processes, so a total of 5 python
+        processes is not a failure — a missing agent is."""
+        script = _read("restart_all.bat")
+        self.assertNotIn("Expected 3 processes but found", script)
+        self.assertIn("'main.py','trueface_poller','gate_counter'", script)
+        self.assertIn("[WARNING] Not running:", script)
+
+    def test_verification_names_each_process(self):
+        script = _read("restart_all.bat")
+        self.assertNotIn('tasklist /FI "IMAGENAME eq python.exe"\n', script)
+        for label in ("Campus Agent", "TrueFace Poller", "Gate Counter"):
+            self.assertIn(f"$agent = '{label}'", script)
+
     def test_a_surviving_process_is_not_reported_as_success(self):
         script = _read("restart_all.bat")
         stale = script.index("still run the OLD code")

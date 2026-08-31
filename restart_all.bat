@@ -113,10 +113,12 @@ echo.
 echo ========================================================
 echo   Verifying running processes:
 echo ========================================================
-tasklist /FI "IMAGENAME eq python.exe"
+REM Name what is running: a python process can be a worker a real agent
+REM spawned, so a bare count cannot tell "all three are up" from "one is
+REM missing and something else is running twice".
+powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe' or Name='pythonw.exe' or Name='py.exe'\" -ErrorAction SilentlyContinue | ForEach-Object { $agent = 'other'; if ($_.CommandLine -match 'trueface_poller') { $agent = 'TrueFace Poller' } elseif ($_.CommandLine -match 'gate_counter') { $agent = 'Gate Counter' } elseif ($_.CommandLine -match 'main.py') { $agent = 'Campus Agent' }; Write-Host ('    PID ' + $_.ProcessId + '  started ' + [Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate).ToString('HH:mm:ss') + '  ' + $agent) }"
 echo.
 
-REM Count python processes
 call :count_python
 set "COUNT=!PYCOUNT!"
 echo   Python processes running: !COUNT!
@@ -130,11 +132,15 @@ if !STALE! GTR 0 (
     echo   Re-run this script as Administrator.
     goto verified
 )
-if !COUNT! EQU 3 (
+REM Judge by which agents are running, not by the total: an agent is free to
+REM spawn helper processes of its own.
+set "MISSING="
+for /f %%a in ('powershell.exe -NoProfile -Command "$c = (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue ^| Select-Object -ExpandProperty CommandLine) -join ' '; @('main.py','trueface_poller','gate_counter') ^| Where-Object { $c -notmatch $_ }"') do set "MISSING=!MISSING! %%a"
+if "!MISSING!"=="" (
     echo   [OK] All 3 agents started successfully!
 ) else (
-    echo   [WARNING] Expected 3 processes but found !COUNT!.
-    echo   Check Task Manager for details.
+    echo   [WARNING] Not running:!MISSING!
+    echo   Check the logs for the missing agent.
 )
 :verified
 echo.
