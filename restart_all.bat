@@ -135,7 +135,10 @@ if !STALE! GTR 0 (
 REM Judge by which agents are running, not by the total: an agent is free to
 REM spawn helper processes of its own.
 set "MISSING="
-for /f %%a in ('powershell.exe -NoProfile -Command "$c = (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue ^| Select-Object -ExpandProperty CommandLine) -join ' '; @('main.py','trueface_poller','gate_counter') ^| Where-Object { $c -notmatch $_ }"') do set "MISSING=!MISSING! %%a"
+REM Only python processes count: every other process list includes this very
+REM command line, whose own text names all three agents, so an unfiltered
+REM search always "finds" them and can never report a missing agent.
+for /f %%a in ('powershell.exe -NoProfile -Command "$c = (Get-CimInstance Win32_Process -Filter \"Name='python.exe' or Name='pythonw.exe' or Name='py.exe'\" -ErrorAction SilentlyContinue ^| Select-Object -ExpandProperty CommandLine) -join ' '; @('main.py','trueface_poller','gate_counter') ^| Where-Object { $c -notmatch $_ }"') do set "MISSING=!MISSING! %%a"
 if "!MISSING!"=="" (
     echo   [OK] All 3 agents started successfully!
 ) else (
