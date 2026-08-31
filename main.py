@@ -783,10 +783,19 @@ def _capture_frame_rtsp(ip: str, port: int, user: str, pwd: str,
             cap.release()
 
 
-async def _capture_snapshot_rtsp(dvr: dict, channel: int) -> bytes | None:
-    """Async wrapper around synchronous RTSP capture."""
+async def _capture_snapshot_rtsp(
+    dvr: dict, channel: int, background: bool = False
+) -> bytes | None:
+    """Async wrapper around synchronous RTSP capture.
+
+    Classroom scanning gets its own slots so a parent waiting for a live photo
+    never queues behind the scanner's sweep of every camera.
+    """
     loop = asyncio.get_running_loop()
-    await _rtsp_capture_semaphore.acquire()
+    semaphore = (
+        _rtsp_background_semaphore if background else _rtsp_capture_semaphore
+    )
+    await semaphore.acquire()
     try:
         future = _rtsp_capture_executor.submit(
             _capture_frame_rtsp,
@@ -797,12 +806,12 @@ async def _capture_snapshot_rtsp(dvr: dict, channel: int) -> bytes | None:
             channel,
         )
     except Exception:
-        _rtsp_capture_semaphore.release()
+        semaphore.release()
         raise
 
     def release_slot(_future: concurrent.futures.Future) -> None:
         if not loop.is_closed():
-            loop.call_soon_threadsafe(_rtsp_capture_semaphore.release)
+            loop.call_soon_threadsafe(semaphore.release)
 
     future.add_done_callback(release_slot)
     return await asyncio.wrap_future(future)
@@ -835,16 +844,20 @@ _SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS = max(
     0.0, float(os.environ.get("SNAPSHOT_BACKGROUND_RETRY_BACKOFF_SECONDS", "0.1"))
 )
 _RTSP_CAPTURE_CONCURRENCY = max(
-    1, int(os.environ.get("RTSP_CAPTURE_CONCURRENCY", "2"))
+    1, int(os.environ.get("RTSP_CAPTURE_CONCURRENCY", "4"))
+)
+_RTSP_BACKGROUND_CONCURRENCY = max(
+    1, int(os.environ.get("RTSP_BACKGROUND_CONCURRENCY", "2"))
 )
 _RTSP_CAPTURE_TIMEOUT_MILLISECONDS = max(
     1000, int(os.environ.get("RTSP_CAPTURE_TIMEOUT_MILLISECONDS", "3000"))
 )
 _rtsp_capture_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=_RTSP_CAPTURE_CONCURRENCY,
+    max_workers=_RTSP_CAPTURE_CONCURRENCY + _RTSP_BACKGROUND_CONCURRENCY,
     thread_name_prefix="ppis-rtsp",
 )
 _rtsp_capture_semaphore = asyncio.Semaphore(_RTSP_CAPTURE_CONCURRENCY)
+_rtsp_background_semaphore = asyncio.Semaphore(_RTSP_BACKGROUND_CONCURRENCY)
 _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS = max(
     1.0, float(os.environ.get("SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS", "50"))
 )
@@ -1180,7 +1193,10 @@ async def capture_snapshot(
                 logger.info("ISAPI exhausted for %s ch%d, trying RTSP fallback", ip, channel)
                 try:
                     rtsp_frame = await asyncio.wait_for(
-                        _capture_snapshot_rtsp(dvr, channel), timeout=remaining
+                        _capture_snapshot_rtsp(
+                            dvr, channel, background=background
+                        ),
+                        timeout=remaining,
                     )
                     if rtsp_frame:
                         metrics["rtsp"] = True
@@ -1518,8 +1534,11 @@ _WS_STALE_SECONDS = max(
     60.0, float(os.environ.get("WS_STALE_SECONDS", "180"))
 )
 _snapshot_tasks: set[asyncio.Task] = set()
+# One family's classroom must not sit in a queue behind another family's:
+# each recorder already has its own concurrency limiter, so several parent
+# requests can be served at once without hammering any one DVR.
 _snapshot_request_semaphore = asyncio.Semaphore(
-    max(1, int(os.environ.get("SNAPSHOT_CONCURRENT_REQUESTS", "2")))
+    max(1, int(os.environ.get("SNAPSHOT_CONCURRENT_REQUESTS", "6")))
 )
 _SNAPSHOT_CAMERA_TIMEOUT_SECONDS = max(
     1.0, float(os.environ.get("SNAPSHOT_CAMERA_TIMEOUT_SECONDS", "40"))
@@ -1977,7 +1996,15 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
       2. snapshot_complete (final message with total count)
     Falls back to legacy single-message format if only 1 image captured.
     """
+    queued_at = time.monotonic()
     async with _snapshot_request_semaphore:
+        waited = time.monotonic() - queued_at
+        if waited >= 1.0:
+            logger.warning(
+                "Snapshot for %s waited %.1fs for a free capture slot",
+                classroom,
+                waited,
+            )
         await _handle_snapshot_request(ws, classroom, request_id)
 
 

@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -330,7 +331,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             snapshot = await main.capture_snapshot(dvr, 3)
 
         self.assertEqual(snapshot, b"rtsp")
-        fallback.assert_awaited_once_with(dvr, 3)
+        fallback.assert_awaited_once_with(dvr, 3, background=False)
 
     async def test_live_capture_uses_rtsp_for_other_dvrs(self):
         class Client:
@@ -357,7 +358,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             snapshot = await main.capture_snapshot(dvr, 3)
 
         self.assertEqual(snapshot, b"rtsp")
-        fallback.assert_awaited_once_with(dvr, 3)
+        fallback.assert_awaited_once_with(dvr, 3, background=False)
 
     async def test_rtsp_failure_cooldown_skips_second_live_attempt(self):
         class Client:
@@ -385,7 +386,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await main.capture_snapshot(dvr, 3))
             self.assertIsNone(await main.capture_snapshot(dvr, 3))
 
-        fallback.assert_awaited_once_with(dvr, 3)
+        fallback.assert_awaited_once_with(dvr, 3, background=False)
 
     async def test_background_capture_uses_short_budget_and_no_general_rtsp(self):
         class Client:
@@ -911,6 +912,69 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(websocket.messages[0]["description"], "TEST C2")
         self.assertEqual(websocket.messages[-1]["image_count"], 1)
+
+    async def test_classroom_scanning_cannot_take_every_rtsp_slot(self):
+        """A parent's live RTSP capture keeps its own worker slots."""
+        dvr = {
+            "ip": "192.0.2.77",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        release = threading.Event()
+
+        def capture(_ip, _port, _user, _password, channel):
+            if channel != 99:
+                release.wait(5)
+            return b"jpeg"
+
+        with patch.object(main, "_capture_frame_rtsp", side_effect=capture):
+            background = [
+                asyncio.create_task(
+                    main._capture_snapshot_rtsp(dvr, channel, background=True)
+                )
+                for channel in range(main._RTSP_BACKGROUND_CONCURRENCY)
+            ]
+            await asyncio.sleep(0.05)
+            # Every scanner slot is occupied, yet the parent's capture still
+            # gets a worker instead of queueing behind the sweep.
+            live = await asyncio.wait_for(
+                main._capture_snapshot_rtsp(dvr, 99), timeout=2
+            )
+            self.assertEqual(live, b"jpeg")
+            self.assertFalse(any(task.done() for task in background))
+            release.set()
+            await asyncio.gather(*background)
+
+    async def test_several_families_are_served_at_once(self):
+        self.assertGreaterEqual(main._snapshot_request_semaphore._value, 4)
+
+    async def test_a_queued_request_is_logged(self):
+        semaphore = asyncio.Semaphore(1)
+        release = asyncio.Event()
+
+        async def handler(_ws, classroom, _request_id):
+            if classroom == "FIRST":
+                await release.wait()
+
+        with patch.object(main, "_snapshot_request_semaphore", semaphore), \
+                patch.object(
+                    main, "_handle_snapshot_request", side_effect=handler
+                ), self.assertLogs(main.logger, level="WARNING") as logs:
+            first = asyncio.create_task(
+                main.handle_snapshot_request(None, "FIRST", "r1")
+            )
+            await asyncio.sleep(0.05)
+            second = asyncio.create_task(
+                main.handle_snapshot_request(None, "SECOND", "r2")
+            )
+            await asyncio.sleep(1.05)
+            release.set()
+            await asyncio.gather(first, second)
+
+        self.assertTrue(
+            any("waited" in line and "SECOND" in line for line in logs.output)
+        )
 
     async def test_websocket_watchdog_restarts_missing_task(self):
         started = asyncio.Event()
