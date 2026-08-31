@@ -34,6 +34,17 @@ class RestartKillsOldProcessesTests(unittest.TestCase):
         self.assertIn("'main.py','trueface_poller','gate_counter'", script)
         self.assertIn("[WARNING] Not running:", script)
 
+    def test_the_role_check_only_looks_at_python_processes(self):
+        """An unfiltered process list contains the checking command itself,
+        whose text names all three agents, so it could never report one
+        missing."""
+        script = _read("restart_all.bat")
+        role_check = script[script.index("$c = (Get-CimInstance"):]
+        role_check = role_check[: role_check.index("\n")]
+        self.assertIn("Name='python.exe'", role_check)
+        self.assertIn("Name='pythonw.exe'", role_check)
+        self.assertIn("Name='py.exe'", role_check)
+
     def test_verification_names_each_process(self):
         script = _read("restart_all.bat")
         self.assertNotIn('tasklist /FI "IMAGENAME eq python.exe"\n', script)
