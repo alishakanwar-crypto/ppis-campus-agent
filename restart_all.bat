@@ -116,7 +116,7 @@ echo ========================================================
 REM Name what is running: a python process can be a worker a real agent
 REM spawned, so a bare count cannot tell "all three are up" from "one is
 REM missing and something else is running twice".
-powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe' or Name='pythonw.exe' or Name='py.exe'\" -ErrorAction SilentlyContinue | ForEach-Object { $agent = 'other'; if ($_.CommandLine -match 'trueface_poller') { $agent = 'TrueFace Poller' } elseif ($_.CommandLine -match 'gate_counter') { $agent = 'Gate Counter' } elseif ($_.CommandLine -match 'main.py') { $agent = 'Campus Agent' }; Write-Host ('    PID ' + $_.ProcessId + '  started ' + [Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate).ToString('HH:mm:ss') + '  ' + $agent) }"
+powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe' or Name='pythonw.exe' or Name='py.exe'\" -ErrorAction SilentlyContinue | ForEach-Object { $agent = 'other'; if ($_.CommandLine -match 'trueface_poller') { $agent = 'TrueFace Poller' } elseif ($_.CommandLine -match 'gate_counter') { $agent = 'Gate Counter' } elseif ($_.CommandLine -match 'main.py') { $agent = 'Campus Agent' }; Write-Host ('    PID ' + $_.ProcessId + '  started ' + $_.CreationDate.ToString('HH:mm:ss') + '  ' + $agent) }" 2>nul
 echo.
 
 call :count_python
@@ -138,7 +138,13 @@ set "MISSING="
 REM Only python processes count: every other process list includes this very
 REM command line, whose own text names all three agents, so an unfiltered
 REM search always "finds" them and can never report a missing agent.
-for /f %%a in ('powershell.exe -NoProfile -Command "$c = (Get-CimInstance Win32_Process -Filter \"Name='python.exe' or Name='pythonw.exe' or Name='py.exe'\" -ErrorAction SilentlyContinue ^| Select-Object -ExpandProperty CommandLine) -join ' '; @('main.py','trueface_poller','gate_counter') ^| Where-Object { $c -notmatch $_ }"') do set "MISSING=!MISSING! %%a"
+REM Accept only the three known names: any PowerShell error text would
+REM otherwise be printed back as the list of missing agents.
+for /f %%a in ('powershell.exe -NoProfile -Command "$c = (Get-CimInstance Win32_Process -Filter \"Name='python.exe' or Name='pythonw.exe' or Name='py.exe'\" -ErrorAction SilentlyContinue ^| Select-Object -ExpandProperty CommandLine) -join ' '; @('main.py','trueface_poller','gate_counter') ^| Where-Object { $c -notmatch $_ }" 2^>nul') do (
+    if "%%a"=="main.py" set "MISSING=!MISSING! Campus Agent"
+    if "%%a"=="trueface_poller" set "MISSING=!MISSING! TrueFace Poller"
+    if "%%a"=="gate_counter" set "MISSING=!MISSING! Gate Counter"
+)
 if "!MISSING!"=="" (
     echo   [OK] All 3 agents started successfully!
 ) else (
