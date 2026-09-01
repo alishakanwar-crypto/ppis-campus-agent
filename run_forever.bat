@@ -31,6 +31,8 @@ reg add "HKLM\Software\Microsoft\Windows\Windows Error Reporting" /v Disabled /t
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug" /v Auto /t REG_SZ /d 1 /f >nul 2>&1
 
 set PYTHONDONTWRITEBYTECODE=1
+REM Tells the agent it may exit to pick up merged code: we restart it below.
+set PPIS_WRAPPER=1
 REM Must match DUPLICATE_INSTANCE_EXIT_CODE in campus_instance.py.
 set "DUPLICATE_EXIT_CODE=75"
 

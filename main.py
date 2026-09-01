@@ -681,6 +681,89 @@ def _process_started_at_ist() -> str:
     return _PROCESS_STARTED_AT.strftime("%d-%m-%Y %H:%M:%S IST")
 
 
+_AUTO_UPDATE_CHECK_SECONDS = max(
+    60.0, float(os.environ.get("AUTO_UPDATE_CHECK_SECONDS", "600"))
+)
+_AUTO_UPDATE_ENABLED = (
+    os.environ.get("AUTO_UPDATE_ENABLED", "1").strip().lower()
+    not in {"0", "false", "no"}
+)
+# Exiting only updates the agent when the wrapper is there to bring it back;
+# started by hand, an exit would simply leave the campus without an agent.
+_STARTED_BY_WRAPPER = os.environ.get("PPIS_WRAPPER", "") == "1"
+
+
+def _git(*args: str) -> str:
+    """Run a read-only git command in the agent's checkout, '' on failure."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as exc:
+        logger.debug("git %s failed: %s", " ".join(args), _exception_text(exc))
+        return ""
+    if result.returncode != 0:
+        logger.debug(
+            "git %s failed: %s", " ".join(args), result.stderr.strip()[:200]
+        )
+        return ""
+    return result.stdout.strip()
+
+
+def _pending_update_commit() -> str:
+    """The commit on origin/main we are not running yet, '' when current."""
+    _git("fetch", "origin", "main")
+    remote = _git("rev-parse", "--short", "origin/main")
+    local = _git("rev-parse", "--short", "HEAD")
+    if not remote or not local or remote == local:
+        return ""
+    return remote
+
+
+async def _auto_update_loop() -> None:
+    """Restart onto merged code by ourselves, so no one has to do it.
+
+    The wrapper pulls origin/main every time the agent exits, so exiting on a
+    quiet moment is all that is needed to run a fix the day it is merged —
+    nobody has to be at the campus PC to run a restart script.
+    """
+    if not _AUTO_UPDATE_ENABLED:
+        return
+    if not _STARTED_BY_WRAPPER:
+        logger.info(
+            "Auto-update is off: this agent was not started by run_forever, "
+            "so nothing would restart it"
+        )
+        return
+    while True:
+        try:
+            await asyncio.sleep(_AUTO_UPDATE_CHECK_SECONDS)
+            commit = await asyncio.to_thread(_pending_update_commit)
+            if not commit:
+                continue
+            if _live_requests_in_flight:
+                logger.info(
+                    "Update %s is waiting for %d parent request(s) to finish",
+                    commit, _live_requests_in_flight,
+                )
+                continue
+            logger.warning(
+                "Restarting onto merged code %s (running %s); the wrapper "
+                "pulls it on the way back up",
+                commit, _running_commit() or "unknown",
+            )
+            logging.shutdown()
+            os._exit(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Auto-update check failed: %s", _exception_text(exc))
+
+
 def _exception_text(exc: BaseException) -> str:
     """Return a useful description even when str(exc) is empty."""
     detail = str(exc).strip()
@@ -746,6 +829,23 @@ _AUTH_REFUSAL_TRUST_SECONDS = max(
 _CHANNEL_AUTH_COOLDOWN_SECONDS = max(
     60.0, float(os.environ.get("ISAPI_CHANNEL_AUTH_COOLDOWN_SECONDS", "1800"))
 )
+# A Hikvision admin lock clears itself once nothing tries the account for a
+# while, so a refused recorder is re-tried exactly once after a long silence
+# instead of waiting for a human to reboot it or type a new password.
+_AUTH_UNLOCK_QUIET_SECONDS = max(
+    300.0, float(os.environ.get("ISAPI_AUTH_UNLOCK_QUIET_SECONDS", "1800"))
+)
+_AUTH_UNLOCK_MAX_QUIET_SECONDS = max(
+    _AUTH_UNLOCK_QUIET_SECONDS,
+    float(os.environ.get("ISAPI_AUTH_UNLOCK_MAX_QUIET_SECONDS", "14400")),
+)
+_AUTH_UNLOCK_CHECK_SECONDS = 60.0
+# ip -> when we last presented a login to that recorder, by any path
+_last_auth_attempt: dict[str, float] = {}
+# ip -> earliest moment the single unlock probe may run
+_auth_unlock_next_probe: dict[str, float] = {}
+# ip -> how long the recorder must stay untouched before the next probe
+_auth_unlock_quiet: dict[str, float] = {}
 # ip -> when ISAPI last handed us a picture, so a refusal can be judged
 _isapi_last_success: dict[str, float] = {}
 # (ip, channel) -> when that channel may be asked for a picture again
@@ -838,15 +938,19 @@ def _mark_isapi_auth_rejected(
     _refused_credentials[ip] = (
         _dvr_credential_key(dvr) if isinstance(dvr, dict) else ""
     )
+    quiet = _AUTH_UNLOCK_QUIET_SECONDS
+    _auth_unlock_quiet[ip] = quiet
+    _auth_unlock_next_probe[ip] = time.monotonic() + quiet
     _auth_refused_since_ist.setdefault(
         ip, datetime.now(_IST).strftime("%d-%m-%Y %H:%M:%S IST")
     )
     if already_refused:
         return
     logger.error(
-        "%s refused our login; every snapshot path for it is paused until its "
-        "password changes, because retrying only keeps the recorder locked",
-        ip,
+        "%s refused our login; every snapshot path for it is paused for "
+        "%.0f minutes, because retrying only keeps the recorder locked — then "
+        "it is tried once",
+        ip, quiet / 60,
     )
 
 
@@ -905,12 +1009,101 @@ def _mark_isapi_timeout(ip: str) -> None:
     )
 
 
+def _note_auth_attempt(ip: str) -> None:
+    """Remember that a login was just presented, so the quiet window is real."""
+    _last_auth_attempt[ip] = time.monotonic()
+
+
+def _note_isapi_success(ip: str) -> None:
+    """Record that the recorder just served a picture over ISAPI."""
+    _isapi_last_success[ip] = time.monotonic()
+
+
 def _clear_isapi_failures(ip: str) -> None:
     _isapi_consecutive_timeouts.pop(ip, None)
     _refused_credentials.pop(ip, None)
     _auth_refused_since_ist.pop(ip, None)
+    _auth_unlock_next_probe.pop(ip, None)
+    _auth_unlock_quiet.pop(ip, None)
     if _isapi_cooldowns.pop(ip, None) is not None:
         logger.info("%s is answering ISAPI again", ip)
+
+
+async def _probe_locked_recorder(dvr: dict) -> bool:
+    """Try a refused recorder exactly once, after it has been left alone.
+
+    A Hikvision admin lock expires on its own, but only while nothing presents
+    the account: one quiet probe recovers the recorder without anyone at
+    school rebooting it, and a failure simply lengthens the next silence.
+    """
+    ip = dvr.get("ip")
+    port = dvr.get("port", 80)
+    _note_auth_attempt(ip)
+    url = f"http://{ip}:{port}/ISAPI/System/deviceInfo"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                url,
+                auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
+            )
+        recovered = resp.status_code == 200
+    except Exception as exc:
+        logger.info(
+            "%s did not answer the unlock check (%s); staying away",
+            ip, _exception_text(exc),
+        )
+        recovered = False
+    if recovered:
+        logger.warning(
+            "%s accepted our login again after the lockout expired; resuming "
+            "its cameras", ip,
+        )
+        _isapi_last_success[ip] = time.monotonic()
+        for key in [k for k in _rtsp_attempts_while_refused if k[0] == ip]:
+            _rtsp_attempts_while_refused.pop(key, None)
+        _clear_isapi_failures(ip)
+        return True
+    quiet = min(
+        _AUTH_UNLOCK_MAX_QUIET_SECONDS,
+        _auth_unlock_quiet.get(ip, _AUTH_UNLOCK_QUIET_SECONDS) * 2,
+    )
+    _auth_unlock_quiet[ip] = quiet
+    _auth_unlock_next_probe[ip] = time.monotonic() + quiet
+    logger.info(
+        "%s still refuses our login; leaving it untouched for %.0f more "
+        "minutes", ip, quiet / 60,
+    )
+    return False
+
+
+async def _unlock_refused_recorders() -> None:
+    """One pass of the unlock watch over every recorder that refused us."""
+    for dvr in config.get("dvrs", []) or []:
+        ip = dvr.get("ip")
+        if not ip or not _credentials_refused(dvr):
+            continue
+        due_at = _auth_unlock_next_probe.get(ip)
+        if due_at is None or due_at > time.monotonic():
+            continue
+        quiet = _auth_unlock_quiet.get(ip, _AUTH_UNLOCK_QUIET_SECONDS)
+        touched = _last_auth_attempt.get(ip)
+        if touched is not None and (time.monotonic() - touched) < quiet:
+            # Something presented the login again (an RTSP fallback, say), so
+            # the lock was re-armed and the silence has to start over.
+            _auth_unlock_next_probe[ip] = touched + quiet
+            continue
+        await _probe_locked_recorder(dvr)
+
+
+async def _unlock_watch_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(_AUTH_UNLOCK_CHECK_SECONDS)
+            await _unlock_refused_recorders()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Unlock watch failed (non-fatal): %s", exc)
 
 
 def dvr_snapshot_health() -> list[dict]:
@@ -918,11 +1111,16 @@ def dvr_snapshot_health() -> list[dict]:
     health = []
     for ip, (expires_at, reason) in sorted(_isapi_cooldowns.items()):
         if expires_at is None:
+            probe_at = _auth_unlock_next_probe.get(ip)
             health.append({
                 "ip": ip,
                 "reason": reason,
                 "seconds_remaining": None,
-                "held_until_password_change": True,
+                "held_until_password_change": probe_at is None,
+                "retry_in_seconds": (
+                    None if probe_at is None
+                    else round(max(0.0, probe_at - time.monotonic()), 1)
+                ),
                 "since_ist": _auth_refused_since_ist.get(ip, ""),
             })
         elif expires_at > time.monotonic():
@@ -1071,6 +1269,11 @@ async def _capture_snapshot_rtsp(
     never queues behind the scanner's sweep of every camera.
     """
     loop = asyncio.get_running_loop()
+    # RTSP presents the same account, so an unlock probe must not run while a
+    # stream is re-arming the lock — unless RTSP is logging in fine, which
+    # proves the account is not locked at all.
+    if _rtsp_credentials_worked.get(dvr["ip"]) != _dvr_credential_key(dvr):
+        _note_auth_attempt(dvr["ip"])
     semaphore = (
         _rtsp_background_semaphore if background else _rtsp_capture_semaphore
     )
@@ -1449,8 +1652,8 @@ async def capture_snapshot(
         # same credentials nothing is tried again until the password changes.
         if _credentials_refused(dvr) and not _rtsp_worth_trying(dvr):
             _last_capture_error = (
-                f"{ip} ch{channel}: recorder refused our login; waiting for a "
-                f"new password (refused since "
+                f"{ip} ch{channel}: recorder refused our login; letting its "
+                f"lockout expire before one quiet retry (refused since "
                 f"{_auth_refused_since_ist.get(ip, 'today')})"
             )
             metrics["outcome"] = "credentials_refused"
@@ -1495,6 +1698,7 @@ async def capture_snapshot(
                 if remaining <= 0:
                     break
                 attempt_started = time.monotonic()
+                _note_auth_attempt(ip)
                 try:
                     snapshot = await asyncio.wait_for(
                         _capture_snapshot_once(
@@ -1719,13 +1923,23 @@ async def test_dvr_connection(dvr: dict) -> dict:
             "error": (
                 "Recorder refused this username/password at "
                 f"{_auth_refused_since_ist.get(ip, 'an earlier check')}; not "
-                "retrying it, because every attempt keeps the recorder locked. "
-                "Save a new password to test again."
+                "retrying it now, because every attempt keeps the recorder "
+                "locked. It is tried again automatically once the recorder "
+                "has been left alone long enough for the lockout to expire."
             ),
-            "held_until_password_change": True,
+            "held_until_password_change": (
+                _auth_unlock_next_probe.get(ip) is None
+            ),
+            "retry_in_seconds": (
+                None if _auth_unlock_next_probe.get(ip) is None
+                else round(
+                    max(0.0, _auth_unlock_next_probe[ip] - time.monotonic()), 1
+                )
+            ),
         }
 
     url = f"http://{ip}:{port}/ISAPI/System/deviceInfo"
+    _note_auth_attempt(ip)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, auth=httpx.DigestAuth(user, pwd))
@@ -2006,6 +2220,7 @@ _WS_STALE_SECONDS = max(
     60.0, float(os.environ.get("WS_STALE_SECONDS", "180"))
 )
 _snapshot_tasks: set[asyncio.Task] = set()
+_live_requests_in_flight = 0
 # One family's classroom must not sit in a queue behind another family's:
 # each recorder already has its own concurrency limiter, so several parent
 # requests can be served at once without hammering any one DVR.
@@ -2474,7 +2689,18 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
       2. snapshot_complete (final message with total count)
     Falls back to legacy single-message format if only 1 image captured.
     """
+    global _live_requests_in_flight
     queued_at = time.monotonic()
+    _live_requests_in_flight += 1
+    try:
+        await _serve_snapshot_request(ws, classroom, request_id, queued_at)
+    finally:
+        _live_requests_in_flight -= 1
+
+
+async def _serve_snapshot_request(
+    ws, classroom: str, request_id: str, queued_at: float
+):
     async with _snapshot_request_semaphore:
         waited = time.monotonic() - queued_at
         if waited >= 1.0:
@@ -2926,6 +3152,11 @@ async def lifespan(app: FastAPI):
             logger.error(f"Health watchdog failed: {e}", exc_info=True)
 
     asyncio.create_task(_delayed_watchdog())
+    # Re-try a locked-out recorder by itself once its lock has had silence to
+    # expire, so nobody has to reboot a DVR to get its classrooms back.
+    asyncio.create_task(_unlock_watch_loop())
+    # Pick up merged fixes without anyone running a restart script.
+    asyncio.create_task(_auto_update_loop())
     # Periodic Entry Gate snapshots DISABLED per user request (2026-05-30).
     # User only wants unknown person alerts, not routine snapshots.
     # asyncio.create_task(_entry_gate_snapshot_loop())

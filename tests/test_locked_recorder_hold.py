@@ -105,7 +105,9 @@ class LockedRecorderHoldTests(unittest.IsolatedAsyncioTestCase):
 
         client.assert_not_called()
         self.assertEqual(result["status"], "auth_failed")
-        self.assertTrue(result["held_until_password_change"])
+        # The recorder is retried by the unlock watch, not by a person.
+        self.assertFalse(result["held_until_password_change"])
+        self.assertGreater(result["retry_in_seconds"], 0)
 
     async def test_the_dashboard_test_records_a_refusal_it_discovers(self):
         client = RecordingClient(lambda url: Response(401))

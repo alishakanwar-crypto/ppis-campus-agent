@@ -1,0 +1,103 @@
+"""The agent must pick up merged fixes without anyone restarting the PC."""
+
+import asyncio
+import os
+import sys
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import main
+
+
+class PendingUpdateTests(unittest.TestCase):
+    def test_no_update_when_running_the_remote_commit(self):
+        with patch.object(main, "_git", side_effect=["", "abc1234", "abc1234"]):
+            self.assertEqual(main._pending_update_commit(), "")
+
+    def test_reports_the_commit_waiting_on_origin_main(self):
+        with patch.object(main, "_git", side_effect=["", "def5678", "abc1234"]):
+            self.assertEqual(main._pending_update_commit(), "def5678")
+
+    def test_a_failed_fetch_never_looks_like_an_update(self):
+        with patch.object(main, "_git", side_effect=["", "", "abc1234"]):
+            self.assertEqual(main._pending_update_commit(), "")
+
+    def test_fetches_before_comparing(self):
+        with patch.object(main, "_git", side_effect=["", "a", "a"]) as git:
+            main._pending_update_commit()
+        self.assertEqual(git.call_args_list[0].args, ("fetch", "origin", "main"))
+
+
+class AutoUpdateLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def _run_one_pass(self):
+        """Run the loop until it either exits the process or sleeps twice."""
+        sleeps = 0
+
+        async def fake_sleep(_seconds):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps > 1:
+                raise asyncio.CancelledError
+
+        with patch.object(main.asyncio, "sleep", fake_sleep), \
+                self.assertRaises(asyncio.CancelledError):
+            await main._auto_update_loop()
+
+    async def test_restarts_onto_the_merged_commit_when_idle(self):
+        with patch.object(main, "_STARTED_BY_WRAPPER", True), \
+                patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
+                patch.object(main, "_live_requests_in_flight", 0), \
+                patch.object(main, "_pending_update_commit", return_value="new1234"), \
+                patch.object(main.os, "_exit") as exit_now, \
+                patch.object(main.logging, "shutdown"):
+            await self._run_one_pass()
+        exit_now.assert_called_once_with(0)
+
+    async def test_waits_while_a_parent_request_is_being_served(self):
+        with patch.object(main, "_STARTED_BY_WRAPPER", True), \
+                patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
+                patch.object(main, "_live_requests_in_flight", 1), \
+                patch.object(main, "_pending_update_commit", return_value="new1234"), \
+                patch.object(main.os, "_exit") as exit_now:
+            await self._run_one_pass()
+        exit_now.assert_not_called()
+
+    async def test_stays_put_when_already_on_the_latest_commit(self):
+        with patch.object(main, "_STARTED_BY_WRAPPER", True), \
+                patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
+                patch.object(main, "_pending_update_commit", return_value=""), \
+                patch.object(main.os, "_exit") as exit_now:
+            await self._run_one_pass()
+        exit_now.assert_not_called()
+
+    async def test_never_exits_when_no_wrapper_would_restart_us(self):
+        with patch.object(main, "_STARTED_BY_WRAPPER", False), \
+                patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
+                patch.object(main, "_pending_update_commit", return_value="new1234"), \
+                patch.object(main.os, "_exit") as exit_now:
+            await main._auto_update_loop()
+        exit_now.assert_not_called()
+
+    async def test_a_broken_git_check_does_not_kill_the_loop(self):
+        with patch.object(main, "_STARTED_BY_WRAPPER", True), \
+                patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
+                patch.object(
+                    main, "_pending_update_commit", side_effect=OSError("no git")
+                ), \
+                patch.object(main.os, "_exit") as exit_now:
+            await self._run_one_pass()
+        exit_now.assert_not_called()
+
+
+class WrapperContractTests(unittest.TestCase):
+    def test_run_forever_marks_the_agent_as_wrapper_started(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "run_forever.bat")) as handle:
+            script = handle.read()
+        self.assertIn("set PPIS_WRAPPER=1", script)
+
+
+if __name__ == "__main__":
+    unittest.main()
