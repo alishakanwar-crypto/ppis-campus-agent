@@ -19,6 +19,7 @@ faulthandler.enable()  # Print C-level crash tracebacks
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -721,12 +722,31 @@ _AUTH_REJECTIONS_BEFORE_GIVING_UP = max(
 _RTSP_RESERVE_SECONDS = max(
     0.0, float(os.environ.get("SNAPSHOT_RTSP_RESERVE_SECONDS", "8"))
 )
-_isapi_cooldowns: dict[str, tuple[float, str]] = {}
+# expires_at is None for a login refusal: retrying on a timer only re-arms the
+# recorder's lockout, so that pause is held until its password changes.
+_isapi_cooldowns: dict[str, tuple[float | None, str]] = {}
 _isapi_consecutive_timeouts: dict[str, int] = {}
+# ip -> the credentials the recorder refused, so a new password lifts the pause
+_refused_credentials: dict[str, str] = {}
+_auth_refused_since_ist: dict[str, str] = {}
+# ip -> credentials RTSP has actually streamed with, so the fallback is only
+# trusted while the recorder still accepts them
+_rtsp_credentials_worked: dict[str, str] = {}
+# (ip, credentials) -> RTSP attempts made since the recorder refused that login
+_rtsp_attempts_while_refused: dict[tuple[str, str], int] = {}
+_RTSP_ATTEMPTS_WHILE_REFUSED = max(
+    1, int(os.environ.get("RTSP_ATTEMPTS_WHILE_REFUSED", "3"))
+)
 
 
 class _DvrAuthRejected(Exception):
     """The recorder refused our credentials, usually a login lockout."""
+
+
+def _dvr_credential_key(dvr: dict) -> str:
+    """Fingerprint of a recorder's login, never the login itself."""
+    raw = f"{dvr.get('username', '')}:{dvr.get('password', '')}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _isapi_cooldown(ip: str) -> str:
@@ -735,24 +755,89 @@ def _isapi_cooldown(ip: str) -> str:
     if entry is None:
         return ""
     expires_at, reason = entry
+    if expires_at is None:
+        return reason
     if expires_at <= time.monotonic():
         _isapi_cooldowns.pop(ip, None)
         return ""
     return reason
 
 
-def _mark_isapi_auth_rejected(ip: str) -> None:
-    _isapi_cooldowns[ip] = (
-        time.monotonic() + _ISAPI_AUTH_COOLDOWN_SECONDS,
-        "credentials refused",
-    )
+def _credentials_refused(dvr: dict) -> bool:
+    """True while this recorder is refusing the login we still hold.
+
+    A locked recorder re-locks itself the moment anything retries the password
+    it rejected, so the only thing that lifts this is a different password.
+    """
+    ip = dvr.get("ip")
+    refused = _refused_credentials.get(ip)
+    if refused is None:
+        return False
+    if refused == _dvr_credential_key(dvr):
+        return True
+    logger.info("%s has a new login; resuming its snapshots", ip)
+    _clear_isapi_failures(ip)
+    return False
+
+
+def _mark_isapi_auth_rejected(dvr: dict | str) -> None:
+    ip = dvr["ip"] if isinstance(dvr, dict) else dvr
+    already_refused = ip in _refused_credentials
+    _isapi_cooldowns[ip] = (None, "credentials refused")
     _isapi_consecutive_timeouts.pop(ip, None)
-    logger.error(
-        "%s refused our login; pausing its ISAPI snapshots for %.0f minutes so "
-        "the recorder's lockout can clear, using RTSP meanwhile",
-        ip,
-        _ISAPI_AUTH_COOLDOWN_SECONDS / 60.0,
+    _refused_credentials[ip] = (
+        _dvr_credential_key(dvr) if isinstance(dvr, dict) else ""
     )
+    _auth_refused_since_ist.setdefault(
+        ip, datetime.now(_IST).strftime("%d-%m-%Y %H:%M:%S IST")
+    )
+    if already_refused:
+        return
+    logger.error(
+        "%s refused our login; every snapshot path for it is paused until its "
+        "password changes, because retrying only keeps the recorder locked",
+        ip,
+    )
+
+
+def _rtsp_worth_trying(dvr: dict) -> bool:
+    """Whether RTSP may still be tried on a recorder that refused our login.
+
+    DVR 4 answers 401 on ISAPI yet streams over RTSP, so a refusal alone must
+    not silence a recorder — but if RTSP cannot log in either, the password is
+    genuinely wrong and every further attempt just re-arms the lockout.
+    """
+    ip = dvr.get("ip")
+    key = _dvr_credential_key(dvr)
+    if _rtsp_credentials_worked.get(ip) == key:
+        return True
+    return _rtsp_attempts_while_refused.get((ip, key), 0) < (
+        _RTSP_ATTEMPTS_WHILE_REFUSED
+    )
+
+
+def _note_rtsp_attempt_while_refused(dvr: dict) -> None:
+    ip = dvr.get("ip")
+    if _refused_credentials.get(ip) is None:
+        return
+    key = _dvr_credential_key(dvr)
+    if _rtsp_credentials_worked.get(ip) == key:
+        return
+    seen = _rtsp_attempts_while_refused.get((ip, key), 0) + 1
+    _rtsp_attempts_while_refused[(ip, key)] = seen
+    if seen == _RTSP_ATTEMPTS_WHILE_REFUSED:
+        logger.error(
+            "%s rejects our login on ISAPI and RTSP cannot get a frame either; "
+            "leaving the recorder alone until its password changes so the "
+            "lockout can clear",
+            ip,
+        )
+
+
+def _note_rtsp_success(dvr: dict) -> None:
+    ip = dvr.get("ip")
+    _rtsp_credentials_worked[ip] = _dvr_credential_key(dvr)
+    _rtsp_attempts_while_refused.pop((ip, _rtsp_credentials_worked[ip]), None)
 
 
 def _mark_isapi_timeout(ip: str) -> None:
@@ -772,21 +857,33 @@ def _mark_isapi_timeout(ip: str) -> None:
 
 def _clear_isapi_failures(ip: str) -> None:
     _isapi_consecutive_timeouts.pop(ip, None)
+    _refused_credentials.pop(ip, None)
+    _auth_refused_since_ist.pop(ip, None)
     if _isapi_cooldowns.pop(ip, None) is not None:
         logger.info("%s is answering ISAPI again", ip)
 
 
 def dvr_snapshot_health() -> list[dict]:
     """Recorders whose direct snapshot path is currently being avoided."""
-    return [
-        {
-            "ip": ip,
-            "reason": reason,
-            "seconds_remaining": round(max(0.0, expires_at - time.monotonic()), 1),
-        }
-        for ip, (expires_at, reason) in sorted(_isapi_cooldowns.items())
-        if expires_at > time.monotonic()
-    ]
+    health = []
+    for ip, (expires_at, reason) in sorted(_isapi_cooldowns.items()):
+        if expires_at is None:
+            health.append({
+                "ip": ip,
+                "reason": reason,
+                "seconds_remaining": None,
+                "held_until_password_change": True,
+                "since_ist": _auth_refused_since_ist.get(ip, ""),
+            })
+        elif expires_at > time.monotonic():
+            health.append({
+                "ip": ip,
+                "reason": reason,
+                "seconds_remaining": round(
+                    max(0.0, expires_at - time.monotonic()), 1
+                ),
+            })
+    return health
 
 
 def _warn_rtsp_timeouts_unsupported() -> None:
@@ -1247,10 +1344,29 @@ async def capture_snapshot(
             isapi_deadline -= min(
                 _RTSP_RESERVE_SECONDS, max(0.0, camera_timeout * 0.5)
             )
+        # A recorder that refused this password re-arms its own lockout on every
+        # further login attempt, so once RTSP has been shown to fail with the
+        # same credentials nothing is tried again until the password changes.
+        if _credentials_refused(dvr) and not _rtsp_worth_trying(dvr):
+            _last_capture_error = (
+                f"{ip} ch{channel}: recorder refused our login; waiting for a "
+                f"new password (refused since "
+                f"{_auth_refused_since_ist.get(ip, 'today')})"
+            )
+            metrics["outcome"] = "credentials_refused"
+            logger.warning(
+                "%s ch%d: skipped, recorder is refusing our login and RTSP "
+                "cannot log in either", ip, channel,
+            )
+            return None
         cooldown_reason = _isapi_cooldown(ip)
         # While a recorder is on cooldown the RTSP road is the one worth taking,
         # unless that has just failed too — then one direct try beats no picture.
         skip_isapi = bool(cooldown_reason) and not _rtsp_cooldown_active(ip)
+        # ...but never against a recorder that refused this login: one more
+        # rejected attempt is what keeps the lockout alive.
+        if cooldown_reason == "credentials refused":
+            skip_isapi = True
         if cooldown_reason:
             logger.info(
                 "%s ch%d: recorder is %s, %s",
@@ -1315,7 +1431,7 @@ async def capture_snapshot(
                     )
                     metrics["exception"] = type(exc).__name__
                     _last_capture_error = f"{ip} ch{channel}: {exc}"
-                    _mark_isapi_auth_rejected(ip)
+                    _mark_isapi_auth_rejected(dvr)
                     break
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
                     metrics["attempt_elapsed"].append(
@@ -1389,6 +1505,7 @@ async def capture_snapshot(
                 and not _rtsp_cooldown_active(ip)
             ):
                 logger.info("ISAPI exhausted for %s ch%d, trying RTSP fallback", ip, channel)
+                _note_rtsp_attempt_while_refused(dvr)
                 try:
                     rtsp_frame = await asyncio.wait_for(
                         _capture_snapshot_rtsp(
@@ -1400,6 +1517,7 @@ async def capture_snapshot(
                         metrics["rtsp"] = True
                         metrics["outcome"] = "success"
                         _clear_rtsp_failure(ip)
+                        _note_rtsp_success(dvr)
                         _last_capture_error = ""
                         return rtsp_frame
                     _mark_rtsp_failure(ip)
@@ -1478,13 +1596,30 @@ async def test_dvr_connection(dvr: dict) -> dict:
     user = dvr["username"]
     pwd = dvr["password"]
 
+    # Testing a recorder that already refused this password is what kept DVR 2
+    # locked: every test re-armed the lockout, so answer from what we know.
+    if _credentials_refused(dvr):
+        return {
+            "status": "auth_failed",
+            "ip": ip,
+            "error": (
+                "Recorder refused this username/password at "
+                f"{_auth_refused_since_ist.get(ip, 'an earlier check')}; not "
+                "retrying it, because every attempt keeps the recorder locked. "
+                "Save a new password to test again."
+            ),
+            "held_until_password_change": True,
+        }
+
     url = f"http://{ip}:{port}/ISAPI/System/deviceInfo"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, auth=httpx.DigestAuth(user, pwd))
             if resp.status_code == 200:
+                _clear_isapi_failures(ip)
                 return {"status": "connected", "ip": ip, "response": resp.text[:500]}
             elif resp.status_code == 401:
+                _mark_isapi_auth_rejected(dvr)
                 return {"status": "auth_failed", "ip": ip, "error": "Invalid username/password"}
             else:
                 return {"status": "error", "ip": ip, "error": f"HTTP {resp.status_code}"}
@@ -1520,6 +1655,12 @@ async def discover_dvr_channel_names() -> int:
         ip = dvr.get("ip")
         port = dvr.get("port", 80)
         url = f"http://{ip}:{port}/ISAPI/System/Video/inputs/channels"
+        if _credentials_refused(dvr):
+            logger.warning(
+                "Skipping channel name discovery on %s; it is refusing our "
+                "login and another attempt would keep it locked", ip,
+            )
+            return 0
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(
@@ -2056,6 +2197,8 @@ async def _restore_daylight_colour(
         f"http://{ip}:{dvr.get('port', 80)}"
         f"/ISAPI/Image/channels/{channel}/ircutFilter"
     )
+    if _credentials_refused(dvr):
+        return False, "login refused"
     auth = httpx.DigestAuth(dvr["username"], dvr["password"])
     body = (
         '<?xml version="1.0" encoding="UTF-8"?>'
