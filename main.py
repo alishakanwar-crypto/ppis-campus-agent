@@ -995,6 +995,7 @@ async def _capture_snapshot_once(
     channel: int,
     client: httpx.AsyncClient,
     metrics: dict[str, object] | None = None,
+    door_budget_seconds: float | None = None,
 ) -> bytes | None:
     ip = dvr["ip"]
     port = dvr.get("port", 80)
@@ -1083,12 +1084,20 @@ async def _capture_snapshot_once(
             )
         return picture
 
+    silent_variants: set[int] = set()
     for scheme, variant in candidates:
         if (scheme, variant) in seen or variant in sized_variants:
             continue
+        if variant in silent_variants:
+            # A URL that never answers will not start answering for the other
+            # authentication scheme; spend the attempt on the next URL instead.
+            continue
         seen.add((scheme, variant))
         auth = digest_auth if scheme == "digest" else httpx.BasicAuth(user, pwd)
-        door_budget = _LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS
+        door_budget = (
+            _LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS
+            if door_budget_seconds is None else door_budget_seconds
+        )
         if best is not None:
             # Probing for something sharper must never cost the picture we have.
             door_budget = min(
@@ -1104,6 +1113,7 @@ async def _capture_snapshot_once(
             if best is not None:
                 return keep(*best)
             _live_capture_slow_doors.setdefault(key, {})[variant] = time.monotonic()
+            silent_variants.add(variant)
             if metrics is not None:
                 metrics["door_timeouts"] = metrics.get("door_timeouts", 0) + 1
             logger.warning(
@@ -1258,7 +1268,20 @@ async def capture_snapshot(
                 attempt_started = time.monotonic()
                 try:
                     snapshot = await asyncio.wait_for(
-                        _capture_snapshot_once(dvr, channel, client, metrics),
+                        _capture_snapshot_once(
+                            dvr,
+                            channel,
+                            client,
+                            metrics,
+                            # Two doors must fit inside one attempt, or a silent
+                            # first door still costs every later one — the
+                            # background sweep's attempt is shorter than the
+                            # default door budget.
+                            door_budget_seconds=min(
+                                _LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS,
+                                max(1.0, min(http_timeout, remaining) / 2),
+                            ),
+                        ),
                         timeout=min(http_timeout, remaining),
                     )
                     metrics["attempt_elapsed"].append(
