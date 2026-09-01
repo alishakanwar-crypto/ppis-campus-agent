@@ -107,6 +107,22 @@ class SnapshotDoorTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(main._isapi_cooldown(self.dvr["ip"]), "not answering")
 
+    async def test_the_scanner_sweep_also_reaches_the_next_door(self):
+        """A background attempt is shorter than the door budget, so the budget
+        must shrink to fit or a silent first door costs every later one."""
+        requested: list[str] = []
+        picture = jpeg(1280, 720)
+        with patch.object(
+            main.httpx,
+            "AsyncClient",
+            return_value=self._client("videoResolutionWidth", picture, requested),
+        ):
+            self.assertEqual(
+                await main.capture_snapshot(self.dvr, 4, background=True), picture
+            )
+
+        self.assertGreaterEqual(len(requested), 2)
+
     async def test_a_door_is_forgiven_once_it_answers_again(self):
         """A recorder that was merely busy must not be avoided forever."""
         requested: list[str] = []
