@@ -48,6 +48,10 @@ class DvrLoginBackoffTests(unittest.IsolatedAsyncioTestCase):
         main._isapi_cooldowns.clear()
         main._isapi_consecutive_timeouts.clear()
         main._rtsp_cooldowns.clear()
+        main._refused_credentials.clear()
+        main._auth_refused_since_ist.clear()
+        main._rtsp_credentials_worked.clear()
+        main._rtsp_attempts_while_refused.clear()
 
     async def test_refused_login_gives_up_at_once_and_falls_back_to_rtsp(self):
         client = RecordingClient(lambda url: Response(401))
@@ -164,16 +168,18 @@ class DvrLoginBackoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(attempted)
 
     async def test_health_lists_the_recorders_being_bypassed(self):
-        main._mark_isapi_auth_rejected("192.0.2.90")
+        main._mark_isapi_auth_rejected(DVR)
         health = main.dvr_snapshot_health()
 
         self.assertEqual(len(health), 1)
         self.assertEqual(health[0]["ip"], "192.0.2.90")
         self.assertEqual(health[0]["reason"], "credentials refused")
-        self.assertGreater(health[0]["seconds_remaining"], 0)
+        # Held until the password changes rather than expiring on a timer.
+        self.assertIsNone(health[0]["seconds_remaining"])
+        self.assertTrue(health[0]["held_until_password_change"])
 
     async def test_background_capture_uses_rtsp_while_isapi_is_paused(self):
-        main._mark_isapi_auth_rejected("192.0.2.90")
+        main._mark_isapi_auth_rejected(DVR)
         with patch.object(
             main, "_capture_snapshot_rtsp", return_value=b"rtsp-frame"
         ):

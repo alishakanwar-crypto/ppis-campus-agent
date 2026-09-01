@@ -2453,10 +2453,14 @@ class AttendanceEngine:
             _acquire_dvr_capture,
             _capture_snapshot_rtsp,
             _clear_isapi_failures,
+            _credentials_refused,
             _exception_text,
             _isapi_cooldown,
             _mark_isapi_auth_rejected,
             _mark_isapi_timeout,
+            _note_rtsp_attempt_while_refused,
+            _note_rtsp_success,
+            _rtsp_worth_trying,
         )
 
         ip = dvr["ip"]
@@ -2465,18 +2469,25 @@ class AttendanceEngine:
         # A recorder that has locked us out must be left alone: the scanner
         # touches every camera every cycle, so retrying here would keep
         # refreshing the lockout and parents' snapshots would never recover.
+        # That includes RTSP — it presents the same rejected password.
+        if _credentials_refused(dvr) and not _rtsp_worth_trying(dvr):
+            return None
         on_cooldown = bool(_isapi_cooldown(ip))
         limiter = await _acquire_dvr_capture(ip, background=True)
         started = time.monotonic()
         try:
             if on_cooldown:
+                _note_rtsp_attempt_while_refused(dvr)
                 try:
-                    return await asyncio.wait_for(
+                    frame = await asyncio.wait_for(
                         _capture_snapshot_rtsp(dvr, channel, background=True),
                         timeout=_SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS,
                     )
                 except Exception:
                     return None
+                if frame:
+                    _note_rtsp_success(dvr)
+                return frame
             client = self._get_dvr_client(dvr)
             deadline = started + _SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS
             remaining = deadline - time.monotonic()
@@ -2522,7 +2533,7 @@ class AttendanceEngine:
                         return resp.content
                     self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
                     if resp.status_code in (401, 403):
-                        _mark_isapi_auth_rejected(ip)
+                        _mark_isapi_auth_rejected(dvr)
                         break
                 except Exception as exc:
                     self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
@@ -2545,13 +2556,17 @@ class AttendanceEngine:
 
             remaining = deadline - time.monotonic()
             if ip in _RTSP_FALLBACK_IPS and remaining > 0:
+                _note_rtsp_attempt_while_refused(dvr)
                 try:
-                    return await asyncio.wait_for(
+                    frame = await asyncio.wait_for(
                         _capture_snapshot_rtsp(dvr, channel, background=True),
                         timeout=remaining,
                     )
                 except asyncio.TimeoutError:
-                    pass
+                    frame = None
+                if frame:
+                    _note_rtsp_success(dvr)
+                    return frame
             return None
         except Exception as e:
             self.add_debug_log(
