@@ -19,7 +19,6 @@ faulthandler.enable()  # Print C-level crash tracebacks
 
 import asyncio
 import base64
-import hashlib
 import io
 import json
 import logging
@@ -126,6 +125,7 @@ _ensure_dlib_compat()
 
 from attendance_engine import engine as attendance_engine
 import face_db
+import recorder_auth
 from mood_detector import MoodDetector
 from teacher_sighting import TeacherSightingTracker
 
@@ -724,6 +724,26 @@ def _pending_update_commit() -> str:
     return remote
 
 
+def _work_in_flight() -> str:
+    """What the agent is in the middle of, '' when it is safe to exit.
+
+    A parent's photo is accepted as a task before the handler that counts it
+    ever runs, and attendance recognition, its cloud sync and its parent
+    notifications all live outside that count — exiting on any of them loses
+    the work outright, so each one is asked here.
+    """
+    reasons = []
+    if _live_requests_in_flight:
+        reasons.append(f"{_live_requests_in_flight} parent request(s)")
+    queued = sum(1 for task in _snapshot_tasks if not task.done())
+    if queued:
+        reasons.append(f"{queued} queued snapshot(s)")
+    attendance = attendance_engine.work_in_flight()
+    if attendance:
+        reasons.append(f"{attendance} attendance job(s)")
+    return ", ".join(reasons)
+
+
 async def _auto_update_loop() -> None:
     """Restart onto merged code by ourselves, so no one has to do it.
 
@@ -745,11 +765,9 @@ async def _auto_update_loop() -> None:
             commit = await asyncio.to_thread(_pending_update_commit)
             if not commit:
                 continue
-            if _live_requests_in_flight:
-                logger.info(
-                    "Update %s is waiting for %d parent request(s) to finish",
-                    commit, _live_requests_in_flight,
-                )
+            busy = _work_in_flight()
+            if busy:
+                logger.info("Update %s is waiting for %s", commit, busy)
                 continue
             logger.warning(
                 "Restarting onto merged code %s (running %s); the wrapper "
@@ -780,6 +798,11 @@ def _rtsp_cooldown_active(ip: str) -> bool:
 
 def _mark_rtsp_failure(ip: str) -> None:
     _rtsp_cooldowns[ip] = time.monotonic() + _RTSP_COOLDOWN_SECONDS
+    # A stream that worked before the recorder locked itself must stop
+    # vouching for the login, or every later failure goes uncounted and the
+    # fallback keeps knocking on a locked account.
+    if ip in _refused_credentials:
+        _rtsp_credentials_worked.pop(ip, None)
 
 
 def _clear_rtsp_failure(ip: str) -> None:
@@ -858,8 +881,9 @@ class _DvrAuthRejected(Exception):
 
 def _dvr_credential_key(dvr: dict) -> str:
     """Fingerprint of a recorder's login, never the login itself."""
-    raw = f"{dvr.get('username', '')}:{dvr.get('password', '')}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return recorder_auth.credential_key(
+        dvr.get("username", ""), dvr.get("password", "")
+    )
 
 
 def _isapi_cooldown(ip: str) -> str:
@@ -885,6 +909,12 @@ def _credentials_refused(dvr: dict) -> bool:
     ip = dvr.get("ip")
     refused = _refused_credentials.get(ip)
     if refused is None:
+        # Another process, or this one before a restart, may already have been
+        # refused; knocking again from here would only re-arm the lockout.
+        if recorder_auth.is_refused(ip, _dvr_credential_key(dvr)):
+            _refused_credentials[ip] = _dvr_credential_key(dvr)
+            _isapi_cooldowns.setdefault(ip, (None, "credentials refused"))
+            return True
         return False
     if refused == _dvr_credential_key(dvr):
         return True
@@ -933,6 +963,9 @@ def _mark_isapi_auth_rejected(
         _mark_channel_auth_refused(ip, channel)
         return
     already_refused = ip in _refused_credentials
+    recorder_auth.note_refusal(
+        ip, _dvr_credential_key(dvr) if isinstance(dvr, dict) else ""
+    )
     _isapi_cooldowns[ip] = (None, "credentials refused")
     _isapi_consecutive_timeouts.pop(ip, None)
     _refused_credentials[ip] = (
@@ -1012,14 +1045,17 @@ def _mark_isapi_timeout(ip: str) -> None:
 def _note_auth_attempt(ip: str) -> None:
     """Remember that a login was just presented, so the quiet window is real."""
     _last_auth_attempt[ip] = time.monotonic()
+    recorder_auth.note_attempt(ip)
 
 
 def _note_isapi_success(ip: str) -> None:
     """Record that the recorder just served a picture over ISAPI."""
     _isapi_last_success[ip] = time.monotonic()
+    recorder_auth.note_success(ip)
 
 
 def _clear_isapi_failures(ip: str) -> None:
+    recorder_auth.clear(ip)
     _isapi_consecutive_timeouts.pop(ip, None)
     _refused_credentials.pop(ip, None)
     _auth_refused_since_ist.pop(ip, None)
@@ -1058,7 +1094,7 @@ async def _probe_locked_recorder(dvr: dict) -> bool:
             "%s accepted our login again after the lockout expired; resuming "
             "its cameras", ip,
         )
-        _isapi_last_success[ip] = time.monotonic()
+        _note_isapi_success(ip)
         for key in [k for k in _rtsp_attempts_while_refused if k[0] == ip]:
             _rtsp_attempts_while_refused.pop(key, None)
         _clear_isapi_failures(ip)
@@ -1067,6 +1103,7 @@ async def _probe_locked_recorder(dvr: dict) -> bool:
         _AUTH_UNLOCK_MAX_QUIET_SECONDS,
         _auth_unlock_quiet.get(ip, _AUTH_UNLOCK_QUIET_SECONDS) * 2,
     )
+    recorder_auth.note_probe_failed(ip)
     _auth_unlock_quiet[ip] = quiet
     _auth_unlock_next_probe[ip] = time.monotonic() + quiet
     logger.info(
@@ -1091,6 +1128,13 @@ async def _unlock_refused_recorders() -> None:
             # Something presented the login again (an RTSP fallback, say), so
             # the lock was re-armed and the silence has to start over.
             _auth_unlock_next_probe[ip] = touched + quiet
+            continue
+        # The gate counter and the mood watcher log in from their own
+        # processes: probing while they are still knocking would only find the
+        # lock they keep re-arming.
+        elsewhere = recorder_auth.seconds_since_attempt(ip)
+        if elsewhere is not None and elsewhere < quiet:
+            _auth_unlock_next_probe[ip] = time.monotonic() + (quiet - elsewhere)
             continue
         await _probe_locked_recorder(dvr)
 
@@ -1272,8 +1316,9 @@ async def _capture_snapshot_rtsp(
     # RTSP presents the same account, so an unlock probe must not run while a
     # stream is re-arming the lock — unless RTSP is logging in fine, which
     # proves the account is not locked at all.
-    if _rtsp_credentials_worked.get(dvr["ip"]) != _dvr_credential_key(dvr):
-        _note_auth_attempt(dvr["ip"])
+    # Every stream presents the account, so each one restarts the silence a
+    # locked recorder needs — even where RTSP logged in fine a moment ago.
+    _note_auth_attempt(dvr["ip"])
     semaphore = (
         _rtsp_background_semaphore if background else _rtsp_capture_semaphore
     )

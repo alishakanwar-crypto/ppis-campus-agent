@@ -71,6 +71,7 @@ import cv2
 import httpx
 import numpy as np
 
+import recorder_auth
 from gate_intelligence import GateIntelligenceConfig, GateIntelligenceMonitor
 from process_priority import set_windows_process_priority
 
@@ -421,11 +422,31 @@ signal.signal(signal.SIGTERM, _handle_signal)
 _RTSP_FALLBACK_IPS: set[str] = {"192.168.0.13"}  # DVR 4
 
 
+def _dvr_credential_key(dvr_ip: str) -> str:
+    creds = DVR_CREDS.get(dvr_ip, {})
+    return recorder_auth.credential_key(
+        creds.get("user", DVR_DEFAULT_USER), creds.get("pass", "")
+    )
+
+
+def _recorder_refusing(dvr_ip: str) -> bool:
+    """Whether this recorder has already refused the login we hold.
+
+    The gate cameras sweep every few seconds, so continuing to log in here is
+    what kept DVR 2's admin account locked all day while the campus agent was
+    politely staying away from it.
+    """
+    return recorder_auth.is_refused(dvr_ip, _dvr_credential_key(dvr_ip))
+
+
 def _capture_gate_frame_rtsp(channel: int, dvr_ip: str) -> np.ndarray | None:
     """Capture a single frame via RTSP (fallback for DVRs with broken ISAPI)."""
+    if _recorder_refusing(dvr_ip) and dvr_ip not in _RTSP_FALLBACK_IPS:
+        return None
     creds = DVR_CREDS.get(dvr_ip, {})
     dvr_user = creds.get("user", DVR_DEFAULT_USER)
     dvr_pass = creds.get("pass", "")
+    recorder_auth.note_attempt(dvr_ip)
     stream_channel = channel * 100 + 1
     safe_pwd = dvr_pass.replace("@", "%40")
     rtsp_url = f"rtsp://{dvr_user}:{safe_pwd}@{dvr_ip}:554/Streaming/Channels/{stream_channel}"
@@ -456,13 +477,36 @@ def capture_gate_frame(channel: int, dvr_ip: str = "192.168.0.14") -> np.ndarray
     dvr_user = creds.get("user", DVR_DEFAULT_USER)
     dvr_pass = creds.get("pass", "")
 
+    if _recorder_refusing(dvr_ip):
+        return None
+
     try:
+        recorder_auth.note_attempt(dvr_ip)
         with httpx.Client(timeout=10.0) as client:
             resp = client.get(url, auth=httpx.DigestAuth(dvr_user, dvr_pass))
             if resp.status_code == 401:
-                resp = client.get(url, auth=httpx.BasicAuth(dvr_user, dvr_pass))
+                # Retrying with basic auth is a second failed login, and a
+                # Hikvision recorder locks its admin account after a handful.
+                if recorder_auth.recently_worked(dvr_ip):
+                    logger.warning(
+                        "%s ch%d refused the gate login although the recorder "
+                        "is serving; skipping this camera", dvr_ip, channel,
+                    )
+                else:
+                    logger.error(
+                        "%s refused the gate login on ch%d; leaving the "
+                        "recorder alone so its lockout can expire",
+                        dvr_ip, channel,
+                    )
+                    recorder_auth.note_refusal(
+                        dvr_ip, _dvr_credential_key(dvr_ip)
+                    )
+                if dvr_ip in _RTSP_FALLBACK_IPS:
+                    return _capture_gate_frame_rtsp(channel, dvr_ip)
+                return None
 
             if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+                recorder_auth.note_success(dvr_ip)
                 img_array = np.frombuffer(resp.content, dtype=np.uint8)
                 frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
                 return frame
