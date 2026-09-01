@@ -47,6 +47,8 @@ class LockedRecorderHoldTests(unittest.IsolatedAsyncioTestCase):
         main._auth_refused_since_ist.clear()
         main._rtsp_credentials_worked.clear()
         main._rtsp_attempts_while_refused.clear()
+        main._isapi_last_success.clear()
+        main._channel_auth_cooldowns.clear()
 
     async def test_the_pause_does_not_expire_on_a_timer(self):
         main._mark_isapi_auth_rejected(DVR)

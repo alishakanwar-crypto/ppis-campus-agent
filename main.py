@@ -737,6 +737,19 @@ _rtsp_attempts_while_refused: dict[tuple[str, str], int] = {}
 _RTSP_ATTEMPTS_WHILE_REFUSED = max(
     1, int(os.environ.get("RTSP_ATTEMPTS_WHILE_REFUSED", "3"))
 )
+# A login that just served twenty classrooms cannot be wrong for the twenty
+# first: when a recorder answered us moments ago, a 401 on one channel is that
+# channel being unusable, not our credentials — so only that channel rests.
+_AUTH_REFUSAL_TRUST_SECONDS = max(
+    0.0, float(os.environ.get("ISAPI_AUTH_REFUSAL_TRUST_SECONDS", "900"))
+)
+_CHANNEL_AUTH_COOLDOWN_SECONDS = max(
+    60.0, float(os.environ.get("ISAPI_CHANNEL_AUTH_COOLDOWN_SECONDS", "1800"))
+)
+# ip -> when ISAPI last handed us a picture, so a refusal can be judged
+_isapi_last_success: dict[str, float] = {}
+# (ip, channel) -> when that channel may be asked for a picture again
+_channel_auth_cooldowns: dict[tuple[str, int], float] = {}
 
 
 class _DvrAuthRejected(Exception):
@@ -780,8 +793,45 @@ def _credentials_refused(dvr: dict) -> bool:
     return False
 
 
-def _mark_isapi_auth_rejected(dvr: dict | str) -> None:
+def _isapi_recently_worked(ip: str) -> bool:
+    """Whether this recorder handed us a picture recently enough to be trusted."""
+    last = _isapi_last_success.get(ip)
+    if last is None:
+        return False
+    return (time.monotonic() - last) <= _AUTH_REFUSAL_TRUST_SECONDS
+
+
+def _channel_auth_refused(ip: str, channel: int) -> bool:
+    """True while this one channel is resting after refusing our login."""
+    until = _channel_auth_cooldowns.get((ip, channel))
+    if until is None:
+        return False
+    if until <= time.monotonic():
+        _channel_auth_cooldowns.pop((ip, channel), None)
+        return False
+    return True
+
+
+def _mark_channel_auth_refused(ip: str, channel: int) -> None:
+    _channel_auth_cooldowns[(ip, channel)] = (
+        time.monotonic() + _CHANNEL_AUTH_COOLDOWN_SECONDS
+    )
+    logger.warning(
+        "%s ch%d refused our login although the recorder is serving other "
+        "channels; resting this channel for %.0fs instead of pausing %s",
+        ip, channel, _CHANNEL_AUTH_COOLDOWN_SECONDS, ip,
+    )
+
+
+def _mark_isapi_auth_rejected(
+    dvr: dict | str, channel: int | None = None
+) -> None:
     ip = dvr["ip"] if isinstance(dvr, dict) else dvr
+    if channel is not None and _isapi_recently_worked(ip):
+        # Condemning the whole recorder here is what took DVR 4's 21 working
+        # rooms dark because five unused channels answered 401.
+        _mark_channel_auth_refused(ip, channel)
+        return
     already_refused = ip in _refused_credentials
     _isapi_cooldowns[ip] = (None, "credentials refused")
     _isapi_consecutive_timeouts.pop(ip, None)
@@ -1417,7 +1467,17 @@ async def capture_snapshot(
         # rejected attempt is what keeps the lockout alive.
         if cooldown_reason == "credentials refused":
             skip_isapi = True
-        if cooldown_reason:
+        if not cooldown_reason and _channel_auth_refused(ip, channel):
+            # This one channel refuses us while its recorder serves others.
+            skip_isapi = True
+            _last_capture_error = (
+                f"{ip} ch{channel}: channel refused our login"
+            )
+            logger.info(
+                "%s ch%d: channel is resting after refusing our login, "
+                "using RTSP", ip, channel,
+            )
+        elif cooldown_reason:
             logger.info(
                 "%s ch%d: recorder is %s, %s",
                 ip, channel, cooldown_reason,
@@ -1464,6 +1524,8 @@ async def capture_snapshot(
                         )
                         _last_capture_error = ""
                         metrics["outcome"] = "success"
+                        _isapi_last_success[ip] = time.monotonic()
+                        _channel_auth_cooldowns.pop((ip, channel), None)
                         _clear_isapi_failures(ip)
                         return snapshot
                     _last_capture_error = f"{ip} ch{channel}: ISAPI capture failed"
@@ -1481,7 +1543,7 @@ async def capture_snapshot(
                     )
                     metrics["exception"] = type(exc).__name__
                     _last_capture_error = f"{ip} ch{channel}: {exc}"
-                    _mark_isapi_auth_rejected(dvr)
+                    _mark_isapi_auth_rejected(dvr, channel)
                     break
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
                     metrics["attempt_elapsed"].append(
@@ -1668,6 +1730,7 @@ async def test_dvr_connection(dvr: dict) -> dict:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, auth=httpx.DigestAuth(user, pwd))
             if resp.status_code == 200:
+                _isapi_last_success[ip] = time.monotonic()
                 _clear_isapi_failures(ip)
                 return {"status": "connected", "ip": ip, "response": resp.text[:500]}
             elif resp.status_code == 401:

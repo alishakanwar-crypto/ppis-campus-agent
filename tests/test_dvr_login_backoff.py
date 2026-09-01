@@ -52,6 +52,8 @@ class DvrLoginBackoffTests(unittest.IsolatedAsyncioTestCase):
         main._auth_refused_since_ist.clear()
         main._rtsp_credentials_worked.clear()
         main._rtsp_attempts_while_refused.clear()
+        main._isapi_last_success.clear()
+        main._channel_auth_cooldowns.clear()
 
     async def test_refused_login_gives_up_at_once_and_falls_back_to_rtsp(self):
         client = RecordingClient(lambda url: Response(401))
