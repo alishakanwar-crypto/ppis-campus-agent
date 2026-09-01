@@ -886,6 +886,54 @@ def dvr_snapshot_health() -> list[dict]:
     return health
 
 
+# The first frames a recorder's video stream decodes are usually grey filler
+# while the decoder waits for a keyframe, so a picture is only worth sending
+# once it actually carries detail.
+_RTSP_MIN_FRAME_STDDEV = max(
+    0.0, float(os.environ.get("RTSP_MIN_FRAME_STDDEV", "6"))
+)
+_RTSP_MAX_FRAMES_READ = max(
+    1, int(os.environ.get("RTSP_MAX_FRAMES_READ", "30"))
+)
+_RTSP_FRAME_SEARCH_SECONDS = max(
+    0.5, float(os.environ.get("RTSP_FRAME_SEARCH_SECONDS", "5"))
+)
+
+
+def _frame_carries_detail(frame) -> bool:
+    """False for the flat grey frame a decoder emits before its first keyframe."""
+    try:
+        return float(frame.std()) >= _RTSP_MIN_FRAME_STDDEV
+    except Exception:
+        return True
+
+
+def _read_detailed_frame(cap, ip: str, channel: int):
+    """Read past the decoder's grey filler frames to a real classroom picture."""
+    deadline = time.monotonic() + _RTSP_FRAME_SEARCH_SECONDS
+    blank = 0
+    for _ in range(_RTSP_MAX_FRAMES_READ):
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            break
+        if _frame_carries_detail(frame):
+            if blank:
+                logger.info(
+                    "[RTSP] %s ch%d: skipped %d blank frame(s) before a real "
+                    "picture", ip, channel, blank,
+                )
+            return frame
+        blank += 1
+        if time.monotonic() >= deadline:
+            break
+    if blank:
+        logger.warning(
+            "[RTSP] %s ch%d: every one of %d frame(s) was blank, refusing to "
+            "send a grey photo", ip, channel, blank,
+        )
+    return None
+
+
 def _warn_rtsp_timeouts_unsupported() -> None:
     global _rtsp_timeout_warning_logged
     with _rtsp_timeout_warning_lock:
@@ -939,9 +987,11 @@ def _capture_frame_rtsp(ip: str, port: int, user: str, pwd: str,
         if not cap.isOpened():
             logger.warning("[RTSP] Failed to open %s ch%d", ip, channel)
             return None
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            logger.warning("[RTSP] Failed to read frame from %s ch%d", ip, channel)
+        frame = _read_detailed_frame(cap, ip, channel)
+        if frame is None:
+            logger.warning(
+                "[RTSP] No usable frame from %s ch%d", ip, channel
+            )
             return None
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
         if ok:
@@ -1586,6 +1636,8 @@ async def capture_snapshot(
                     "rtsp": bool(metrics["rtsp"]),
                     "recorder": ip,
                     "channel": channel,
+                    "outcome": str(metrics["outcome"]),
+                    "exception": str(metrics["exception"]),
                 })
 
 
