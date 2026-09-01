@@ -1054,7 +1054,7 @@ async def _capture_snapshot_once(
         candidates.sort(key=lambda candidate: candidate[1] in slow_doors)
     seen: set[tuple[str, int]] = set()
     auth_rejections = 0
-    other_replies = 0
+    usable_replies = 0
     last_rejection = 0
     wanted_pixels = _LIVE_SNAPSHOT_WIDTH * _LIVE_SNAPSHOT_HEIGHT
     known_best = _live_capture_best_pixels.get(key, 0)
@@ -1134,7 +1134,10 @@ async def _capture_snapshot_once(
             auth_rejections += 1
             last_rejection = response.status_code
             continue
-        other_replies += 1
+        if response.status_code < 400:
+            # Only a door that could have served a picture proves the recorder
+            # still accepts us; a 404 door must not hide a login lockout.
+            usable_replies += 1
         if (
             response.status_code == 200
             and response.headers.get("content-type", "").startswith("image")
@@ -1161,7 +1164,7 @@ async def _capture_snapshot_once(
     if best is not None:
         return keep(*best)
     if (
-        not other_replies
+        not usable_replies
         and auth_rejections >= _AUTH_REJECTIONS_BEFORE_GIVING_UP
     ):
         # Every door was locked, so the credentials are wrong for this

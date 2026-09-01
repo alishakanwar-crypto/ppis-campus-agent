@@ -77,6 +77,26 @@ class DvrLoginBackoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot, b"jpeg")
         self.assertEqual(main._isapi_cooldown("192.0.2.90"), "")
 
+    async def test_a_missing_channel_does_not_hide_a_locked_recorder(self):
+        """DVR 2's lockout looked like a plain capture failure because one of
+        its doors answers 404, so the recorder never went on fallback."""
+        def reply(url):
+            if "/502/picture" in url:
+                return Response(404, content_type="text/html")
+            return Response(401)
+
+        client = RecordingClient(reply)
+        with patch.object(main, "_get_live_dvr_client", return_value=client), \
+                patch.object(
+                    main, "_capture_snapshot_rtsp", return_value=b"rtsp-frame"
+                ):
+            snapshot = await main.capture_snapshot(DVR, 5)
+
+        self.assertEqual(snapshot, b"rtsp-frame")
+        self.assertEqual(
+            main._isapi_cooldown("192.0.2.90"), "credentials refused"
+        )
+
     async def test_a_recorder_on_cooldown_is_not_asked_again(self):
         client = RecordingClient(lambda url: Response(401))
         with patch.object(main, "_get_live_dvr_client", return_value=client), \
