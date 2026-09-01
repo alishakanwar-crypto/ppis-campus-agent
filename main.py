@@ -620,6 +620,18 @@ _LIVE_CAPTURE_PROBE_PICTURES = max(
 _LIVE_CAPTURE_PROBE_BUDGET_SECONDS = max(
     0.0, float(os.environ.get("SNAPSHOT_PROBE_BUDGET_SECONDS", "2"))
 )
+# Longest a single door (one URL with one auth scheme) may take before it is
+# abandoned for the next one. A recorder that never answers the full-size
+# request otherwise eats the whole attempt, and every retry knocks on the same
+# silent door again.
+_LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS = max(
+    0.5, float(os.environ.get("SNAPSHOT_DOOR_TIMEOUT_SECONDS", "5"))
+)
+# How long a door that hung is tried last for.
+_LIVE_CAPTURE_SLOW_DOOR_TTL_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_SLOW_DOOR_TTL_SECONDS", "300"))
+)
+_live_capture_slow_doors: dict[tuple[str, int], dict[int, float]] = {}
 # A parent's photo is worth the bytes: WhatsApp accepts images up to 5 MB, so
 # only squeeze quality when the picture is far bigger than that.
 _LIVE_SNAPSHOT_MAX_BYTES = max(
@@ -634,6 +646,11 @@ _live_request_deadline: contextvars.ContextVar[float | None] = (
 )
 _live_request_classroom: contextvars.ContextVar[str] = contextvars.ContextVar(
     "live_request_classroom", default=""
+)
+# Where a live capture writes its own timing, so the cloud can see which stage
+# of a parent's request was slow without reading the campus PC's log.
+_live_capture_report: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "live_capture_report", default=None
 )
 
 
@@ -1019,6 +1036,21 @@ async def _capture_snapshot_once(
         candidate for candidate in candidates
         if candidate[1] <= 1 or candidate[0] == "digest"
     ]
+    slow_doors = _live_capture_slow_doors.get(key)
+    if slow_doors:
+        fresh = {
+            variant: hung_at for variant, hung_at in slow_doors.items()
+            if time.monotonic() - hung_at <= _LIVE_CAPTURE_SLOW_DOOR_TTL_SECONDS
+        }
+        if fresh:
+            _live_capture_slow_doors[key] = fresh
+        else:
+            _live_capture_slow_doors.pop(key, None)
+        slow_doors = fresh
+    if slow_doors:
+        # A door that hung goes last: the parent's photo is behind whichever
+        # door still answers, not behind the one that never does.
+        candidates.sort(key=lambda candidate: candidate[1] in slow_doors)
     seen: set[tuple[str, int]] = set()
     auth_rejections = 0
     other_replies = 0
@@ -1056,22 +1088,35 @@ async def _capture_snapshot_once(
             continue
         seen.add((scheme, variant))
         auth = digest_auth if scheme == "digest" else httpx.BasicAuth(user, pwd)
+        door_budget = _LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS
         if best is not None:
             # Probing for something sharper must never cost the picture we have.
-            try:
-                response = await asyncio.wait_for(
-                    client.get(urls[variant], auth=auth),
-                    timeout=max(
-                        0.1,
-                        _LIVE_CAPTURE_PROBE_BUDGET_SECONDS
-                        - (time.monotonic() - started),
-                    ),
-                )
-            except (asyncio.TimeoutError, httpx.HTTPError):
+            door_budget = min(
+                door_budget,
+                _LIVE_CAPTURE_PROBE_BUDGET_SECONDS - (time.monotonic() - started),
+            )
+        try:
+            response = await asyncio.wait_for(
+                client.get(urls[variant], auth=auth),
+                timeout=max(0.1, door_budget),
+            )
+        except (asyncio.TimeoutError, httpx.ReadTimeout):
+            if best is not None:
                 return keep(*best)
-        else:
-            response = await client.get(urls[variant], auth=auth)
+            _live_capture_slow_doors.setdefault(key, {})[variant] = time.monotonic()
+            if metrics is not None:
+                metrics["door_timeouts"] = metrics.get("door_timeouts", 0) + 1
+            logger.warning(
+                "%s ch%d: no answer within %.1fs from %s, trying the next door",
+                ip, channel, door_budget, urls[variant],
+            )
+            continue
+        except httpx.HTTPError:
+            if best is not None:
+                return keep(*best)
+            raise
         if metrics is not None:
+            metrics["door"] = variant
             metrics["round_trips"] = (
                 metrics.get("round_trips", 0) + _response_round_trips(response)
             )
@@ -1086,6 +1131,8 @@ async def _capture_snapshot_once(
         ):
             pixels = _jpeg_pixels(response.content)
             sized_variants.add(variant)
+            if key in _live_capture_slow_doors:
+                _live_capture_slow_doors[key].pop(variant, None)
             if best is None or pixels > best[3]:
                 best = (scheme, variant, response.content, pixels)
             pictures += 1
@@ -1152,6 +1199,8 @@ async def capture_snapshot(
         "rtsp": False,
         "outcome": "failed",
         "exception": "",
+        "door_timeouts": 0,
+        "door": -1,
     }
     try:
         retries = _SNAPSHOT_BACKGROUND_RETRIES if background else _SNAPSHOT_RETRIES
@@ -1226,6 +1275,8 @@ async def capture_snapshot(
                         _clear_isapi_failures(ip)
                         return snapshot
                     _last_capture_error = f"{ip} ch{channel}: ISAPI capture failed"
+                    if metrics["door_timeouts"]:
+                        isapi_timed_out = True
                     if attempt < attempts - 1:
                         await asyncio.sleep(min(
                             _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
@@ -1360,20 +1411,38 @@ async def capture_snapshot(
     finally:
         await limiter.release(not background)
         if not background:
+            elapsed = time.monotonic() - capture_started
             logger.info(
-                "[LIVE] snapshot classroom=%s ip=%s channel=%d "
+                "[LIVE] snapshot classroom=%s ip=%s channel=%d elapsed=%.2fs "
                 "limiter_wait=%.3fs http_round_trips=%d attempt_elapsed=%s "
-                "rtsp=%s outcome=%s exception=%s",
+                "door=%s door_timeouts=%d rtsp=%s outcome=%s exception=%s",
                 classroom or _live_request_classroom.get() or "-",
                 ip,
                 channel,
+                elapsed,
                 limiter_wait,
                 metrics["round_trips"],
                 metrics["attempt_elapsed"],
+                metrics["door"],
+                metrics["door_timeouts"],
                 metrics["rtsp"],
                 metrics["outcome"],
                 metrics["exception"] or "-",
             )
+            sink = _live_capture_report.get()
+            if sink is not None:
+                # The campus PC's log is not reachable from the cloud, so the
+                # timing travels with the photo instead.
+                sink.update({
+                    "seconds": round(elapsed, 2),
+                    "slot_wait_seconds": round(limiter_wait, 2),
+                    "attempt_seconds": list(metrics["attempt_elapsed"]),
+                    "door": metrics["door"],
+                    "door_timeouts": metrics["door_timeouts"],
+                    "rtsp": bool(metrics["rtsp"]),
+                    "recorder": ip,
+                    "channel": channel,
+                })
 
 
 async def test_dvr_connection(dvr: dict) -> dict:
@@ -2070,8 +2139,10 @@ async def _repair_colour_if_night_mode(
 async def _capture_classroom_camera(
     classroom: str,
     camera: tuple[dict, int, str],
-) -> tuple[bytes, str, str] | None:
+) -> tuple[bytes, str, str, dict] | None:
     dvr, channel, desc = camera
+    report: dict = {}
+    _live_capture_report.set(report)
     try:
         request_deadline = _live_request_deadline.get()
         timeout = _SNAPSHOT_CAMERA_TIMEOUT_SECONDS
@@ -2106,7 +2177,7 @@ async def _capture_classroom_camera(
     with open(filepath, "wb") as file:
         file.write(snapshot)
     logger.info(f"Snapshot captured: {filename} ({len(snapshot)} bytes) - {desc}")
-    return snapshot, filename, desc
+    return snapshot, filename, desc, report
 
 
 async def handle_snapshot_request(ws, classroom: str, request_id: str):
@@ -2164,7 +2235,7 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         if result is None:
             continue
 
-        raw_data, filename, desc = result
+        raw_data, filename, desc, capture = result
         compressed = compress_jpeg(
             raw_data,
             max_bytes=_LIVE_SNAPSHOT_MAX_BYTES,
@@ -2184,6 +2255,7 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
             "width": width,
             "height": height,
             "description": desc,
+            "capture": capture,
         }))
         sent_count += 1
         logger.info(
