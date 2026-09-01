@@ -51,6 +51,25 @@ class RestartKillsOldProcessesTests(unittest.TestCase):
         for label in ("Campus Agent", "TrueFace Poller", "Gate Counter"):
             self.assertIn(f"$agent = '{label}'", script)
 
+    def test_the_start_time_is_read_as_a_date_not_a_dmtf_string(self):
+        """Get-CimInstance already returns CreationDate as a DateTime, so the
+        WMI DMTF converter threw on every process and printed only errors."""
+        script = _read("restart_all.bat")
+        self.assertNotIn("ManagementDateTimeConverter", script)
+        self.assertIn("$_.CreationDate.ToString('HH:mm:ss')", script)
+
+    def test_powershell_errors_cannot_become_the_missing_agent_list(self):
+        script = _read("restart_all.bat")
+        for name, label in (
+            ("main.py", "Campus Agent"),
+            ("trueface_poller", "TrueFace Poller"),
+            ("gate_counter", "Gate Counter"),
+        ):
+            self.assertIn(
+                f'if "%%a"=="{name}" set "MISSING=!MISSING! {label}"', script
+            )
+        self.assertIn("2^>nul'", script)
+
     def test_a_surviving_process_is_not_reported_as_success(self):
         script = _read("restart_all.bat")
         stale = script.index("still run the OLD code")
