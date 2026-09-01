@@ -2452,12 +2452,15 @@ class AttendanceEngine:
             _RTSP_FALLBACK_IPS,
             _acquire_dvr_capture,
             _capture_snapshot_rtsp,
+            _channel_auth_refused,
             _clear_isapi_failures,
             _credentials_refused,
             _exception_text,
             _isapi_cooldown,
             _mark_isapi_auth_rejected,
             _mark_isapi_timeout,
+            _note_auth_attempt,
+            _note_isapi_success,
             _note_rtsp_attempt_while_refused,
             _note_rtsp_success,
             _rtsp_worth_trying,
@@ -2473,6 +2476,10 @@ class AttendanceEngine:
         if _credentials_refused(dvr) and not _rtsp_worth_trying(dvr):
             return None
         on_cooldown = bool(_isapi_cooldown(ip))
+        # One camera that refuses us must not drag its recorder down, and the
+        # sweep must not keep knocking on it either.
+        if not on_cooldown and _channel_auth_refused(ip, channel):
+            on_cooldown = True
         limiter = await _acquire_dvr_capture(ip, background=True)
         started = time.monotonic()
         try:
@@ -2489,6 +2496,9 @@ class AttendanceEngine:
                     _note_rtsp_success(dvr)
                 return frame
             client = self._get_dvr_client(dvr)
+            # Everything below presents the recorder's login, including the
+            # resolution probe, so the unlock watch must see it as a touch.
+            _note_auth_attempt(ip)
             deadline = started + _SNAPSHOT_BACKGROUND_CAMERA_TIMEOUT_SECONDS
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2529,11 +2539,14 @@ class AttendanceEngine:
                     if resp.status_code == 200 and resp.headers.get(
                             "content-type", "").startswith("image"):
                         self._camera_errors.pop(cam_key, None)
+                        _note_isapi_success(ip)
                         _clear_isapi_failures(ip)
                         return resp.content
                     self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1
                     if resp.status_code in (401, 403):
-                        _mark_isapi_auth_rejected(dvr)
+                        # Naming the channel keeps a single dead camera from
+                        # pausing a recorder that is serving the sweep.
+                        _mark_isapi_auth_rejected(dvr, channel)
                         break
                 except Exception as exc:
                     self._camera_errors[cam_key] = self._camera_errors.get(cam_key, 0) + 1

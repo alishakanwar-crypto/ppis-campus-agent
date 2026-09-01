@@ -176,9 +176,10 @@ class DvrLoginBackoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(health), 1)
         self.assertEqual(health[0]["ip"], "192.0.2.90")
         self.assertEqual(health[0]["reason"], "credentials refused")
-        # Held until the password changes rather than expiring on a timer.
+        # Held until the unlock watch retries it, not on a capture timer.
         self.assertIsNone(health[0]["seconds_remaining"])
-        self.assertTrue(health[0]["held_until_password_change"])
+        self.assertFalse(health[0]["held_until_password_change"])
+        self.assertGreater(health[0]["retry_in_seconds"], 0)
 
     async def test_background_capture_uses_rtsp_while_isapi_is_paused(self):
         main._mark_isapi_auth_rejected(DVR)
