@@ -14,12 +14,14 @@ is swallowed: a recorder must never go dark because bookkeeping broke.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 logger = logging.getLogger("ppis-agent")
@@ -45,6 +47,62 @@ def credential_key(username: str, password: str) -> str:
     """Fingerprint of a recorder's login, never the login itself."""
     raw = f"{username or ''}:{password or ''}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+_LOCK_WAIT_SECONDS = 2.0
+_LOCK_STALE_SECONDS = 30.0
+
+
+def _lock_path() -> Path:
+    return Path(f"{STATE_PATH}.lock")
+
+
+def _lock_age(path: Path) -> float:
+    try:
+        return max(0.0, time.time() - path.stat().st_mtime)
+    except OSError:
+        return 0.0
+
+
+@contextlib.contextmanager
+def _exclusive() -> Iterator[None]:
+    """Hold the state file against the other campus processes while writing.
+
+    Without this, two processes that both read before either writes let the
+    later write erase the other's record — and a recorder whose refusal is
+    forgotten gets knocked on again, which is what keeps a lock alive. An
+    exclusive create is used rather than locking an open handle so this behaves
+    the same on the campus PC's Windows.
+    """
+    path = _lock_path()
+    deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+    handle = None
+    while handle is None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if (
+                _lock_age(path) > _LOCK_STALE_SECONDS
+                or time.monotonic() > deadline
+            ):
+                # A process killed mid-write must not hold every recorder's
+                # bookkeeping hostage.
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                continue
+            time.sleep(0.005)
+        except OSError:
+            # Bookkeeping must never stop a camera from being captured.
+            yield
+            return
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(handle)
+        with contextlib.suppress(OSError):
+            path.unlink()
 
 
 def _read() -> dict:
@@ -79,12 +137,13 @@ def _entry(ip: str) -> dict:
 
 
 def _update(ip: str, **fields) -> dict:
-    state = _read()
-    entry = state.get(ip)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    entry.update(fields)
-    state[ip] = entry
-    _write(state)
+    with _exclusive():
+        state = _read()
+        entry = state.get(ip)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        entry.update(fields)
+        state[ip] = entry
+        _write(state)
     return entry
 
 
@@ -104,9 +163,10 @@ def note_success(ip: str) -> None:
     ):
         # Every gate frame succeeds; rewriting the file each time is waste.
         return
-    state = _read()
-    state[ip] = {"last_success": now, "last_attempt": now}
-    _write(state)
+    with _exclusive():
+        state = _read()
+        state[ip] = {"last_success": now, "last_attempt": now}
+        _write(state)
 
 
 def seconds_since_success(ip: str) -> float | None:
@@ -158,15 +218,16 @@ def note_probe_failed(ip: str) -> float:
 
 def clear(ip: str) -> None:
     """Forget a refusal without claiming the recorder just served us."""
-    state = _read()
-    entry = state.get(ip)
-    if not isinstance(entry, dict) or not entry.get("refused_at"):
-        return
-    for field in ("refused_at", "credential_key", "quiet_seconds",
-                  "next_probe_at"):
-        entry.pop(field, None)
-    state[ip] = entry
-    _write(state)
+    with _exclusive():
+        state = _read()
+        entry = state.get(ip)
+        if not isinstance(entry, dict) or not entry.get("refused_at"):
+            return
+        for field in ("refused_at", "credential_key", "quiet_seconds",
+                      "next_probe_at"):
+            entry.pop(field, None)
+        state[ip] = entry
+        _write(state)
 
 
 def is_refused(ip: str, credential_key: str = "") -> bool:

@@ -936,6 +936,13 @@ def _credentials_refused(dvr: dict) -> bool:
         if recorder_auth.is_refused(ip, _dvr_credential_key(dvr)):
             _refused_credentials[ip] = _dvr_credential_key(dvr)
             _isapi_cooldowns.setdefault(ip, (None, "credentials refused"))
+            # Take the shared quiet window with it, or this process would have
+            # no probe scheduled and the recorder would stay dark for good.
+            _auth_unlock_quiet[ip] = recorder_auth.quiet_seconds(ip)
+            due_in = recorder_auth.seconds_until_probe(ip)
+            _auth_unlock_next_probe[ip] = time.monotonic() + (
+                _auth_unlock_quiet[ip] if due_in is None else due_in
+            )
             return True
         return False
     if refused == _dvr_credential_key(dvr):

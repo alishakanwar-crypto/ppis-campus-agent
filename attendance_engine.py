@@ -1881,14 +1881,7 @@ class AttendanceEngine:
                 pass
 
         def _schedule(coro):
-            if loop is None:
-                logger.error("No event loop available for async task")
-                return
-            try:
-                asyncio.get_running_loop()
-                asyncio.create_task(coro)
-            except RuntimeError:
-                asyncio.run_coroutine_threadsafe(coro, loop)
+            self.schedule_background(coro, loop)
 
         # Sync attendance to cloud dashboard
         _schedule(self._sync_attendance_to_cloud(result, phone or ""))
@@ -2185,6 +2178,38 @@ class AttendanceEngine:
         self._work_in_flight += 1
         try:
             await self._sync_attendance_to_cloud_inner(record, parent_phones)
+        finally:
+            self._work_in_flight -= 1
+
+    def schedule_background(self, coro, loop) -> None:
+        """Run an attendance job in the background, counted until it finishes.
+
+        The count starts here rather than when the coroutine begins running: an
+        auto-update restarting in that gap loses a parent's notification
+        outright, and nothing would ever report it as missing.
+        """
+        if loop is None:
+            logger.error("No event loop available for async task")
+            coro.close()
+            return
+        self._work_in_flight += 1
+        tracked = self._tracked(coro)
+        try:
+            asyncio.get_running_loop()
+            task = asyncio.create_task(tracked)
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except RuntimeError:
+            try:
+                asyncio.run_coroutine_threadsafe(tracked, loop)
+            except RuntimeError:
+                self._work_in_flight -= 1
+                tracked.close()
+                logger.error("Event loop closed; attendance task dropped")
+
+    async def _tracked(self, coro):
+        try:
+            await coro
         finally:
             self._work_in_flight -= 1
 
