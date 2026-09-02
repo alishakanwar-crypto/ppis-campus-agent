@@ -130,9 +130,12 @@ from mood_detector import MoodDetector
 from teacher_sighting import TeacherSightingTracker
 
 try:
-    from PIL import Image
+    from PIL import Image, UnidentifiedImageError
 except ImportError:
     Image = None
+
+    class UnidentifiedImageError(Exception):
+        pass
 
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _LOG_FILE = Path(__file__).parent / "campus_agent.log"
@@ -440,6 +443,35 @@ def _jpeg_size(data: bytes) -> tuple[int, int]:
             return img.width, img.height
     except Exception:
         return 0, 0
+
+
+def _jpeg_is_complete(data: bytes) -> bool:
+    """False when only part of a picture arrived.
+
+    A recorder sometimes closes the connection mid-picture. The bytes still
+    open like a JPEG and their header still gives a size, so nothing noticed
+    and the parent received a photo whose lower half was smeared streaks.
+    Only a picture that decodes end to end is worth sending.
+    """
+    if not data:
+        return False
+    if Image is None:
+        return True
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            fmt = img.format
+            img.load()
+    except UnidentifiedImageError:
+        # Not a picture at all: that is somebody else's judgement to make,
+        # and the capture path already treats it as a failed door.
+        return True
+    except Exception:
+        return False
+    if fmt != "JPEG":
+        return True
+    # Pillow can decode some cut-short pictures without complaining; a JPEG
+    # that never reached its end marker is still only part of one.
+    return data.rstrip(b"\r\n").endswith(b"\xff\xd9")
 
 
 def _jpeg_pixels(data: bytes) -> int:
@@ -1693,6 +1725,15 @@ async def _capture_snapshot_once(
             response.status_code == 200
             and response.headers.get("content-type", "").startswith("image")
         ):
+            if not _jpeg_is_complete(response.content):
+                # Half a picture is worse than none: it reaches the parent as
+                # smeared streaks. Try the next door for a whole one.
+                logger.warning(
+                    "%s ch%d: %s served only part of a picture (%d bytes), "
+                    "trying the next door",
+                    ip, channel, urls[variant], len(response.content),
+                )
+                continue
             pixels = _jpeg_pixels(response.content)
             sized_variants.add(variant)
             if key in _live_capture_slow_doors:
@@ -3037,6 +3078,12 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
                 max_bytes=_LIVE_SNAPSHOT_MAX_BYTES,
                 quality_start=_LIVE_SNAPSHOT_JPEG_QUALITY,
             )
+            if not _jpeg_is_complete(compressed):
+                logger.warning(
+                    "Refusing to send a half-decoded photo of %s (%s, %d "
+                    "bytes)", classroom, filename, len(compressed),
+                )
+                continue
             b64 = base64.b64encode(compressed).decode("ascii")
             width, height = _jpeg_size(compressed)
             await ws.send(json.dumps({
