@@ -3210,10 +3210,8 @@ async def _cloud_link_watchdog():
         try:
             if not _restart_websocket_task_if_needed():
                 await _repair_cloud_link_if_needed()
-        except Exception as exc:
-            logger.exception(
-                "Cloud link watchdog failed: %s", _exception_text(exc)
-            )
+        except Exception:
+            logger.exception("Cloud link watchdog failed")
 
 
 async def _health_watchdog():
