@@ -3,6 +3,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+from fake_camera import JPEG
+
 import main
 
 
@@ -33,7 +35,7 @@ class SecondAngleRetryTests(unittest.IsolatedAsyncioTestCase):
             attempts[channel] += 1
             if channel == 26 and attempts[channel] == 1:
                 return None
-            return b"jpeg", f"{desc}.jpg", desc, {}
+            return JPEG, f"{desc}.jpg", desc, {}
 
         ws = FakeWs()
         with patch.object(
@@ -59,7 +61,7 @@ class SecondAngleRetryTests(unittest.IsolatedAsyncioTestCase):
             attempts[channel] += 1
             if channel == 26:
                 return None
-            return b"jpeg", f"{desc}.jpg", desc, {}
+            return JPEG, f"{desc}.jpg", desc, {}
 
         ws = FakeWs()
         with patch.object(
@@ -78,7 +80,7 @@ class SecondAngleRetryTests(unittest.IsolatedAsyncioTestCase):
             _, channel, desc = camera
             if channel == 26:
                 raise RuntimeError("stream exploded")
-            return b"jpeg", f"{desc}.jpg", desc, {}
+            return JPEG, f"{desc}.jpg", desc, {}
 
         ws = FakeWs()
         with patch.object(

@@ -2,9 +2,11 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
+from fake_camera import JPEG
+
 import main
 
-PICTURE = b"\xff\xd8jpeg\xff\xd9"
+PICTURE = JPEG
 
 
 class Response:
