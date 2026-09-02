@@ -82,6 +82,41 @@ class PendingUpdateTests(unittest.TestCase):
         self.assertEqual(state["origin_commit"], "abc1234")
 
 
+class PullMergedCodeTests(unittest.TestCase):
+    def test_takes_the_merged_code_and_confirms_head_moved(self):
+        with patch.object(
+            main.subprocess, "run", return_value=_Fetch()
+        ) as run, patch.object(main, "_git", side_effect=["old1234", "new1234"]):
+            self.assertEqual(main._pull_merged_code("new1234"), "")
+
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["git", "fetch", "origin", "main"],
+                ["git", "reset", "--hard", "FETCH_HEAD"],
+            ],
+        )
+
+    def test_a_checkout_that_did_not_move_is_reported_as_a_failure(self):
+        with patch.object(main.subprocess, "run", return_value=_Fetch()), \
+                patch.object(main, "_git", side_effect=["old1234", "old1234"]):
+            self.assertIn("still on old1234", main._pull_merged_code("new1234"))
+
+    def test_a_refused_reset_is_reported_and_stops_the_update(self):
+        with patch.object(
+            main.subprocess,
+            "run",
+            side_effect=[_Fetch(), _Fetch(1, "error: Your local changes")],
+        ), patch.object(main, "_git", return_value="old1234"):
+            self.assertIn("local changes", main._pull_merged_code("new1234"))
+
+    def test_a_crashed_git_is_reported_instead_of_raising(self):
+        with patch.object(
+            main.subprocess, "run", side_effect=OSError("git missing")
+        ), patch.object(main, "_git", return_value="old1234"):
+            self.assertIn("git missing", main._pull_merged_code("new1234"))
+
+
 class AutoUpdateLoopTests(unittest.IsolatedAsyncioTestCase):
     async def _run_one_pass(self):
         """Run the loop until it either exits the process or sleeps twice."""
@@ -102,10 +137,26 @@ class AutoUpdateLoopTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
                 patch.object(main, "_live_requests_in_flight", 0), \
                 patch.object(main, "_pending_update_commit", return_value="new1234"), \
+                patch.object(main, "_pull_merged_code", return_value="") as pull, \
                 patch.object(main.os, "_exit") as exit_now, \
                 patch.object(main.logging, "shutdown"):
             await self._run_one_pass()
+        pull.assert_called_once_with("new1234")
         exit_now.assert_called_once_with(0)
+
+    async def test_no_restart_when_the_code_did_not_actually_move(self):
+        """Restarting without the fix is a restart every ten minutes, nothing more."""
+        with patch.object(main, "_STARTED_BY_WRAPPER", True), \
+                patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
+                patch.object(main, "_live_requests_in_flight", 0), \
+                patch.object(main, "_pending_update_commit", return_value="new1234"), \
+                patch.object(
+                    main, "_pull_merged_code", return_value="still on old1234"
+                ), \
+                patch.object(main.os, "_exit") as exit_now:
+            await self._run_one_pass()
+        exit_now.assert_not_called()
+        self.assertIn("still on old1234", main.auto_update_state()["last_error"])
 
     async def test_waits_while_a_parent_request_is_being_served(self):
         with patch.object(main, "_STARTED_BY_WRAPPER", True), \
