@@ -774,29 +774,32 @@ class AttendanceEngine:
         are included in every classroom camera scan (teachers walk
         through all classrooms, not just gates).
         """
-        self._grade_face_cache.clear()
-        self._teacher_faces_cache: dict = {}
+        grade_cache: dict = {}
+        teacher_cache: dict = {}
         for person_id, person_data in self.known_faces.items():
             if person_id.startswith(("TEACHER_", "PRINCIPAL_")):
-                self._teacher_faces_cache[person_id] = person_data
+                teacher_cache[person_id] = person_data
                 continue
             grade = _grade_from_person_id(person_id)
             if grade:
-                if grade not in self._grade_face_cache:
-                    self._grade_face_cache[grade] = {}
-                self._grade_face_cache[grade][person_id] = person_data
+                grade_cache.setdefault(grade, {})[person_id] = person_data
 
-        self._grade_face_cache_insightface.clear()
-        self._teacher_faces_cache_insightface: dict = {}
+        grade_cache_insightface: dict = {}
+        teacher_cache_insightface: dict = {}
         for person_id, person_data in self.known_faces_insightface.items():
             if person_id.startswith(("TEACHER_", "PRINCIPAL_")):
-                self._teacher_faces_cache_insightface[person_id] = person_data
+                teacher_cache_insightface[person_id] = person_data
                 continue
             grade = _grade_from_person_id(person_id)
             if grade:
-                if grade not in self._grade_face_cache_insightface:
-                    self._grade_face_cache_insightface[grade] = {}
-                self._grade_face_cache_insightface[grade][person_id] = person_data
+                grade_cache_insightface.setdefault(grade, {})[person_id] = person_data
+
+        # Swap the finished caches in, never clear-then-fill: a scan reading
+        # them while faces reload must see the old set, not an empty one.
+        self._grade_face_cache = grade_cache
+        self._teacher_faces_cache: dict = teacher_cache
+        self._grade_face_cache_insightface = grade_cache_insightface
+        self._teacher_faces_cache_insightface: dict = teacher_cache_insightface
 
         grades_with_faces = {g: len(v) for g, v in self._grade_face_cache.items()}
         logger.info(f"Grade face cache: {grades_with_faces}, "

@@ -54,6 +54,7 @@ class DvrLoginBackoffTests(unittest.IsolatedAsyncioTestCase):
         main._rtsp_attempts_while_refused.clear()
         main._isapi_last_success.clear()
         main._channel_auth_cooldowns.clear()
+        main._live_capture_silent_channels.clear()
 
     async def test_refused_login_gives_up_at_once_and_falls_back_to_rtsp(self):
         client = RecordingClient(lambda url: Response(401))
@@ -130,8 +131,8 @@ class DvrLoginBackoffTests(unittest.IsolatedAsyncioTestCase):
         client = TimingOutClient()
         with patch.object(main, "_get_live_dvr_client", return_value=client), \
                 patch.object(main, "_capture_snapshot_rtsp", return_value=None):
-            for _ in range(main._ISAPI_TIMEOUTS_BEFORE_BACKOFF):
-                await main.capture_snapshot(DVR, 8)
+            for channel in range(8, 8 + main._ISAPI_TIMEOUTS_BEFORE_BACKOFF):
+                await main.capture_snapshot(DVR, channel)
             requests_before = client.requests
             main._rtsp_cooldowns.clear()
             with patch.object(

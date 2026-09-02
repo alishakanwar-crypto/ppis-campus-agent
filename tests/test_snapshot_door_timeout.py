@@ -33,6 +33,7 @@ class SnapshotDoorTimeoutTests(unittest.IsolatedAsyncioTestCase):
         main._isapi_cooldowns.clear()
         main._isapi_consecutive_timeouts.clear()
         main._rtsp_cooldowns.clear()
+        main._live_capture_silent_channels.clear()
         self.dvr = {
             "ip": "192.0.2.70",
             "port": 80,
@@ -153,6 +154,7 @@ class LiveCaptureTelemetryTests(unittest.IsolatedAsyncioTestCase):
         main._live_capture_preferences.clear()
         main._live_capture_best_pixels.clear()
         main._live_capture_slow_doors.clear()
+        main._live_capture_silent_channels.clear()
 
     async def test_the_capture_timing_travels_with_the_photo(self):
         """The cloud cannot read the campus PC's log, so timing rides along."""
