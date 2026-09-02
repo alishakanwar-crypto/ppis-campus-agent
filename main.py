@@ -787,14 +787,63 @@ def _git(*args: str) -> str:
     return result.stdout.strip()
 
 
+# What the last update check saw, so the cloud can tell "nothing merged" from
+# "the campus PC cannot reach GitHub" without someone reading its log.
+_auto_update_state: dict[str, str] = {
+    "origin_commit": "",
+    "last_error": "",
+    "checked_at_ist": "",
+}
+
+
 def _pending_update_commit() -> str:
     """The commit on origin/main we are not running yet, '' when current."""
-    _git("fetch", "origin", "main")
+    try:
+        fetched = subprocess.run(
+            ["git", "fetch", "origin", "main"],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except Exception as exc:
+        _auto_update_state["last_error"] = _exception_text(exc)
+        logger.error(
+            "Cannot reach GitHub to check for merged fixes: %s",
+            _auto_update_state["last_error"],
+        )
+        return ""
+    finally:
+        _auto_update_state["checked_at_ist"] = datetime.now(_IST).strftime(
+            "%d-%m-%Y %H:%M:%S IST"
+        )
+    if fetched.returncode != 0:
+        # A stale origin/main looks exactly like being up to date, which is how
+        # merged fixes sat unused while the agent reported itself healthy.
+        error = (fetched.stderr or fetched.stdout).strip()[:200]
+        _auto_update_state["last_error"] = error or "git fetch failed"
+        logger.error(
+            "Cannot reach GitHub to check for merged fixes: %s",
+            _auto_update_state["last_error"],
+        )
+        return ""
+    _auto_update_state["last_error"] = ""
     remote = _git("rev-parse", "--short", "origin/main")
     local = _git("rev-parse", "--short", "HEAD")
+    _auto_update_state["origin_commit"] = remote
     if not remote or not local or remote == local:
         return ""
     return remote
+
+
+def auto_update_state() -> dict:
+    """What the cloud needs to see to trust that fixes reach the campus PC."""
+    return {
+        "enabled": _AUTO_UPDATE_ENABLED,
+        "wrapper": _STARTED_BY_WRAPPER,
+        **_auto_update_state,
+    }
 
 
 def _work_in_flight() -> str:
@@ -827,9 +876,9 @@ async def _auto_update_loop() -> None:
     if not _AUTO_UPDATE_ENABLED:
         return
     if not _STARTED_BY_WRAPPER:
-        logger.info(
+        logger.error(
             "Auto-update is off: this agent was not started by run_forever, "
-            "so nothing would restart it"
+            "so merged fixes will not reach this PC by themselves"
         )
         return
     while True:
@@ -2684,6 +2733,7 @@ async def websocket_client():
                     "dvr_health": dvr_snapshot_health(),
                     "code_commit": _running_commit(),
                     "started_at_ist": _process_started_at_ist(),
+                    "auto_update": auto_update_state(),
                 }))
 
                 async for message in ws:
@@ -2706,6 +2756,7 @@ async def websocket_client():
                             await ws.send(json.dumps({
                                 "type": "pong",
                                 "dvr_health": dvr_snapshot_health(),
+                                "auto_update": auto_update_state(),
                             }))
 
                         elif msg_type == "test_connection":

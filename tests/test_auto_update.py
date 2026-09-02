@@ -11,23 +11,75 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import main
 
 
+class _Fetch:
+    def __init__(self, returncode=0, stderr=""):
+        self.returncode = returncode
+        self.stderr = stderr
+        self.stdout = ""
+
+
 class PendingUpdateTests(unittest.TestCase):
+    def setUp(self):
+        main._auto_update_state.update(
+            origin_commit="", last_error="", checked_at_ist=""
+        )
+
     def test_no_update_when_running_the_remote_commit(self):
-        with patch.object(main, "_git", side_effect=["", "abc1234", "abc1234"]):
+        with patch.object(main.subprocess, "run", return_value=_Fetch()), \
+                patch.object(main, "_git", side_effect=["abc1234", "abc1234"]):
             self.assertEqual(main._pending_update_commit(), "")
 
     def test_reports_the_commit_waiting_on_origin_main(self):
-        with patch.object(main, "_git", side_effect=["", "def5678", "abc1234"]):
+        with patch.object(main.subprocess, "run", return_value=_Fetch()), \
+                patch.object(main, "_git", side_effect=["def5678", "abc1234"]):
             self.assertEqual(main._pending_update_commit(), "def5678")
 
     def test_a_failed_fetch_never_looks_like_an_update(self):
-        with patch.object(main, "_git", side_effect=["", "", "abc1234"]):
+        with patch.object(main.subprocess, "run", return_value=_Fetch()), \
+                patch.object(main, "_git", side_effect=["", "abc1234"]):
             self.assertEqual(main._pending_update_commit(), "")
 
     def test_fetches_before_comparing(self):
-        with patch.object(main, "_git", side_effect=["", "a", "a"]) as git:
+        with patch.object(
+            main.subprocess, "run", return_value=_Fetch()
+        ) as run, patch.object(main, "_git", side_effect=["a", "a"]):
             main._pending_update_commit()
-        self.assertEqual(git.call_args_list[0].args, ("fetch", "origin", "main"))
+        self.assertEqual(
+            run.call_args.args[0], ["git", "fetch", "origin", "main"]
+        )
+
+    def test_an_unreachable_github_is_reported_not_swallowed(self):
+        """A campus PC that cannot fetch looks up to date, so the cloud has to
+        be told, or merged fixes sit unused while everything reads healthy."""
+        with patch.object(
+            main.subprocess,
+            "run",
+            return_value=_Fetch(128, "fatal: could not read Username"),
+        ), patch.object(main, "_git") as git:
+            self.assertEqual(main._pending_update_commit(), "")
+
+        git.assert_not_called()
+        state = main.auto_update_state()
+        self.assertIn("could not read Username", state["last_error"])
+        self.assertTrue(state["checked_at_ist"].endswith("IST"))
+
+    def test_a_crashed_fetch_is_reported_too(self):
+        with patch.object(
+            main.subprocess, "run", side_effect=OSError("git missing")
+        ):
+            self.assertEqual(main._pending_update_commit(), "")
+
+        self.assertIn("git missing", main.auto_update_state()["last_error"])
+
+    def test_a_working_check_clears_the_last_error(self):
+        main._auto_update_state["last_error"] = "fatal: could not read Username"
+        with patch.object(main.subprocess, "run", return_value=_Fetch()), \
+                patch.object(main, "_git", side_effect=["abc1234", "abc1234"]):
+            main._pending_update_commit()
+
+        state = main.auto_update_state()
+        self.assertEqual(state["last_error"], "")
+        self.assertEqual(state["origin_commit"], "abc1234")
 
 
 class AutoUpdateLoopTests(unittest.IsolatedAsyncioTestCase):
