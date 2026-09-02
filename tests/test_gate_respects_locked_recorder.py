@@ -62,6 +62,26 @@ class GateRecorderSafetyTests(unittest.TestCase):
             gate_counter.capture_gate_frame(54, "192.168.0.12")
         self.assertFalse(recorder_auth.is_refused("192.168.0.12", self._key()))
 
+    def test_a_refused_snapshot_login_still_leaves_the_video_stream(self):
+        # DVR 4's snapshot login is refused on its dead channels; its gate
+        # cameras only ever worked through the video stream.
+        gate_counter.DVR_CREDS["192.168.0.13"] = {
+            "user": "admin", "pass": "secret",
+        }
+        self.addCleanup(gate_counter.DVR_CREDS.pop, "192.168.0.13", None)
+        recorder_auth.note_refusal(
+            "192.168.0.13", recorder_auth.credential_key("admin", "secret"),
+        )
+        frame = object()
+        with patch.object(gate_counter.httpx, "Client") as client, \
+                patch.object(
+                    gate_counter, "_capture_gate_frame_rtsp", return_value=frame
+                ) as rtsp:
+            got = gate_counter.capture_gate_frame(20, "192.168.0.13")
+        self.assertIs(got, frame)
+        client.assert_not_called()
+        rtsp.assert_called_once_with(20, "192.168.0.13")
+
     def test_every_gate_login_restarts_the_recorder_s_quiet_window(self):
         recorder_auth.note_refusal("192.168.0.14", "other-key")
         gate_counter.DVR_CREDS["192.168.0.14"] = {

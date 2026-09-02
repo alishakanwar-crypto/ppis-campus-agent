@@ -321,7 +321,11 @@ async def sync_faces_from_cloud() -> int:
                         logger.warning(f"Cloud face sync: image {face_id} returned {img_resp.status_code}")
                         continue
                     image_bytes = img_resp.content
-                    result = face_db.register_face(
+                    # Encoding a face takes seconds of pure CPU: on the event
+                    # loop it holds up the campus link, so a parent asking for
+                    # a photo during a sync waits for the whole sync.
+                    result = await asyncio.to_thread(
+                        face_db.register_face,
                         person_id=person_id,
                         name=face_meta["name"],
                         role=face_meta["role"],
@@ -350,6 +354,16 @@ async def sync_faces_from_cloud() -> int:
         return 0
 
 
+async def _reload_faces_off_loop() -> None:
+    """Rebuild the face caches without freezing the campus link.
+
+    Reading every encoding out of the database takes tens of seconds, and on
+    the event loop a parent's photo request is not even read from the socket
+    until it ends — which is why the first request after a start timed out.
+    """
+    await asyncio.to_thread(attendance_engine.reload_faces)
+
+
 async def _sync_faces_legacy(client: httpx.AsyncClient, headers: dict) -> int:
     """Fallback: download all faces via /api/face/images (old endpoint)."""
     import gc
@@ -371,7 +385,8 @@ async def _sync_faces_legacy(client: httpx.AsyncClient, headers: dict) -> int:
         if (person_id, angle) in existing_keys:
             continue
         image_bytes = base64.b64decode(face_data["image_base64"])
-        result = face_db.register_face(
+        result = await asyncio.to_thread(
+            face_db.register_face,
             person_id=person_id,
             name=face_data["name"],
             role=face_data["role"],
@@ -633,6 +648,13 @@ _LIVE_CAPTURE_SLOW_DOOR_TTL_SECONDS = max(
     0.0, float(os.environ.get("SNAPSHOT_SLOW_DOOR_TTL_SECONDS", "300"))
 )
 _live_capture_slow_doors: dict[tuple[str, int], dict[int, float]] = {}
+# A channel whose every snapshot door stayed silent: knocking on them again
+# costs a parent ~20s before the video fallback even starts, so that channel
+# goes straight to video until the doors are worth a fresh try.
+_LIVE_CAPTURE_SILENT_CHANNEL_TTL_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_SILENT_CHANNEL_TTL_SECONDS", "300"))
+)
+_live_capture_silent_channels: dict[tuple[str, int], float] = {}
 # A parent's photo is worth the bytes: WhatsApp accepts images up to 5 MB, so
 # only squeeze quality when the picture is far bigger than that.
 _LIVE_SNAPSHOT_MAX_BYTES = max(
@@ -914,6 +936,13 @@ def _credentials_refused(dvr: dict) -> bool:
         if recorder_auth.is_refused(ip, _dvr_credential_key(dvr)):
             _refused_credentials[ip] = _dvr_credential_key(dvr)
             _isapi_cooldowns.setdefault(ip, (None, "credentials refused"))
+            # Take the shared quiet window with it, or this process would have
+            # no probe scheduled and the recorder would stay dark for good.
+            _auth_unlock_quiet[ip] = recorder_auth.quiet_seconds(ip)
+            due_in = recorder_auth.seconds_until_probe(ip)
+            _auth_unlock_next_probe[ip] = time.monotonic() + (
+                _auth_unlock_quiet[ip] if due_in is None else due_in
+            )
             return True
         return False
     if refused == _dvr_credential_key(dvr):
@@ -940,6 +969,29 @@ def _channel_auth_refused(ip: str, channel: int) -> bool:
         _channel_auth_cooldowns.pop((ip, channel), None)
         return False
     return True
+
+
+def _channel_doors_silent(ip: str, channel: int) -> bool:
+    """True while none of this channel's snapshot doors answers at all."""
+    since = _live_capture_silent_channels.get((ip, channel))
+    if since is None:
+        return False
+    if (
+        time.monotonic() - since
+    ) > _LIVE_CAPTURE_SILENT_CHANNEL_TTL_SECONDS:
+        _live_capture_silent_channels.pop((ip, channel), None)
+        return False
+    return True
+
+
+def _mark_channel_doors_silent(ip: str, channel: int) -> None:
+    if (ip, channel) not in _live_capture_silent_channels:
+        logger.warning(
+            "%s ch%d: no snapshot door answers; using the video stream for "
+            "the next %.0fs instead of waiting on them",
+            ip, channel, _LIVE_CAPTURE_SILENT_CHANNEL_TTL_SECONDS,
+        )
+    _live_capture_silent_channels[(ip, channel)] = time.monotonic()
 
 
 def _mark_channel_auth_refused(ip: str, channel: int) -> None:
@@ -1572,6 +1624,7 @@ async def _capture_snapshot_once(
             raise
         if metrics is not None:
             metrics["door"] = variant
+            metrics["answered"] = True
             metrics["round_trips"] = (
                 metrics.get("round_trips", 0) + _response_round_trips(response)
             )
@@ -1659,6 +1712,7 @@ async def capture_snapshot(
         "exception": "",
         "door_timeouts": 0,
         "door": -1,
+        "answered": False,
     }
     try:
         retries = _SNAPSHOT_BACKGROUND_RETRIES if background else _SNAPSHOT_RETRIES
@@ -1715,7 +1769,22 @@ async def capture_snapshot(
         # rejected attempt is what keeps the lockout alive.
         if cooldown_reason == "credentials refused":
             skip_isapi = True
-        if not cooldown_reason and _channel_auth_refused(ip, channel):
+        if (
+            not cooldown_reason
+            and not _rtsp_cooldown_active(ip)
+            and _channel_doors_silent(ip, channel)
+        ):
+            # Every door of this channel was silent a moment ago; waiting on
+            # them again only delays the picture the video stream can give.
+            skip_isapi = True
+            _last_capture_error = (
+                f"{ip} ch{channel}: no snapshot door answers"
+            )
+            logger.info(
+                "%s ch%d: snapshot doors are silent, going straight to RTSP",
+                ip, channel,
+            )
+        elif not cooldown_reason and _channel_auth_refused(ip, channel):
             # This one channel refuses us while its recorder serves others.
             skip_isapi = True
             _last_capture_error = (
@@ -1775,11 +1844,18 @@ async def capture_snapshot(
                         metrics["outcome"] = "success"
                         _isapi_last_success[ip] = time.monotonic()
                         _channel_auth_cooldowns.pop((ip, channel), None)
+                        _live_capture_silent_channels.pop((ip, channel), None)
                         _clear_isapi_failures(ip)
                         return snapshot
                     _last_capture_error = f"{ip} ch{channel}: ISAPI capture failed"
                     if metrics["door_timeouts"]:
                         isapi_timed_out = True
+                    if metrics["door_timeouts"] and not metrics["answered"]:
+                        # Not one door on this channel replied: further attempts
+                        # knock on the same silent doors and cost the parent the
+                        # time the video fallback needs.
+                        _mark_channel_doors_silent(ip, channel)
+                        break
                     if attempt < attempts - 1:
                         await asyncio.sleep(min(
                             _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
@@ -1807,6 +1883,9 @@ async def capture_snapshot(
                         "Snapshot attempt %d/%d failed from %s ch%d: %s",
                         attempt + 1, attempts, ip, channel, _exception_text(exc),
                     )
+                    if isinstance(exc, httpx.ReadTimeout) and not metrics["answered"]:
+                        _mark_channel_doors_silent(ip, channel)
+                        break
                     if attempt < attempts - 1:
                         await asyncio.sleep(min(
                             _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
@@ -1824,6 +1903,9 @@ async def capture_snapshot(
                         "Snapshot attempt %d/%d timed out from %s ch%d",
                         attempt + 1, attempts, ip, channel,
                     )
+                    if not metrics["answered"]:
+                        _mark_channel_doors_silent(ip, channel)
+                        break
                     if attempt < attempts - 1:
                         await asyncio.sleep(min(
                             _SNAPSHOT_RETRY_BACKOFF_SECONDS if not background
@@ -2495,7 +2577,7 @@ async def websocket_client():
                             logger.info("REMOTE FACE SYNC requested via WebSocket")
                             synced = await sync_faces_from_cloud()
                             if synced > 0:
-                                attendance_engine.reload_faces()
+                                await _reload_faces_off_loop()
                             await ws.send(json.dumps({
                                 "type": "sync_faces_result",
                                 "synced": synced,
@@ -2962,7 +3044,7 @@ async def _health_watchdog():
                         logger.warning("WATCHDOG: Classwise monitoring stopped — restarting")
                         attendance_engine._health["total_recoveries"] += 1
                         attendance_engine.test_mode = False
-                        attendance_engine.reload_faces()
+                        await _reload_faces_off_loop()
                         attendance_engine.classwise_running = True
                         attendance_engine._classwise_task = asyncio.create_task(
                             attendance_engine.classwise_monitoring_loop(dvrs, camera_mapping)
@@ -2986,7 +3068,7 @@ async def _health_watchdog():
                 face_sync_counter = 0
                 synced = await sync_faces_from_cloud()
                 if synced > 0:
-                    attendance_engine.reload_faces()
+                    await _reload_faces_off_loop()
                     logger.info(f"WATCHDOG: Synced {synced} new face(s) from cloud")
 
             # --- Check 4: Tiered memory management (every 2 min) ---
@@ -3179,7 +3261,7 @@ async def lifespan(app: FastAPI):
     # Pre-load registered faces into attendance engine
     logger.info("Loading face encodings into attendance engine...")
     try:
-        attendance_engine.reload_faces()
+        await _reload_faces_off_loop()
         logger.info("Face encodings loaded")
     except Exception as e:
         logger.error(f"Face reload crashed during startup (non-fatal): {e}", exc_info=True)

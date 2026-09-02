@@ -774,29 +774,32 @@ class AttendanceEngine:
         are included in every classroom camera scan (teachers walk
         through all classrooms, not just gates).
         """
-        self._grade_face_cache.clear()
-        self._teacher_faces_cache: dict = {}
+        grade_cache: dict = {}
+        teacher_cache: dict = {}
         for person_id, person_data in self.known_faces.items():
             if person_id.startswith(("TEACHER_", "PRINCIPAL_")):
-                self._teacher_faces_cache[person_id] = person_data
+                teacher_cache[person_id] = person_data
                 continue
             grade = _grade_from_person_id(person_id)
             if grade:
-                if grade not in self._grade_face_cache:
-                    self._grade_face_cache[grade] = {}
-                self._grade_face_cache[grade][person_id] = person_data
+                grade_cache.setdefault(grade, {})[person_id] = person_data
 
-        self._grade_face_cache_insightface.clear()
-        self._teacher_faces_cache_insightface: dict = {}
+        grade_cache_insightface: dict = {}
+        teacher_cache_insightface: dict = {}
         for person_id, person_data in self.known_faces_insightface.items():
             if person_id.startswith(("TEACHER_", "PRINCIPAL_")):
-                self._teacher_faces_cache_insightface[person_id] = person_data
+                teacher_cache_insightface[person_id] = person_data
                 continue
             grade = _grade_from_person_id(person_id)
             if grade:
-                if grade not in self._grade_face_cache_insightface:
-                    self._grade_face_cache_insightface[grade] = {}
-                self._grade_face_cache_insightface[grade][person_id] = person_data
+                grade_cache_insightface.setdefault(grade, {})[person_id] = person_data
+
+        # Swap the finished caches in, never clear-then-fill: a scan reading
+        # them while faces reload must see the old set, not an empty one.
+        self._grade_face_cache = grade_cache
+        self._teacher_faces_cache: dict = teacher_cache
+        self._grade_face_cache_insightface = grade_cache_insightface
+        self._teacher_faces_cache_insightface: dict = teacher_cache_insightface
 
         grades_with_faces = {g: len(v) for g, v in self._grade_face_cache.items()}
         logger.info(f"Grade face cache: {grades_with_faces}, "
@@ -1878,14 +1881,7 @@ class AttendanceEngine:
                 pass
 
         def _schedule(coro):
-            if loop is None:
-                logger.error("No event loop available for async task")
-                return
-            try:
-                asyncio.get_running_loop()
-                asyncio.create_task(coro)
-            except RuntimeError:
-                asyncio.run_coroutine_threadsafe(coro, loop)
+            self.schedule_background(coro, loop)
 
         # Sync attendance to cloud dashboard
         _schedule(self._sync_attendance_to_cloud(result, phone or ""))
@@ -2182,6 +2178,38 @@ class AttendanceEngine:
         self._work_in_flight += 1
         try:
             await self._sync_attendance_to_cloud_inner(record, parent_phones)
+        finally:
+            self._work_in_flight -= 1
+
+    def schedule_background(self, coro, loop) -> None:
+        """Run an attendance job in the background, counted until it finishes.
+
+        The count starts here rather than when the coroutine begins running: an
+        auto-update restarting in that gap loses a parent's notification
+        outright, and nothing would ever report it as missing.
+        """
+        if loop is None:
+            logger.error("No event loop available for async task")
+            coro.close()
+            return
+        self._work_in_flight += 1
+        tracked = self._tracked(coro)
+        try:
+            asyncio.get_running_loop()
+            task = asyncio.create_task(tracked)
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except RuntimeError:
+            try:
+                asyncio.run_coroutine_threadsafe(tracked, loop)
+            except RuntimeError:
+                self._work_in_flight -= 1
+                tracked.close()
+                logger.error("Event loop closed; attendance task dropped")
+
+    async def _tracked(self, coro):
+        try:
+            await coro
         finally:
             self._work_in_flight -= 1
 

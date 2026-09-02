@@ -478,6 +478,10 @@ def capture_gate_frame(channel: int, dvr_ip: str = "192.168.0.14") -> np.ndarray
     dvr_pass = creds.get("pass", "")
 
     if _recorder_refusing(dvr_ip):
+        # This recorder's snapshot login is the one that was refused; its video
+        # stream is a separate login and is how DVR 4's gate cameras work at all.
+        if dvr_ip in _RTSP_FALLBACK_IPS:
+            return _capture_gate_frame_rtsp(channel, dvr_ip)
         return None
 
     try:
