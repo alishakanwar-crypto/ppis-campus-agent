@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from PIL import Image
 
 import main
@@ -132,6 +133,86 @@ class WarmUpTests(unittest.IsolatedAsyncioTestCase):
             measured = await main._warm_up_every_camera()
 
         self.assertEqual(list(measured), ["G2B C1"])
+
+
+class MeasurementIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_locked_recorder_is_not_logged_into_by_the_measurement(self):
+        locked = {"ip": "192.0.2.65", "username": "admin", "password": "x"}
+        cameras = {"PREP-2": [(locked, 38, "PREP-2 C1")]}
+        attempts = []
+
+        async def capture(dvr, channel, **_kwargs):
+            attempts.append((dvr["ip"], channel))
+            return jpeg()
+
+        with patch.object(main, "config", {"camera_mapping": cameras}), \
+                patch.object(main, "find_all_cameras_for_classroom",
+                             lambda room: cameras[room]), \
+                patch.object(main, "_credentials_refused", lambda dvr: True), \
+                patch.object(main, "capture_snapshot", capture), \
+                patch.object(main.asyncio, "sleep", AsyncMock()):
+            measured = await main._warm_up_every_camera()
+
+        self.assertEqual(attempts, [])
+        self.assertEqual(measured, {})
+
+    async def test_measuring_does_not_leak_into_the_next_request(self):
+        cameras = {"GRADE 1A": [({"ip": "192.0.2.66"}, 3, "G1A C1")]}
+
+        async def capture(*_args, **_kwargs):
+            assert main._measuring_cameras.get() is True
+            return jpeg()
+
+        with patch.object(main, "config", {"camera_mapping": cameras}), \
+                patch.object(main, "find_all_cameras_for_classroom",
+                             lambda room: cameras[room]), \
+                patch.object(main, "capture_snapshot", capture), \
+                patch.object(main.asyncio, "sleep", AsyncMock()):
+            await main._warm_up_every_camera()
+
+        self.assertFalse(main._measuring_cameras.get())
+
+
+class RefusalReasonTests(unittest.TestCase):
+    def _reply(self, body: bytes, status: int = 401, headers=None):
+        return httpx.Response(status, content=body, headers=headers or {})
+
+    def test_a_locked_account_is_named_so_no_one_retypes_the_password(self):
+        said = main._refusal_reason(self._reply(
+            b"<ResponseStatus><statusCode>4</statusCode>"
+            b"<subStatusCode>userLocked</subStatusCode></ResponseStatus>"
+        ))
+        self.assertEqual(said, "recorder said userLocked")
+
+    def test_a_wrong_password_is_named_as_such(self):
+        said = main._refusal_reason(self._reply(
+            b"<ResponseStatus><subStatusCode>badPassword</subStatusCode>"
+            b"</ResponseStatus>"
+        ))
+        self.assertEqual(said, "recorder said badPassword")
+
+    def test_a_silent_refusal_still_says_something_useful(self):
+        said = main._refusal_reason(self._reply(b""))
+        self.assertEqual(said, "recorder refused without offering a login")
+
+    def test_a_normal_challenge_needs_no_explanation(self):
+        said = main._refusal_reason(self._reply(
+            b"", headers={"WWW-Authenticate": 'Digest realm="x"'}
+        ))
+        self.assertEqual(said, "")
+
+    def test_health_publishes_what_the_recorder_said(self):
+        main._isapi_cooldowns["192.0.2.67"] = (None, "credentials refused")
+        main._auth_refusal_detail["192.0.2.67"] = "recorder said userLocked"
+        try:
+            entry = next(
+                row for row in main.dvr_snapshot_health()
+                if row["ip"] == "192.0.2.67"
+            )
+        finally:
+            main._isapi_cooldowns.pop("192.0.2.67", None)
+            main._auth_refusal_detail.pop("192.0.2.67", None)
+        self.assertEqual(entry["refusal_detail"], "recorder said userLocked")
 
 
 class ColourRepairTimingTests(unittest.IsolatedAsyncioTestCase):

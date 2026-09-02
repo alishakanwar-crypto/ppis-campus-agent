@@ -1010,6 +1010,10 @@ _isapi_consecutive_timeouts: dict[str, int] = {}
 # ip -> the credentials the recorder refused, so a new password lifts the pause
 _refused_credentials: dict[str, str] = {}
 _auth_refused_since_ist: dict[str, str] = {}
+# What the recorder itself said when it refused us, so a locked admin account
+# can be told apart from a password that no longer matches, without presenting
+# the login again to find out.
+_auth_refusal_detail: dict[str, str] = {}
 # ip -> credentials RTSP has actually streamed with, so the fallback is only
 # trusted while the recorder still accepts them
 _rtsp_credentials_worked: dict[str, str] = {}
@@ -1058,6 +1062,29 @@ _channel_auth_cooldowns: dict[tuple[str, int], float] = {}
 
 class _DvrAuthRejected(Exception):
     """The recorder refused our credentials, usually a login lockout."""
+
+
+def _refusal_reason(response: httpx.Response) -> str:
+    """The recorder's own words for a refused login, safe to publish.
+
+    Hikvision answers a locked admin account with a subStatusCode such as
+    ``userLocked``, and a wrong password with ``badPassword`` — the difference
+    between waiting the lock out and someone re-entering the password at the
+    recorder. Only the code itself is kept, never the body.
+    """
+    try:
+        body = response.content[:2048].decode("utf-8", "ignore")
+    except Exception:  # noqa: BLE001 - a reply we cannot read tells us nothing
+        return ""
+    for tag in ("subStatusCode", "statusString", "errorMsg"):
+        match = re.search(rf"<{tag}>([^<]{{1,60}})</{tag}>", body)
+        if match:
+            said = match.group(1).strip()
+            if said:
+                return f"recorder said {said}"
+    if response.status_code == 401 and "WWW-Authenticate" not in response.headers:
+        return "recorder refused without offering a login"
+    return ""
 
 
 def _dvr_credential_key(dvr: dict) -> str:
@@ -1309,6 +1336,7 @@ def _clear_isapi_failures(ip: str) -> None:
     _isapi_consecutive_timeouts.pop(ip, None)
     _refused_credentials.pop(ip, None)
     _auth_refused_since_ist.pop(ip, None)
+    _auth_refusal_detail.pop(ip, None)
     _auth_unlock_next_probe.pop(ip, None)
     _auth_unlock_quiet.pop(ip, None)
     if _isapi_cooldowns.pop(ip, None) is not None:
@@ -1333,6 +1361,10 @@ async def _probe_locked_recorder(dvr: dict) -> bool:
                 auth=httpx.DigestAuth(dvr["username"], dvr["password"]),
             )
         recovered = resp.status_code == 200
+        if not recovered:
+            said = _refusal_reason(resp)
+            if said:
+                _auth_refusal_detail[ip] = said
     except Exception as exc:
         logger.info(
             "%s did not answer the unlock check (%s); staying away",
@@ -1357,8 +1389,9 @@ async def _probe_locked_recorder(dvr: dict) -> bool:
     _auth_unlock_quiet[ip] = quiet
     _auth_unlock_next_probe[ip] = time.monotonic() + quiet
     logger.info(
-        "%s still refuses our login; leaving it untouched for %.0f more "
-        "minutes", ip, quiet / 60,
+        "%s still refuses our login (%s); leaving it untouched for %.0f more "
+        "minutes",
+        ip, _auth_refusal_detail.get(ip, "no reason given"), quiet / 60,
     )
     return False
 
@@ -1411,9 +1444,30 @@ async def _warm_up_every_camera() -> dict[str, float]:
     the capture itself, so this never knocks on a locked one.
     """
     results: dict[str, float] = {}
-    _measuring_cameras.set(True)
+    token = _measuring_cameras.set(True)
+    try:
+        await _measure_every_camera(results)
+    finally:
+        # Measuring relaxes the probe limits; leaking that into a parent's
+        # request would put the waiting back that this whole change removes.
+        _measuring_cameras.reset(token)
+    served = [seconds for seconds in results.values() if seconds >= 0]
+    logger.info(
+        "Camera warm-up finished at %s: %d of %d cameras served a picture, "
+        "slowest %.1fs",
+        datetime.now(_IST).strftime("%d-%m-%Y %H:%M:%S IST"),
+        len(served), len(results), max(served) if served else 0.0,
+    )
+    return results
+
+
+async def _measure_every_camera(results: dict[str, float]) -> None:
     for classroom in sorted(config.get("camera_mapping", {})):
         for dvr, channel, desc in find_all_cameras_for_classroom(classroom) or []:
+            if _credentials_refused(dvr):
+                # A recorder that refused our login must get no login at all,
+                # not even a nightly one: each attempt re-arms its lockout.
+                continue
             started = time.monotonic()
             try:
                 picture = await capture_snapshot(
@@ -1430,14 +1484,6 @@ async def _warm_up_every_camera() -> dict[str, float]:
                 logger.warning("Warm-up: %s took %.1fs, slower than a parent "
                                "should wait", desc, elapsed)
             await asyncio.sleep(0.2)
-    served = [seconds for seconds in results.values() if seconds >= 0]
-    logger.info(
-        "Camera warm-up finished at %s: %d of %d cameras served a picture, "
-        "slowest %.1fs",
-        datetime.now(_IST).strftime("%d-%m-%Y %H:%M:%S IST"),
-        len(served), len(results), max(served) if served else 0.0,
-    )
-    return results
 
 
 async def _camera_warmup_loop() -> None:
@@ -1474,6 +1520,7 @@ def dvr_snapshot_health() -> list[dict]:
                     else round(max(0.0, probe_at - time.monotonic()), 1)
                 ),
                 "since_ist": _auth_refused_since_ist.get(ip, ""),
+                "refusal_detail": _auth_refusal_detail.get(ip, ""),
             })
         elif expires_at > time.monotonic():
             health.append({
@@ -1813,6 +1860,7 @@ async def _capture_snapshot_once(
     auth_rejections = 0
     usable_replies = 0
     last_rejection = 0
+    last_rejection_detail = ""
     wanted_pixels = _LIVE_SNAPSHOT_WIDTH * _LIVE_SNAPSHOT_HEIGHT
     known_best = _live_capture_best_pixels.get(key, 0)
     best: tuple[str, int, bytes, int] | None = None
@@ -1901,6 +1949,9 @@ async def _capture_snapshot_once(
         if response.status_code in (401, 403):
             auth_rejections += 1
             last_rejection = response.status_code
+            last_rejection_detail = (
+                _refusal_reason(response) or last_rejection_detail
+            )
             continue
         if response.status_code < 400:
             # Only a door that could have served a picture proves the recorder
@@ -1949,8 +2000,11 @@ async def _capture_snapshot_once(
     ):
         # Every door was locked, so the credentials are wrong for this
         # recorder; hammering it only deepens its login lockout.
+        if last_rejection_detail:
+            _auth_refusal_detail[ip] = last_rejection_detail
+        said = f"; {last_rejection_detail}" if last_rejection_detail else ""
         raise _DvrAuthRejected(
-            f"{ip} rejected our credentials (HTTP {last_rejection})"
+            f"{ip} rejected our credentials (HTTP {last_rejection}{said})"
         )
     return None
 
