@@ -1127,6 +1127,16 @@ def _mark_isapi_timeout(ip: str) -> None:
     _isapi_consecutive_timeouts[ip] = count
     if count < _ISAPI_TIMEOUTS_BEFORE_BACKOFF or _isapi_cooldown(ip):
         return
+    if _isapi_served_recently(ip):
+        # This recorder handed us a classroom moments ago, so it is busy, not
+        # deaf. Sending every room on it down the video road costs each parent
+        # 10-20s instead of the fraction of a second its doors answer in.
+        logger.info(
+            "%s failed %d captures in a row but served another classroom just "
+            "now; keeping its snapshot doors in use",
+            ip, count,
+        )
+        return
     _isapi_cooldowns[ip] = (
         time.monotonic() + _ISAPI_TIMEOUT_COOLDOWN_SECONDS,
         "not answering",
@@ -2465,6 +2475,11 @@ _snapshot_request_semaphore = asyncio.Semaphore(
 _SNAPSHOT_CAMERA_TIMEOUT_SECONDS = max(
     1.0, float(os.environ.get("SNAPSHOT_CAMERA_TIMEOUT_SECONDS", "40"))
 )
+# Request budget that must remain before a classroom's quiet second camera is
+# tried again, so the retry never costs the parent the photo already taken.
+_SNAPSHOT_SECOND_ANGLE_RETRY_SECONDS = max(
+    1.0, float(os.environ.get("SNAPSHOT_SECOND_ANGLE_RETRY_SECONDS", "12"))
+)
 
 
 def _snapshot_task_done(task: asyncio.Task) -> None:
@@ -2968,52 +2983,88 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
 
     logger.info(f"Capturing from {len(all_cameras)} camera(s) for {classroom}")
 
-    capture_tasks = [
-        asyncio.create_task(_capture_classroom_camera(classroom, camera))
-        for camera in all_cameras[:2]
-    ]
-    expected_total = len(capture_tasks)
+    wanted = all_cameras[:2]
+    expected_total = len(wanted)
     sent_count = 0
 
-    for completed in asyncio.as_completed(capture_tasks):
-        result = await completed
-        if result is None:
-            continue
+    async def send_captured(cameras: list) -> list:
+        """Capture and forward these cameras, returning the ones that failed."""
+        nonlocal sent_count
+        tasks = {
+            asyncio.create_task(_capture_classroom_camera(classroom, camera)):
+                camera
+            for camera in cameras
+        }
+        missed = []
+        for completed in asyncio.as_completed(list(tasks)):
+            try:
+                result = await completed
+            except Exception as exc:
+                logger.exception(
+                    "Capture for %s failed: %s",
+                    classroom, _exception_text(exc),
+                )
+                continue
+            if result is None:
+                continue
+            raw_data, filename, desc, capture = result
+            compressed = compress_jpeg(
+                raw_data,
+                max_bytes=_LIVE_SNAPSHOT_MAX_BYTES,
+                quality_start=_LIVE_SNAPSHOT_JPEG_QUALITY,
+            )
+            b64 = base64.b64encode(compressed).decode("ascii")
+            width, height = _jpeg_size(compressed)
+            await ws.send(json.dumps({
+                "type": "snapshot_image",
+                "request_id": request_id,
+                "classroom": classroom,
+                "image_index": sent_count,
+                "image_total": expected_total,
+                "filename": filename,
+                "image_base64": b64,
+                "size_bytes": len(compressed),
+                "width": width,
+                "height": height,
+                "description": desc,
+                "capture": capture,
+            }))
+            sent_count += 1
+            logger.info(
+                "Sent image %d/%d: %s (%d bytes, %dx%d) - %s in %.2fs",
+                sent_count,
+                expected_total,
+                filename,
+                len(compressed),
+                width,
+                height,
+                desc,
+                time.monotonic() - request_started,
+            )
+        for task, camera in tasks.items():
+            if (
+                task.cancelled()
+                or task.exception() is not None
+                or task.result() is None
+            ):
+                missed.append(camera)
+        return missed
 
-        raw_data, filename, desc, capture = result
-        compressed = compress_jpeg(
-            raw_data,
-            max_bytes=_LIVE_SNAPSHOT_MAX_BYTES,
-            quality_start=_LIVE_SNAPSHOT_JPEG_QUALITY,
+    missed = await send_captured(wanted)
+    if missed and sent_count:
+        # One angle answering and the other not is what makes a parent see a
+        # single photo of a two-camera classroom; the room is reachable, so
+        # the quiet camera is worth one more try while the request lives.
+        deadline = _live_request_deadline.get()
+        left = _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS if deadline is None else (
+            deadline - time.monotonic()
         )
-        b64 = base64.b64encode(compressed).decode("ascii")
-        width, height = _jpeg_size(compressed)
-        await ws.send(json.dumps({
-            "type": "snapshot_image",
-            "request_id": request_id,
-            "classroom": classroom,
-            "image_index": sent_count,
-            "image_total": expected_total,
-            "filename": filename,
-            "image_base64": b64,
-            "size_bytes": len(compressed),
-            "width": width,
-            "height": height,
-            "description": desc,
-            "capture": capture,
-        }))
-        sent_count += 1
-        logger.info(
-            "Sent image %d/%d: %s (%d bytes, %dx%d) - %s in %.2fs",
-            sent_count,
-            expected_total,
-            filename,
-            len(compressed),
-            width,
-            height,
-            desc,
-            time.monotonic() - request_started,
-        )
+        if left >= _SNAPSHOT_SECOND_ANGLE_RETRY_SECONDS:
+            logger.info(
+                "Retrying %d camera(s) for %s that gave no picture",
+                len(missed), classroom,
+            )
+            await send_captured(missed)
 
     if sent_count == 0:
         await ws.send(json.dumps({
