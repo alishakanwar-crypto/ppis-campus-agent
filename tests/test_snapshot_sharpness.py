@@ -43,8 +43,12 @@ class SnapshotSharpnessTests(unittest.IsolatedAsyncioTestCase):
 
         return Client()
 
-    async def test_the_sharpest_available_picture_is_sent(self):
-        """A 720p answer on one door does not settle it if another serves 1080p."""
+    async def test_the_nightly_measurement_finds_the_sharpest_door(self):
+        """A 720p answer on one door does not settle it if another serves 1080p.
+
+        Comparing doors happens in the nightly measurement, and every parent's
+        request afterwards goes straight to the door it settled on.
+        """
         requested: list[str] = []
         soft = jpeg(1280, 720)
         sharp = jpeg(1920, 1080)
@@ -58,13 +62,38 @@ class SnapshotSharpnessTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             main.httpx, "AsyncClient", return_value=self._client(pictures, requested)
         ):
-            self.assertEqual(await main.capture_snapshot(dvr, 3), sharp)
+            main._measuring_cameras.set(True)
+            try:
+                self.assertEqual(
+                    await main.capture_snapshot(dvr, 3, background=True), sharp
+                )
+            finally:
+                main._measuring_cameras.set(False)
             requested.clear()
             # The sharp door is remembered, so the soft one is not tried again.
             self.assertEqual(await main.capture_snapshot(dvr, 3), sharp)
 
         self.assertEqual(len(requested), 1)
         self.assertNotIn("videoResolutionWidth", requested[0])
+
+    async def test_a_parents_request_takes_one_door_only(self):
+        """No comparing pictures while a parent waits: the first whole one wins."""
+        requested: list[str] = []
+        soft = jpeg(1280, 720)
+        sharp = jpeg(1920, 1080)
+        pictures = {"videoResolutionWidth": soft, "/301/picture": sharp}
+        dvr = {
+            "ip": "192.0.2.54",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(
+            main.httpx, "AsyncClient", return_value=self._client(pictures, requested)
+        ):
+            self.assertEqual(await main.capture_snapshot(dvr, 3), soft)
+
+        self.assertEqual(len(requested), 1)
 
     async def test_a_720p_camera_is_measured_once_and_then_trusted(self):
         requested: list[str] = []

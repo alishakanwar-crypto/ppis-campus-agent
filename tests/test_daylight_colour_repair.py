@@ -1,3 +1,4 @@
+import asyncio
 import io
 import unittest
 from datetime import datetime
@@ -75,11 +76,21 @@ class DaylightColourRepairTests(unittest.IsolatedAsyncioTestCase):
              patch.object(main.asyncio, "sleep", AsyncMock()):
             clock.now.return_value = now
             result = await main._repair_colour_if_night_mode(snapshot, CAMERA)
+            # The camera is reset behind the delivered picture, so the checks
+            # below wait for that background work instead of the parent doing it.
+            pending = [
+                task for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+            ]
+            if pending:
+                await asyncio.gather(*pending)
         return result, client, capture
 
-    async def test_colourless_daytime_picture_is_recaptured_in_colour(self):
+    async def test_a_colourless_daytime_picture_is_sent_before_the_reset(self):
         result, client, capture = await self._repair(GREY)
-        self.assertEqual(result, COLOUR)
+        # The photo in hand goes to the parent at once; the camera is taken out
+        # of night mode behind it, so the next photo of the room is in colour.
+        self.assertEqual(result, GREY)
         self.assertEqual(client.put.await_count, 1)
         self.assertIn("auto", client.put.await_args.kwargs["content"])
         self.assertEqual(capture.await_count, 1)
@@ -106,9 +117,10 @@ class DaylightColourRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, GREY)
         self.assertEqual(capture.await_count, 0)
 
-    async def test_a_still_grey_camera_delivers_the_recapture(self):
-        result, _, _ = await self._repair(GREY, recaptured=GREYSCALE_MODE)
-        self.assertEqual(result, GREYSCALE_MODE)
+    async def test_a_still_grey_camera_never_costs_the_parent_time(self):
+        result, _, capture = await self._repair(GREY, recaptured=GREYSCALE_MODE)
+        self.assertEqual(result, GREY)
+        self.assertEqual(capture.await_count, 1)
 
     async def test_a_camera_left_on_auto_is_reported_as_low_light(self):
         with self.assertLogs(main.logger, level="WARNING") as logs:

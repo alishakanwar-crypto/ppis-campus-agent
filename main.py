@@ -646,6 +646,45 @@ _rtsp_timeout_warning_lock = threading.Lock()
 _live_dvr_clients: dict[str, httpx.AsyncClient] = {}
 _live_capture_preferences: dict[tuple[str, int], tuple[str, int]] = {}
 _live_capture_preference_age: dict[tuple[str, int], float] = {}
+# The door each channel actually serves pictures through, kept on disk so a
+# restart does not make the next parent pay for relearning it.
+_LIVE_CAPTURE_DOORS_FILE = Path(__file__).parent / "snapshot_doors.json"
+
+
+def _load_capture_doors() -> None:
+    """Remember which door served each channel before the last restart."""
+    try:
+        stored = json.loads(_LIVE_CAPTURE_DOORS_FILE.read_text())
+    except FileNotFoundError:
+        return
+    except Exception as exc:  # noqa: BLE001 - a bad file must not stop the agent
+        logger.warning("Could not read remembered snapshot doors: %s", exc)
+        return
+    for name, door in (stored.get("doors") or {}).items():
+        ip, _, channel = name.rpartition("|")
+        try:
+            key = (ip, int(channel))
+            scheme, variant = door["scheme"], int(door["variant"])
+        except Exception:  # noqa: BLE001 - skip only the malformed entry
+            continue
+        if scheme not in ("digest", "basic"):
+            continue
+        _live_capture_preferences[key] = (scheme, variant)
+        _live_capture_preference_age[key] = time.monotonic()
+
+
+def _save_capture_doors() -> None:
+    """Keep the learned doors across a restart; never fail a capture over it."""
+    doors = {
+        f"{ip}|{channel}": {"scheme": scheme, "variant": variant}
+        for (ip, channel), (scheme, variant) in _live_capture_preferences.items()
+    }
+    try:
+        _LIVE_CAPTURE_DOORS_FILE.write_text(json.dumps({"doors": doors}, indent=1))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not save remembered snapshot doors: %s", exc)
+
+
 # Largest picture a channel has ever handed us, so a camera that simply cannot
 # do 1080p is not re-probed on every parent request.
 _live_capture_best_pixels: dict[tuple[str, int], int] = {}
@@ -660,21 +699,35 @@ _LIVE_CAPTURE_FALLBACK_TTL_SECONDS = max(
     0.0, float(os.environ.get("SNAPSHOT_FALLBACK_TTL_SECONDS", "900"))
 )
 # How many differently-shaped pictures to collect from a channel we have never
-# measured before settling on its sharpest one.
+# measured before settling on its sharpest one. One, because a parent's request
+# is not the place to compare pictures: the nightly warm-up measures each
+# channel instead, and the door it settles on is remembered on disk.
 _LIVE_CAPTURE_PROBE_PICTURES = max(
-    1, int(os.environ.get("SNAPSHOT_PROBE_PICTURES", "3"))
+    1, int(os.environ.get("SNAPSHOT_PROBE_PICTURES", "1"))
 )
 # Time the extra sharpness probes may take. A picture in hand always beats a
 # sharper one the parent never receives.
 _LIVE_CAPTURE_PROBE_BUDGET_SECONDS = max(
     0.0, float(os.environ.get("SNAPSHOT_PROBE_BUDGET_SECONDS", "2"))
 )
+# The nightly measurement may compare doors properly: nobody is waiting on it,
+# and what it learns is what every parent's request then uses straight away.
+_LIVE_CAPTURE_MEASURE_PICTURES = max(
+    1, int(os.environ.get("SNAPSHOT_MEASURE_PICTURES", "3"))
+)
+_LIVE_CAPTURE_MEASURE_BUDGET_SECONDS = max(
+    _LIVE_CAPTURE_PROBE_BUDGET_SECONDS,
+    float(os.environ.get("SNAPSHOT_MEASURE_BUDGET_SECONDS", "10")),
+)
+_measuring_cameras: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "measuring_cameras", default=False
+)
 # Longest a single door (one URL with one auth scheme) may take before it is
 # abandoned for the next one. A recorder that never answers the full-size
 # request otherwise eats the whole attempt, and every retry knocks on the same
 # silent door again.
 _LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS = max(
-    0.5, float(os.environ.get("SNAPSHOT_DOOR_TIMEOUT_SECONDS", "5"))
+    0.5, float(os.environ.get("SNAPSHOT_DOOR_TIMEOUT_SECONDS", "3"))
 )
 # How long a door that hung is tried last for.
 _LIVE_CAPTURE_SLOW_DOOR_TTL_SECONDS = max(
@@ -948,7 +1001,7 @@ _AUTH_REJECTIONS_BEFORE_GIVING_UP = max(
 )
 # Time held back from the ISAPI attempts so the RTSP fallback still gets a turn.
 _RTSP_RESERVE_SECONDS = max(
-    0.0, float(os.environ.get("SNAPSHOT_RTSP_RESERVE_SECONDS", "8"))
+    0.0, float(os.environ.get("SNAPSHOT_RTSP_RESERVE_SECONDS", "4"))
 )
 # expires_at is None for a login refusal: retrying on a timer only re-arms the
 # recorder's lockout, so that pause is held until its password changes.
@@ -1347,6 +1400,64 @@ async def _unlock_watch_loop() -> None:
             logger.warning("Unlock watch failed (non-fatal): %s", exc)
 
 
+_WARMUP_HOUR_IST = max(0, min(23, int(os.environ.get("SNAPSHOT_WARMUP_HOUR", "3"))))
+
+
+async def _warm_up_every_camera() -> dict[str, float]:
+    """Measure every mapped camera so no parent's request has to.
+
+    Learns each channel's working door and how sharp a picture it can give,
+    while the school is empty. A recorder that refused our login is skipped by
+    the capture itself, so this never knocks on a locked one.
+    """
+    results: dict[str, float] = {}
+    _measuring_cameras.set(True)
+    for classroom in sorted(config.get("camera_mapping", {})):
+        for dvr, channel, desc in find_all_cameras_for_classroom(classroom) or []:
+            started = time.monotonic()
+            try:
+                picture = await capture_snapshot(
+                    dvr, channel, background=True, classroom=classroom
+                )
+            except Exception as exc:  # noqa: BLE001 - measure the rest anyway
+                logger.warning("Warm-up of %s failed: %s", desc, _exception_text(exc))
+                continue
+            elapsed = round(time.monotonic() - started, 2)
+            results[desc or f"{dvr['ip']} ch{channel}"] = elapsed if picture else -1.0
+            if not picture:
+                logger.warning("Warm-up: %s gave no picture", desc)
+            elif elapsed > 5.0:
+                logger.warning("Warm-up: %s took %.1fs, slower than a parent "
+                               "should wait", desc, elapsed)
+            await asyncio.sleep(0.2)
+    served = [seconds for seconds in results.values() if seconds >= 0]
+    logger.info(
+        "Camera warm-up finished at %s: %d of %d cameras served a picture, "
+        "slowest %.1fs",
+        datetime.now(_IST).strftime("%d-%m-%Y %H:%M:%S IST"),
+        len(served), len(results), max(served) if served else 0.0,
+    )
+    return results
+
+
+async def _camera_warmup_loop() -> None:
+    """Warm every camera up once a night, so the first parent is not the probe."""
+    while True:
+        now = datetime.now(_IST)
+        next_run = now.replace(
+            hour=_WARMUP_HOUR_IST, minute=0, second=0, microsecond=0
+        )
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        await asyncio.sleep(max(60.0, (next_run - now).total_seconds()))
+        try:
+            await _warm_up_every_camera()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Camera warm-up failed (non-fatal): %s", exc)
+
+
 def dvr_snapshot_health() -> list[dict]:
     """Recorders whose direct snapshot path is currently being avoided."""
     health = []
@@ -1541,16 +1652,16 @@ async def _capture_snapshot_rtsp(
     return await asyncio.wrap_future(future)
 
 
-_SNAPSHOT_RETRIES = max(1, int(os.environ.get("SNAPSHOT_RETRIES", "3")))
+_SNAPSHOT_RETRIES = max(1, int(os.environ.get("SNAPSHOT_RETRIES", "2")))
 _SNAPSHOT_RETRY_BACKOFF_SECONDS = max(
-    0.0, float(os.environ.get("SNAPSHOT_RETRY_BACKOFF_SECONDS", "0.4"))
+    0.0, float(os.environ.get("SNAPSHOT_RETRY_BACKOFF_SECONDS", "0"))
 )
 _SNAPSHOT_CONNECT_TIMEOUT_SECONDS = max(
     1.0, float(os.environ.get("SNAPSHOT_CONNECT_TIMEOUT_SECONDS", "5"))
 )
 _SNAPSHOT_HTTP_TIMEOUT_SECONDS = max(
     _SNAPSHOT_CONNECT_TIMEOUT_SECONDS,
-    float(os.environ.get("SNAPSHOT_HTTP_TIMEOUT_SECONDS", "10")),
+    float(os.environ.get("SNAPSHOT_HTTP_TIMEOUT_SECONDS", "6")),
 )
 _SNAPSHOT_BACKGROUND_RETRIES = max(
     1, int(os.environ.get("SNAPSHOT_BACKGROUND_RETRIES", "1"))
@@ -1582,8 +1693,10 @@ _rtsp_capture_executor = concurrent.futures.ThreadPoolExecutor(
 )
 _rtsp_capture_semaphore = asyncio.Semaphore(_RTSP_CAPTURE_CONCURRENCY)
 _rtsp_background_semaphore = asyncio.Semaphore(_RTSP_BACKGROUND_CONCURRENCY)
+# A parent either gets the photo quickly or a straight answer: waiting out a
+# dead camera for most of a minute is what made the feature feel broken.
 _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS = max(
-    1.0, float(os.environ.get("SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS", "50"))
+    1.0, float(os.environ.get("SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS", "12"))
 )
 
 
@@ -1676,8 +1789,10 @@ async def _capture_snapshot_once(
         for scheme in ("digest", "basic")
     )
     candidates = [
+        # Our recorders all speak digest; basic is kept for the main door only,
+        # so a parent's request is never spent on eight login combinations.
         candidate for candidate in candidates
-        if candidate[1] <= 1 or candidate[0] == "digest"
+        if candidate[1] == 0 or candidate[0] == "digest"
     ]
     slow_doors = _live_capture_slow_doors.get(key)
     if slow_doors:
@@ -1701,6 +1816,15 @@ async def _capture_snapshot_once(
     wanted_pixels = _LIVE_SNAPSHOT_WIDTH * _LIVE_SNAPSHOT_HEIGHT
     known_best = _live_capture_best_pixels.get(key, 0)
     best: tuple[str, int, bytes, int] | None = None
+    measuring = _measuring_cameras.get()
+    probe_pictures = (
+        _LIVE_CAPTURE_MEASURE_PICTURES if measuring
+        else _LIVE_CAPTURE_PROBE_PICTURES
+    )
+    probe_budget = (
+        _LIVE_CAPTURE_MEASURE_BUDGET_SECONDS if measuring
+        else _LIVE_CAPTURE_PROBE_BUDGET_SECONDS
+    )
     pictures = 0
     sized_variants: set[int] = set()
     started = time.monotonic()
@@ -1710,7 +1834,8 @@ async def _capture_snapshot_once(
             # Age the choice from when it was made, so a busy camera stuck
             # on a fallback still retries the full-size stream.
             _live_capture_preference_age[key] = time.monotonic()
-        _live_capture_preferences[key] = (scheme, variant)
+            _live_capture_preferences[key] = (scheme, variant)
+            _save_capture_doors()
         _live_capture_best_pixels[key] = max(known_best, pixels)
         if (
             pixels
@@ -1744,7 +1869,7 @@ async def _capture_snapshot_once(
             # Probing for something sharper must never cost the picture we have.
             door_budget = min(
                 door_budget,
-                _LIVE_CAPTURE_PROBE_BUDGET_SECONDS - (time.monotonic() - started),
+                probe_budget - (time.monotonic() - started),
             )
         try:
             response = await asyncio.wait_for(
@@ -1806,8 +1931,8 @@ async def _capture_snapshot_once(
                 or variant >= 1
                 or pixels >= wanted_pixels
                 or (known_best and pixels >= known_best)
-                or pictures >= _LIVE_CAPTURE_PROBE_PICTURES
-                or time.monotonic() - started >= _LIVE_CAPTURE_PROBE_BUDGET_SECONDS
+                or pictures >= probe_pictures
+                or time.monotonic() - started >= probe_budget
             ):
                 # Only the resolution-request door is worth checking against
                 # the plain main stream, which some cameras serve sharper.
@@ -2586,12 +2711,12 @@ _snapshot_request_semaphore = asyncio.Semaphore(
     max(1, int(os.environ.get("SNAPSHOT_CONCURRENT_REQUESTS", "6")))
 )
 _SNAPSHOT_CAMERA_TIMEOUT_SECONDS = max(
-    1.0, float(os.environ.get("SNAPSHOT_CAMERA_TIMEOUT_SECONDS", "40"))
+    1.0, float(os.environ.get("SNAPSHOT_CAMERA_TIMEOUT_SECONDS", "8"))
 )
 # Request budget that must remain before a classroom's quiet second camera is
 # tried again, so the retry never costs the parent the photo already taken.
 _SNAPSHOT_SECOND_ANGLE_RETRY_SECONDS = max(
-    1.0, float(os.environ.get("SNAPSHOT_SECOND_ANGLE_RETRY_SECONDS", "12"))
+    1.0, float(os.environ.get("SNAPSHOT_SECOND_ANGLE_RETRY_SECONDS", "4"))
 )
 
 
@@ -2980,23 +3105,28 @@ async def _repair_colour_if_night_mode(
         return snapshot
 
     _COLOUR_REPAIR_ATTEMPTED[key] = today
-    deadline = _live_request_deadline.get()
-    if deadline is not None and deadline - time.monotonic() < 20.0:
-        # Not enough of the parent's request budget left to wait for a colour
-        # recapture: fix the camera in the background so the next photo is fine.
-        asyncio.create_task(_restore_daylight_colour(dvr, channel, desc))
-        return snapshot
+    # Resetting the camera's day/night mode takes seconds the parent should not
+    # be waiting through: send the picture we have and fix the camera behind it,
+    # so the next photo of that room is in colour.
+    asyncio.create_task(_repair_colour_in_background(dvr, channel, desc))
+    return snapshot
+
+
+async def _repair_colour_in_background(dvr: dict, channel: int, desc: str) -> None:
+    """Take a camera out of night mode and report why if it stays grey."""
     changed, reported_mode = await _restore_daylight_colour(dvr, channel, desc)
     if not changed:
-        return snapshot
+        return
     await asyncio.sleep(2.0)
     try:
-        retry = await asyncio.wait_for(capture_snapshot(dvr, channel), timeout=15.0)
+        retry = await asyncio.wait_for(
+            capture_snapshot(dvr, channel, background=True), timeout=15.0
+        )
     except asyncio.TimeoutError:
-        return snapshot
+        return
     if retry and _image_has_no_colour(retry) is not True:
-        logger.info("Recaptured %s in colour after leaving night mode", desc)
-        return retry
+        logger.info("%s is in colour again after leaving night mode", desc)
+        return
     if reported_mode == "auto":
         # The camera was already deciding for itself, so it chose infrared
         # because the room was too dim — lights, not settings.
@@ -3012,7 +3142,6 @@ async def _repair_colour_if_night_mode(
             "itself",
             desc, reported_mode,
         )
-    return retry or snapshot
 
 
 async def _capture_classroom_camera(
@@ -3594,6 +3723,9 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_unlock_watch_loop())
     # Pick up merged fixes without anyone running a restart script.
     asyncio.create_task(_auto_update_loop())
+    # Measure every camera nightly, so a parent's request is never the probe.
+    _load_capture_doors()
+    asyncio.create_task(_camera_warmup_loop())
     # Periodic Entry Gate snapshots DISABLED per user request (2026-05-30).
     # User only wants unknown person alerts, not routine snapshots.
     # asyncio.create_task(_entry_gate_snapshot_loop())
