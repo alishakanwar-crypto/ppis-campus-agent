@@ -914,7 +914,13 @@ _rtsp_credentials_worked: dict[str, str] = {}
 # (ip, credentials) -> RTSP attempts made since the recorder refused that login
 _rtsp_attempts_while_refused: dict[tuple[str, str], int] = {}
 _RTSP_ATTEMPTS_WHILE_REFUSED = max(
-    1, int(os.environ.get("RTSP_ATTEMPTS_WHILE_REFUSED", "3"))
+    1, int(os.environ.get("RTSP_ATTEMPTS_WHILE_REFUSED", "1"))
+)
+# A recorder known to stream over RTSP while its ISAPI answers 401 may be
+# tried a little longer, since its account is plainly not locked.
+_RTSP_FALLBACK_ATTEMPTS_WHILE_REFUSED = max(
+    _RTSP_ATTEMPTS_WHILE_REFUSED,
+    int(os.environ.get("RTSP_FALLBACK_ATTEMPTS_WHILE_REFUSED", "3")),
 )
 # A login that just served twenty classrooms cannot be wrong for the twenty
 # first: when a recorder answered us moments ago, a 401 on one channel is that
@@ -1126,9 +1132,13 @@ def _rtsp_worth_trying(dvr: dict) -> bool:
     key = _dvr_credential_key(dvr)
     if _rtsp_credentials_worked.get(ip) == key:
         return True
-    return _rtsp_attempts_while_refused.get((ip, key), 0) < (
-        _RTSP_ATTEMPTS_WHILE_REFUSED
-    )
+    attempts = _rtsp_attempts_while_refused.get((ip, key), 0)
+    if ip in _RTSP_FALLBACK_IPS:
+        return attempts < _RTSP_FALLBACK_ATTEMPTS_WHILE_REFUSED
+    # One try is enough to tell an ISAPI-only fault from a locked account:
+    # each further stream logs in again, which re-arms the lockout and pushes
+    # the quiet unlock probe further away.
+    return attempts < _RTSP_ATTEMPTS_WHILE_REFUSED
 
 
 def _note_rtsp_attempt_while_refused(dvr: dict) -> None:
@@ -1451,12 +1461,12 @@ async def _capture_snapshot_rtsp(
     never queues behind the scanner's sweep of every camera.
     """
     loop = asyncio.get_running_loop()
-    # RTSP presents the same account, so an unlock probe must not run while a
-    # stream is re-arming the lock — unless RTSP is logging in fine, which
-    # proves the account is not locked at all.
     # Every stream presents the account, so each one restarts the silence a
-    # locked recorder needs — even where RTSP logged in fine a moment ago.
-    _note_auth_attempt(dvr["ip"])
+    # locked recorder needs — unless RTSP has already streamed with these
+    # credentials, which proves the account is not locked and leaves the
+    # unlock probe free to run.
+    if _rtsp_credentials_worked.get(dvr["ip"]) != _dvr_credential_key(dvr):
+        _note_auth_attempt(dvr["ip"])
     semaphore = (
         _rtsp_background_semaphore if background else _rtsp_capture_semaphore
     )
