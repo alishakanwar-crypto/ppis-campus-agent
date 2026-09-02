@@ -107,6 +107,27 @@ class SharedLiveCaptureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(calls, 2)
 
+    async def test_a_parent_arriving_after_the_first_gave_up_still_joins(self):
+        """The first request timing out must not orphan its running capture."""
+        calls = 0
+
+        class Client:
+            async def get(_self, url, auth):
+                nonlocal calls
+                calls += 1
+                await asyncio.sleep(0.1)
+                return Response(PICTURE)
+
+        with patch.object(main, "_get_live_dvr_client", return_value=Client()):
+            gave_up = asyncio.create_task(main.capture_snapshot(DVR, 10))
+            await asyncio.sleep(0.01)
+            gave_up.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await gave_up
+            self.assertEqual(await main.capture_snapshot(DVR, 10), PICTURE)
+
+        self.assertEqual(calls, 1)
+
     async def test_a_timed_out_parent_does_not_cancel_the_shared_capture(self):
         class Client:
             async def get(_self, url, auth):

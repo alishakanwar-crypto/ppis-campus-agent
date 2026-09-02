@@ -1764,7 +1764,10 @@ async def capture_snapshot(
         # capture the other waiting parents are relying on.
         picture = await asyncio.shield(task)
     finally:
-        if mine and _live_capture_in_flight.get(key) is task:
+        # Only once the capture is over: the first parent's request can time out
+        # while it is still running, and the parents behind them must join that
+        # capture rather than start another one on the same camera.
+        if task.done() and _live_capture_in_flight.get(key) is task:
             _live_capture_in_flight.pop(key, None)
     if not mine and report is not None and not report:
         report.update({
