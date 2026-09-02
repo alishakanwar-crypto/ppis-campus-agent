@@ -171,6 +171,11 @@ class RecorderUnlockWatchTests(unittest.TestCase):
         )
         main._auth_unlock_next_probe[DVR["ip"]] = main.time.monotonic() - 1
         main._last_auth_attempt[DVR["ip"]] = main.time.monotonic() - quiet - 1
+        # The other processes' shared record has to look silent too, or the
+        # probe rightly waits for them.
+        main.recorder_auth._update(
+            DVR["ip"], last_attempt=main.time.time() - quiet - 1
+        )
 
 
 if __name__ == "__main__":

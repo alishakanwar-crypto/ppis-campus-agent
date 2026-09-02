@@ -4,7 +4,7 @@ import asyncio
 import os
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -80,6 +80,19 @@ class AutoUpdateLoopTests(unittest.IsolatedAsyncioTestCase):
             await main._auto_update_loop()
         exit_now.assert_not_called()
 
+    async def test_no_exit_while_any_work_is_in_flight(self):
+        with patch.object(main, "_STARTED_BY_WRAPPER", True), \
+                patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
+                patch.object(
+                    main, "_work_in_flight", return_value="1 attendance job(s)"
+                ), \
+                patch.object(
+                    main, "_pending_update_commit", return_value="new1234"
+                ), \
+                patch.object(main.os, "_exit") as exit_now:
+            await self._run_one_pass()
+        exit_now.assert_not_called()
+
     async def test_a_broken_git_check_does_not_kill_the_loop(self):
         with patch.object(main, "_STARTED_BY_WRAPPER", True), \
                 patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
@@ -89,6 +102,36 @@ class AutoUpdateLoopTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.os, "_exit") as exit_now:
             await self._run_one_pass()
         exit_now.assert_not_called()
+
+
+class WorkInFlightTests(unittest.TestCase):
+    def setUp(self):
+        main._snapshot_tasks.clear()
+
+    def test_idle_agent_reports_nothing_in_flight(self):
+        with patch.object(main, "_live_requests_in_flight", 0), \
+                patch.object(
+                    main.attendance_engine, "work_in_flight", return_value=0
+                ):
+            self.assertEqual(main._work_in_flight(), "")
+
+    def test_a_snapshot_accepted_but_not_yet_counted_holds_the_update(self):
+        task = MagicMock()
+        task.done.return_value = False
+        main._snapshot_tasks.add(task)
+        self.addCleanup(main._snapshot_tasks.discard, task)
+        with patch.object(main, "_live_requests_in_flight", 0), \
+                patch.object(
+                    main.attendance_engine, "work_in_flight", return_value=0
+                ):
+            self.assertIn("queued snapshot", main._work_in_flight())
+
+    def test_attendance_recognition_holds_the_update(self):
+        with patch.object(main, "_live_requests_in_flight", 0), \
+                patch.object(
+                    main.attendance_engine, "work_in_flight", return_value=2
+                ):
+            self.assertIn("attendance job", main._work_in_flight())
 
 
 class WrapperContractTests(unittest.TestCase):

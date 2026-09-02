@@ -498,6 +498,9 @@ class AttendanceEngine:
     def __init__(self):
         self.running = False
         self.classwise_running = False
+        # Recognition, cloud sync and parent notifications that must finish
+        # before the agent may exit to pick up merged code.
+        self._work_in_flight = 0
         self.test_mode = True  # Only track test_person_id when True
         self.test_person_id = "TEST001"
         self.confidence_threshold = 0.40  # Student min confidence 40%
@@ -2176,6 +2179,22 @@ class AttendanceEngine:
 
     async def _sync_attendance_to_cloud(self, record: dict, parent_phones: str):
         """Report attendance record to cloud backend for dashboard display."""
+        self._work_in_flight += 1
+        try:
+            await self._sync_attendance_to_cloud_inner(record, parent_phones)
+        finally:
+            self._work_in_flight -= 1
+
+    def work_in_flight(self) -> int:
+        """Recognition and reporting work that must not be interrupted."""
+        pending = sum(
+            1 for task in self._background_tasks if not task.done()
+        )
+        return max(0, self._work_in_flight) + pending
+
+    async def _sync_attendance_to_cloud_inner(
+        self, record: dict, parent_phones: str
+    ):
         api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
         agent_secret = os.environ.get("AGENT_SECRET", "")
         headers = {"Content-Type": "application/json"}
@@ -2605,9 +2624,13 @@ class AttendanceEngine:
         loop = asyncio.get_event_loop()
         # Store loop reference so thread-pool code can schedule async tasks
         self._event_loop = loop
-        return await loop.run_in_executor(
-            None, self.recognize_faces_in_image,
-            frame, source, faces_subset, insightface_subset)
+        self._work_in_flight += 1
+        try:
+            return await loop.run_in_executor(
+                None, self.recognize_faces_in_image,
+                frame, source, faces_subset, insightface_subset)
+        finally:
+            self._work_in_flight -= 1
 
     # ------------------------------------------------------------------
     # Single-camera monitoring (existing test mode)

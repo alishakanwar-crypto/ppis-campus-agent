@@ -44,6 +44,8 @@ import cv2
 import httpx
 import numpy as np
 
+import recorder_auth
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -140,14 +142,28 @@ def capture_frame(channel: int, dvr_ip: str = "192.168.0.12") -> np.ndarray | No
     creds = DVR_CREDS.get(dvr_ip, {})
     dvr_user = creds.get("user", DVR_DEFAULT_USER)
     dvr_pass = creds.get("pass", "")
+    credential_key = recorder_auth.credential_key(dvr_user, dvr_pass)
+
+    # A recorder that already refused this login locks its admin account again
+    # on every further attempt, so this watcher stays away with the others.
+    if recorder_auth.is_refused(dvr_ip, credential_key):
+        return None
 
     try:
+        recorder_auth.note_attempt(dvr_ip)
         with httpx.Client(timeout=10.0) as client:
             resp = client.get(url, auth=httpx.DigestAuth(dvr_user, dvr_pass))
             if resp.status_code == 401:
-                resp = client.get(url, auth=httpx.BasicAuth(dvr_user, dvr_pass))
+                if not recorder_auth.recently_worked(dvr_ip):
+                    logger.error(
+                        "%s refused our login on ch%d; leaving the recorder "
+                        "alone so its lockout can expire", dvr_ip, channel,
+                    )
+                    recorder_auth.note_refusal(dvr_ip, credential_key)
+                return None
 
             if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+                recorder_auth.note_success(dvr_ip)
                 img_array = np.frombuffer(resp.content, dtype=np.uint8)
                 frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
                 return frame
