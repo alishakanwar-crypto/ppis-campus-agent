@@ -43,9 +43,10 @@ class TruncatedJpegTests(unittest.TestCase):
     def test_rejects_an_empty_answer(self):
         self.assertFalse(main._jpeg_is_complete(b""))
 
-    def test_leaves_bytes_that_are_not_a_picture_to_the_capture_path(self):
-        """A recorder's error page is judged as a failed door, not as a photo."""
-        self.assertTrue(main._jpeg_is_complete(b"<html>not a picture</html>"))
+    def test_rejects_bytes_that_are_not_a_picture(self):
+        """An error page, or a JPEG cut before its header finished."""
+        self.assertFalse(main._jpeg_is_complete(b"<html>not a picture</html>"))
+        self.assertFalse(main._jpeg_is_complete(_jpeg()[:8]))
 
     def test_rejects_a_jpeg_whose_middle_was_lost(self):
         whole = _jpeg()

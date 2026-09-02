@@ -462,12 +462,13 @@ def _jpeg_is_complete(data: bytes) -> bool:
             fmt = img.format
             img.load()
     except UnidentifiedImageError:
-        # Not a picture at all: that is somebody else's judgement to make,
-        # and the capture path already treats it as a failed door.
-        return True
+        # Cut short before its header finished, or not a picture at all.
+        return False
     except Exception:
         return False
     if fmt != "JPEG":
+        # Some recorders answer with a BMP or PNG; those carry their own
+        # completeness in the decode above.
         return True
     # Pillow can decode some cut-short pictures without complaining; a JPEG
     # that never reached its end marker is still only part of one.
@@ -1743,16 +1744,19 @@ async def _capture_snapshot_once(
             pictures += 1
             if (
                 not pixels
+                or variant >= 1
                 or pixels >= wanted_pixels
                 or (known_best and pixels >= known_best)
                 or pictures >= _LIVE_CAPTURE_PROBE_PICTURES
                 or time.monotonic() - started >= _LIVE_CAPTURE_PROBE_BUDGET_SECONDS
             ):
-                # As sharp as this channel is known to get, so take it.
+                # Only the resolution-request door is worth checking against
+                # the plain main stream, which some cameras serve sharper.
+                # Past that, further probing just made the parent wait for a
+                # photo no better than the one already in hand.
                 return keep(*best)
-            # Undersized on a channel we have never sized up: the sub-stream may
-            # have answered where the main stream should have, so try one more
-            # door before settling for a soft picture.
+            # The camera downscaled the size we asked for, so let the plain
+            # main stream answer before settling for a soft picture.
     if best is not None:
         return keep(*best)
     if (

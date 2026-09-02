@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+from fake_camera import JPEG
+
 import main
 
 
@@ -57,7 +59,7 @@ class SilentChannelShortcutTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_channel_that_answers_is_not_shortcut(self):
         """One silent door must not send a working channel to the video stream."""
-        picture = b"\xff\xd8jpeg\xff\xd9"
+        picture = JPEG
 
         class Client:
             async def get(_self, url, auth):
@@ -82,7 +84,7 @@ class SilentChannelShortcutTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_a_working_capture_forgets_the_shortcut(self):
-        picture = b"\xff\xd8jpeg\xff\xd9"
+        picture = JPEG
         main._live_capture_silent_channels[(DVR["ip"], 14)] = (
             main.time.monotonic()
         )

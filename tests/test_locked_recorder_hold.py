@@ -5,6 +5,8 @@ until its password changes."""
 import unittest
 from unittest.mock import patch
 
+from fake_camera import JPEG
+
 import main
 
 
@@ -94,9 +96,9 @@ class LockedRecorderHoldTests(unittest.IsolatedAsyncioTestCase):
         renamed = dict(DVR, password="new-password")
         self.assertFalse(main._credentials_refused(renamed))
 
-        client = RecordingClient(lambda url: Response(200, b"jpeg"))
+        client = RecordingClient(lambda url: Response(200, JPEG))
         with patch.object(main, "_get_live_dvr_client", return_value=client):
-            self.assertEqual(await main.capture_snapshot(renamed, 5), b"jpeg")
+            self.assertEqual(await main.capture_snapshot(renamed, 5), JPEG)
 
     async def test_the_dashboard_test_does_not_retry_a_refused_login(self):
         main._mark_isapi_auth_rejected(DVR)

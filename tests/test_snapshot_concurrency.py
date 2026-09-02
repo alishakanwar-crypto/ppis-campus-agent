@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from fake_camera import JPEG
+
 import attendance_engine
 import main
 
@@ -35,7 +37,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         class Response:
             status_code = 200
             headers = {"content-type": "image/jpeg"}
-            content = b"jpeg"
+            content = JPEG
 
         class Client:
             async def __aenter__(self):
@@ -57,7 +59,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.httpx, "AsyncClient", return_value=Client()):
             snapshot = await main.capture_snapshot(dvr, 3)
 
-        self.assertEqual(snapshot, b"jpeg")
+        self.assertEqual(snapshot, JPEG)
         self.assertEqual(
             requested_urls,
             [
@@ -74,7 +76,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, status_code):
                 self.status_code = status_code
                 self.headers = {"content-type": "image/jpeg"}
-                self.content = b"jpeg"
+                self.content = JPEG
 
         class Client:
             async def get(self, url, auth):
@@ -89,10 +91,10 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             "password": "password",
         }
         with patch.object(main.httpx, "AsyncClient", return_value=Client()):
-            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
+            self.assertEqual(await main.capture_snapshot(dvr, 3), JPEG)
             requested_urls.clear()
             # The working URL is remembered, so no repeat of the rejected one.
-            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
+            self.assertEqual(await main.capture_snapshot(dvr, 3), JPEG)
 
         self.assertEqual(
             requested_urls,
@@ -106,7 +108,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, status_code):
                 self.status_code = status_code
                 self.headers = {"content-type": "image/jpeg"}
-                self.content = b"jpeg"
+                self.content = JPEG
 
         class Client:
             main_stream_ok = False
@@ -124,15 +126,17 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             "password": "password",
         }
         with patch.object(main.httpx, "AsyncClient", return_value=Client()):
-            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
-            self.assertIn("/302/picture", requested_urls[-1])
+            self.assertEqual(await main.capture_snapshot(dvr, 3), JPEG)
+            self.assertTrue(
+                any("/302/picture" in url for url in requested_urls)
+            )
 
             Client.main_stream_ok = True
             main._live_capture_preference_age[("192.0.2.31", 3)] = (
                 main.time.monotonic() - main._LIVE_CAPTURE_FALLBACK_TTL_SECONDS - 1
             )
             requested_urls.clear()
-            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
+            self.assertEqual(await main.capture_snapshot(dvr, 3), JPEG)
 
         self.assertIn("videoResolutionWidth=1920", requested_urls[0])
 
@@ -141,7 +145,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, status_code):
                 self.status_code = status_code
                 self.headers = {"content-type": "image/jpeg"}
-                self.content = b"jpeg"
+                self.content = JPEG
 
         class Client:
             async def get(self, url, auth):
@@ -167,7 +171,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         class Response:
             status_code = 200
             headers = {"content-type": "image/jpeg"}
-            content = b"jpeg"
+            content = JPEG
 
         class Client:
             async def __aenter__(self):
@@ -210,7 +214,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 self.calls += 1
                 if self.calls == 1:
                     return Response(401)
-                return Response(200, b"jpeg")
+                return Response(200, JPEG)
 
         dvr = {
             "ip": "192.0.2.20",
@@ -219,9 +223,9 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             "password": "password",
         }
         with patch.object(main.httpx, "AsyncClient", return_value=Client()):
-            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
+            self.assertEqual(await main.capture_snapshot(dvr, 3), JPEG)
             requested.clear()
-            self.assertEqual(await main.capture_snapshot(dvr, 3), b"jpeg")
+            self.assertEqual(await main.capture_snapshot(dvr, 3), JPEG)
 
         self.assertEqual(len(requested), 1)
         self.assertIn("/301/picture", requested[0][0])
@@ -237,7 +241,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         class Response:
             status_code = 200
             headers = {"content-type": "image/jpeg"}
-            content = b"jpeg"
+            content = JPEG
 
         class Client:
             calls = 0
@@ -267,13 +271,13 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNone(first)
-        self.assertEqual(second, b"jpeg")
+        self.assertEqual(second, JPEG)
 
     async def test_snapshot_retries_transient_timeout_then_succeeds(self):
         class Response:
             status_code = 200
             headers = {"content-type": "image/jpeg"}
-            content = b"jpeg"
+            content = JPEG
 
         class Client:
             def __init__(self):
@@ -303,7 +307,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(main, "_SNAPSHOT_RETRY_BACKOFF_SECONDS", 0):
             snapshot = await main.capture_snapshot(dvr, 3)
 
-        self.assertEqual(snapshot, b"jpeg")
+        self.assertEqual(snapshot, JPEG)
         self.assertEqual(client.calls, 2)
 
     async def test_snapshot_exhaustion_uses_rtsp_fallback(self):
@@ -621,7 +625,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
 
         async def capture(_dvr, _channel):
             observed.append(main._live_request_deadline.get())
-            return b"jpeg"
+            return JPEG
 
         websocket = FakeWebSocket()
         with tempfile.TemporaryDirectory() as directory, patch.object(
@@ -731,7 +735,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 return 4
 
             def tobytes(self):
-                return b"jpeg"
+                return JPEG
 
         class Capture:
             def __init__(self, opened=False):
@@ -775,7 +779,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         finally:
             main._rtsp_timeout_warning_logged = previous_warning_state
 
-        self.assertEqual(frame, b"jpeg")
+        self.assertEqual(frame, JPEG)
         self.assertEqual(calls[0][0], "VideoCapture")
         self.assertEqual(calls[1][0], "parameterized_open")
         self.assertEqual(calls[2], ("release",))
@@ -802,7 +806,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             max_active_captures = max(max_active_captures, active_captures)
             await asyncio.sleep(0)
             active_captures -= 1
-            return b"jpeg"
+            return JPEG
 
         websocket = FakeWebSocket()
         with tempfile.TemporaryDirectory() as directory, patch.object(
@@ -832,7 +836,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         async def capture(_dvr, channel):
             if channel == 1:
                 await release_slow_camera.wait()
-            return b"jpeg"
+            return JPEG
 
         websocket = FakeWebSocket()
         with tempfile.TemporaryDirectory() as directory, patch.object(
@@ -867,7 +871,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             max_active_captures = max(max_active_captures, active_captures)
             await asyncio.sleep(0)
             active_captures -= 1
-            return b"jpeg"
+            return JPEG
 
         first_websocket = FakeWebSocket()
         second_websocket = FakeWebSocket()
@@ -894,7 +898,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         async def capture(_dvr, channel):
             if channel == 1:
                 await asyncio.sleep(1)
-            return b"jpeg"
+            return JPEG
 
         websocket = FakeWebSocket()
         with tempfile.TemporaryDirectory() as directory, patch.object(
@@ -926,7 +930,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         def capture(_ip, _port, _user, _password, channel):
             if channel != 99:
                 release.wait(5)
-            return b"jpeg"
+            return JPEG
 
         with patch.object(main, "_capture_frame_rtsp", side_effect=capture):
             background = [
@@ -941,7 +945,7 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             live = await asyncio.wait_for(
                 main._capture_snapshot_rtsp(dvr, 99), timeout=2
             )
-            self.assertEqual(live, b"jpeg")
+            self.assertEqual(live, JPEG)
             self.assertFalse(any(task.done() for task in background))
             release.set()
             await asyncio.gather(*background)

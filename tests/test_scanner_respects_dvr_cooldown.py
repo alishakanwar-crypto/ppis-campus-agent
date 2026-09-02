@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from fake_camera import JPEG
 
 import main
 from attendance_engine import AttendanceEngine
@@ -64,7 +65,7 @@ class ScannerCooldownTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_working_recorder_is_scanned_normally(self):
         client = AsyncMock()
         client.get.return_value = httpx.Response(
-            200, content=b"jpeg", headers={"content-type": "image/jpeg"}
+            200, content=JPEG, headers={"content-type": "image/jpeg"}
         )
         with patch.object(
             self.engine, "_get_dvr_client", return_value=client
@@ -74,7 +75,7 @@ class ScannerCooldownTests(unittest.IsolatedAsyncioTestCase):
         ):
             frame = await self.engine.capture_frame_from_dvr(DVR, 14)
 
-        self.assertEqual(frame, b"jpeg")
+        self.assertEqual(frame, JPEG)
         self.assertEqual(main._isapi_cooldown(DVR["ip"]), "")
 
     async def test_one_refusing_camera_does_not_pause_a_serving_recorder(self):
@@ -112,7 +113,7 @@ class ScannerCooldownTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_sweep_records_that_it_touched_the_recorder(self):
         client = AsyncMock()
         client.get.return_value = httpx.Response(
-            200, content=b"jpeg", headers={"content-type": "image/jpeg"}
+            200, content=JPEG, headers={"content-type": "image/jpeg"}
         )
         with patch.object(
             self.engine, "_get_dvr_client", return_value=client

@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+from fake_camera import JPEG
+
 import main
 
 
@@ -74,14 +76,14 @@ class DvrLoginBackoffTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_stream_refusing_still_falls_back_to_another_stream(self):
         def reply(url):
             if "/502/picture" in url:
-                return Response(200, b"jpeg")
+                return Response(200, JPEG)
             return Response(401)
 
         client = RecordingClient(reply)
         with patch.object(main, "_get_live_dvr_client", return_value=client):
             snapshot = await main.capture_snapshot(DVR, 5)
 
-        self.assertEqual(snapshot, b"jpeg")
+        self.assertEqual(snapshot, JPEG)
         self.assertEqual(main._isapi_cooldown("192.0.2.90"), "")
 
     async def test_a_missing_channel_does_not_hide_a_locked_recorder(self):
@@ -119,12 +121,12 @@ class DvrLoginBackoffTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_working_capture_clears_the_cooldown(self):
         main._isapi_cooldowns["192.0.2.90"] = (float("inf"), "not answering")
-        client = RecordingClient(lambda url: Response(200, b"jpeg"))
+        client = RecordingClient(lambda url: Response(200, JPEG))
         with patch.object(main, "_get_live_dvr_client", return_value=client):
             main._isapi_cooldowns.clear()
             snapshot = await main.capture_snapshot(DVR, 7)
 
-        self.assertEqual(snapshot, b"jpeg")
+        self.assertEqual(snapshot, JPEG)
         self.assertEqual(main._isapi_cooldown("192.0.2.90"), "")
 
     async def test_repeated_timeouts_send_later_captures_straight_to_rtsp(self):
