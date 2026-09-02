@@ -76,6 +76,33 @@ class SnapshotSharpnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(requested), 1)
         self.assertNotIn("videoResolutionWidth", requested[0])
 
+    async def test_a_soft_picture_from_the_day_does_not_settle_the_measurement(self):
+        """A parent's soft photo must not stop the night finding the sharp door."""
+        requested: list[str] = []
+        soft = jpeg(1280, 720)
+        sharp = jpeg(1920, 1080)
+        pictures = {"videoResolutionWidth": soft, "/301/picture": sharp}
+        dvr = {
+            "ip": "192.0.2.55",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        with patch.object(
+            main.httpx, "AsyncClient", return_value=self._client(pictures, requested)
+        ):
+            # During the day the first whole picture wins, soft as it is.
+            self.assertEqual(await main.capture_snapshot(dvr, 3), soft)
+            main._live_capture_preferences.clear()
+            main._live_capture_preference_age.clear()
+            main._measuring_cameras.set(True)
+            try:
+                self.assertEqual(
+                    await main.capture_snapshot(dvr, 3, background=True), sharp
+                )
+            finally:
+                main._measuring_cameras.set(False)
+
     async def test_a_parents_request_takes_one_door_only(self):
         """No comparing pictures while a parent waits: the first whole one wins."""
         requested: list[str] = []

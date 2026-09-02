@@ -52,6 +52,30 @@ class RememberedDoorTests(unittest.TestCase):
             main._load_capture_doors()
         self.assertEqual(main._live_capture_preferences, {})
 
+    def test_a_file_holding_a_list_is_ignored_instead_of_crashing_the_start(self):
+        path = self._file()
+        path.write_text('["192.0.2.60|7"]')
+        with patch.object(main, "_LIVE_CAPTURE_DOORS_FILE", path):
+            main._load_capture_doors()
+        self.assertEqual(main._live_capture_preferences, {})
+
+    def test_a_file_holding_null_doors_is_ignored(self):
+        path = self._file()
+        path.write_text('{"doors": null}')
+        with patch.object(main, "_LIVE_CAPTURE_DOORS_FILE", path):
+            main._load_capture_doors()
+        self.assertEqual(main._live_capture_preferences, {})
+
+    def test_a_door_number_we_do_not_have_is_not_remembered(self):
+        path = self._file()
+        path.write_text(
+            '{"doors": {"192.0.2.60|7": {"scheme": "digest", "variant": -1},'
+            ' "192.0.2.60|8": {"scheme": "digest", "variant": 99}}}'
+        )
+        with patch.object(main, "_LIVE_CAPTURE_DOORS_FILE", path):
+            main._load_capture_doors()
+        self.assertEqual(main._live_capture_preferences, {})
+
     def _file(self, name="doors.json"):
         return Path(tempfile.mkdtemp()) / name
 
