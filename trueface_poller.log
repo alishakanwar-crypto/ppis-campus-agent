@@ -1,0 +1,12 @@
+2026-08-14 02:28:38,614 [WARNING] Heartbeat post failed: cloud unavailable
+2026-08-14 02:28:38,615 [ERROR] Cloud API success response was not JSON: invalid response
+2026-08-14 02:28:38,615 [INFO] Retrying 1 previously failed event(s)...
+2026-08-14 02:28:38,616 [ERROR] Cloud API request failed (attempt 1/2): cloud unavailable
+2026-08-14 02:28:38,616 [ERROR] Cloud API request failed (attempt 2/2): cloud unavailable
+2026-08-14 02:28:38,616 [WARNING] Queued 1 event(s) for retry on next cycle
+2026-08-14 04:41:46,836 [WARNING] Heartbeat post failed: cloud unavailable
+2026-08-14 05:08:37,117 [WARNING] Heartbeat post failed: cloud unavailable
+2026-08-14 05:32:03,961 [INFO] Poller alive — 11:02:03 IST
+2026-08-14 05:32:03,961 [INFO] Poller alive — 11:02:03 IST
+2026-08-14 05:32:03,961 [WARNING] Heartbeat post failed: cloud unavailable
+2026-08-14 05:32:03,961 [INFO] Poller alive — 11:02:03 IST
