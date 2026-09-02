@@ -2461,8 +2461,17 @@ ws_task = None
 _ws_last_activity = 0.0
 _ws_disconnected_since = 0.0
 _ws_recycles = 0
+_ws_last_recycle = 0.0
+# A parent's request lands nowhere while the cloud cannot see us, so an
+# outage must be found in seconds rather than minutes.
 _WS_STALE_SECONDS = max(
-    60.0, float(os.environ.get("WS_STALE_SECONDS", "180"))
+    20.0, float(os.environ.get("WS_STALE_SECONDS", "45"))
+)
+_WS_LINK_CHECK_SECONDS = max(
+    5.0, float(os.environ.get("WS_LINK_CHECK_SECONDS", "15"))
+)
+_WS_RECYCLE_MIN_GAP_SECONDS = max(
+    10.0, float(os.environ.get("WS_RECYCLE_MIN_GAP_SECONDS", "45"))
 )
 _snapshot_tasks: set[asyncio.Task] = set()
 _live_requests_in_flight = 0
@@ -2525,7 +2534,18 @@ async def _recycle_websocket(reason: str) -> None:
     The socket can look open to us long after the cloud has stopped seeing
     us, and parents' requests then land nowhere. Rebuilding is cheap.
     """
-    global ws_connection, ws_task, _ws_recycles
+    global ws_connection, ws_task, _ws_recycles, _ws_last_recycle
+    if (
+        _ws_last_recycle
+        and time.monotonic() - _ws_last_recycle < _WS_RECYCLE_MIN_GAP_SECONDS
+    ):
+        logger.info(
+            "Cloud link was just rebuilt; letting it settle instead of "
+            "recycling again (%s)",
+            reason,
+        )
+        return
+    _ws_last_recycle = time.monotonic()
     _ws_recycles += 1
     logger.error("WATCHDOG: recycling the cloud link (%s)", reason)
     task = ws_task
@@ -2566,7 +2586,9 @@ async def _repair_cloud_link_if_needed() -> None:
         if not _ws_disconnected_since:
             _ws_disconnected_since = time.monotonic()
         elif time.monotonic() - _ws_disconnected_since > _WS_STALE_SECONDS:
-            await _recycle_websocket("no cloud link for over 3 minutes")
+            await _recycle_websocket(
+                f"no cloud link for over {_WS_STALE_SECONDS:.0f}s"
+            )
         return
     if await _cloud_says_we_are_connected() is False:
         # Our socket looks fine but the cloud has stopped seeing us, so the
@@ -2588,8 +2610,10 @@ async def websocket_client():
             async with websockets.connect(
                 url,
                 extra_headers={"X-Agent-Secret": secret},
-                ping_interval=30,
-                ping_timeout=30,
+                ping_interval=20,
+                ping_timeout=20,
+                open_timeout=15,
+                close_timeout=5,
                 max_size=10 * 1024 * 1024,  # 10 MB max message size
             ) as ws:
                 ws_connection = ws
@@ -3174,6 +3198,22 @@ def _restart_websocket_task_if_needed() -> bool:
     return True
 
 
+async def _cloud_link_watchdog():
+    """Keep the cloud link alive on its own clock.
+
+    The general health watchdog runs once a minute and does heavy work such
+    as face syncing, so an outage found there can cost a parent minutes of
+    silence. This loop does nothing but watch the link.
+    """
+    while True:
+        await asyncio.sleep(_WS_LINK_CHECK_SECONDS)
+        try:
+            if not _restart_websocket_task_if_needed():
+                await _repair_cloud_link_if_needed()
+        except Exception:
+            logger.exception("Cloud link watchdog failed")
+
+
 async def _health_watchdog():
     """Background watchdog that monitors system health and auto-recovers.
 
@@ -3191,9 +3231,6 @@ async def _health_watchdog():
     while True:
         await asyncio.sleep(60)
         try:
-            if not _restart_websocket_task_if_needed():
-                await _repair_cloud_link_if_needed()
-
             # --- Check 1: Classwise monitoring alive ---
             if attendance_engine._health.get("auto_start_enabled", True):
                 if not attendance_engine.classwise_running and not attendance_engine.running:
@@ -3438,6 +3475,8 @@ async def lifespan(app: FastAPI):
             logger.error(f"Health watchdog failed: {e}", exc_info=True)
 
     asyncio.create_task(_delayed_watchdog())
+    # Watch the cloud link on its own fast clock, from the first seconds
+    asyncio.create_task(_cloud_link_watchdog())
     # Re-try a locked-out recorder by itself once its lock has had silence to
     # expire, so nobody has to reboot a DVR to get its classrooms back.
     asyncio.create_task(_unlock_watch_loop())
