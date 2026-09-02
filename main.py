@@ -655,6 +655,24 @@ _LIVE_CAPTURE_SILENT_CHANNEL_TTL_SECONDS = max(
     0.0, float(os.environ.get("SNAPSHOT_SILENT_CHANNEL_TTL_SECONDS", "300"))
 )
 _live_capture_silent_channels: dict[tuple[str, int], float] = {}
+# How recently a recorder must have served a picture for a silent channel to
+# count as "the recorder is busy" rather than "these doors are dead".
+_LIVE_CAPTURE_BUSY_RECORDER_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_BUSY_RECORDER_SECONDS", "120"))
+)
+# How many load-suspected silences a channel is forgiven before it is treated
+# as dead anyway, so a genuinely broken door cannot cost every parent its wait.
+_LIVE_CAPTURE_BUSY_FORGIVENESS = max(
+    1, int(os.environ.get("SNAPSHOT_BUSY_FORGIVENESS", "3"))
+)
+_live_capture_busy_silences: dict[tuple[str, int], int] = {}
+# Parents asking for one classroom at the same moment share the capture that is
+# already running, instead of each queueing more work on the recorder.
+_LIVE_CAPTURE_SHARING = (
+    os.environ.get("SNAPSHOT_SHARE_CAPTURES", "1").strip().lower()
+    not in {"0", "false", "no"}
+)
+_live_capture_in_flight: dict[tuple[str, int], asyncio.Task] = {}
 # A parent's photo is worth the bytes: WhatsApp accepts images up to 5 MB, so
 # only squeeze quality when the picture is far bigger than that.
 _LIVE_SNAPSHOT_MAX_BYTES = max(
@@ -952,6 +970,14 @@ def _credentials_refused(dvr: dict) -> bool:
     return False
 
 
+def _isapi_served_recently(ip: str) -> bool:
+    """Whether this recorder answered a snapshot door in the last moments."""
+    last = _isapi_last_success.get(ip)
+    if last is None or _LIVE_CAPTURE_BUSY_RECORDER_SECONDS <= 0:
+        return False
+    return (time.monotonic() - last) <= _LIVE_CAPTURE_BUSY_RECORDER_SECONDS
+
+
 def _isapi_recently_worked(ip: str) -> bool:
     """Whether this recorder handed us a picture recently enough to be trusted."""
     last = _isapi_last_success.get(ip)
@@ -980,11 +1006,28 @@ def _channel_doors_silent(ip: str, channel: int) -> bool:
         time.monotonic() - since
     ) > _LIVE_CAPTURE_SILENT_CHANNEL_TTL_SECONDS:
         _live_capture_silent_channels.pop((ip, channel), None)
+        _live_capture_busy_silences.pop((ip, channel), None)
         return False
     return True
 
 
 def _mark_channel_doors_silent(ip: str, channel: int) -> None:
+    # A recorder that served another classroom moments ago is busy, not deaf:
+    # blacklisting the channel then sends every later request down the slow
+    # video road for minutes because of one crowded moment.
+    if (
+        (ip, channel) not in _live_capture_silent_channels
+        and _isapi_served_recently(ip)
+    ):
+        silences = _live_capture_busy_silences.get((ip, channel), 0) + 1
+        _live_capture_busy_silences[(ip, channel)] = silences
+        if silences < _LIVE_CAPTURE_BUSY_FORGIVENESS:
+            logger.info(
+                "%s ch%d: no door answered, but the recorder served another "
+                "classroom moments ago; keeping its doors in use (%d/%d)",
+                ip, channel, silences, _LIVE_CAPTURE_BUSY_FORGIVENESS,
+            )
+            return
     if (ip, channel) not in _live_capture_silent_channels:
         logger.warning(
             "%s ch%d: no snapshot door answers; using the video stream for "
@@ -1681,6 +1724,67 @@ async def capture_snapshot(
     classroom: str = "",
     deadline: float | None = None,
 ) -> bytes | None:
+    """Capture a live JPEG, sharing one capture between parents asking together.
+
+    Several parents of one class used to queue a separate capture each, which is
+    what turned a crowded minute into a half-minute wait: the recorder was
+    answering, just for everybody at once. The classroom scanner keeps its own
+    capture — recognising faces needs the frame of its own sweep.
+    """
+    if background or not _LIVE_CAPTURE_SHARING:
+        return await _capture_snapshot_now(
+            dvr,
+            channel,
+            background=background,
+            classroom=classroom,
+            deadline=deadline,
+        )
+    key = (dvr["ip"], channel)
+    report = _live_capture_report.get()
+    task = _live_capture_in_flight.get(key)
+    mine = task is None or task.done()
+    if mine:
+        task = asyncio.create_task(
+            _capture_snapshot_now(
+                dvr,
+                channel,
+                background=False,
+                classroom=classroom,
+                deadline=deadline,
+            )
+        )
+        _live_capture_in_flight[key] = task
+    else:
+        logger.info(
+            "%s ch%d: waiting on the capture already running for %s",
+            key[0], channel, classroom or _live_request_classroom.get() or "-",
+        )
+    try:
+        # Shielded, so a caller whose own request times out does not cancel the
+        # capture the other waiting parents are relying on.
+        picture = await asyncio.shield(task)
+    finally:
+        if mine and _live_capture_in_flight.get(key) is task:
+            _live_capture_in_flight.pop(key, None)
+    if not mine and report is not None and not report:
+        report.update({
+            "seconds": 0.0,
+            "shared": True,
+            "recorder": key[0],
+            "channel": channel,
+            "outcome": "success" if picture else "failed",
+        })
+    return picture
+
+
+async def _capture_snapshot_now(
+    dvr: dict,
+    channel: int,
+    *,
+    background: bool = False,
+    classroom: str = "",
+    deadline: float | None = None,
+) -> bytes | None:
     """Capture a JPEG snapshot from a Hikvision NVR via ISAPI.
 
     Hikvision DS-9664NI-ST / DS-7632NXI-K2 supports:
@@ -1845,6 +1949,7 @@ async def capture_snapshot(
                         _isapi_last_success[ip] = time.monotonic()
                         _channel_auth_cooldowns.pop((ip, channel), None)
                         _live_capture_silent_channels.pop((ip, channel), None)
+                        _live_capture_busy_silences.pop((ip, channel), None)
                         _clear_isapi_failures(ip)
                         return snapshot
                     _last_capture_error = f"{ip} ch{channel}: ISAPI capture failed"
