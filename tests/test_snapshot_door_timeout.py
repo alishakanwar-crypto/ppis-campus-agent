@@ -32,6 +32,7 @@ class SnapshotDoorTimeoutTests(unittest.IsolatedAsyncioTestCase):
         main._live_capture_slow_doors.clear()
         main._isapi_cooldowns.clear()
         main._isapi_consecutive_timeouts.clear()
+        main._isapi_last_success.clear()
         main._rtsp_cooldowns.clear()
         main._live_capture_silent_channels.clear()
         self.dvr = {
