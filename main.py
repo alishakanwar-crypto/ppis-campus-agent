@@ -930,8 +930,17 @@ def _release_locked_paths(said: str) -> list[str]:
     unlink an open file, so every self-update failed on them and the campus PC
     ran the previous day's code. Marking them skip-worktree lets the code move
     without touching those files.
+
+    Only log files are released: skip-worktree on a source file would freeze
+    it at its current contents, and the agent would run stale code for good.
     """
-    paths = sorted(set(_LOCKED_FILE_PATTERN.findall(said)))
+    paths = sorted(
+        {
+            path
+            for path in _LOCKED_FILE_PATTERN.findall(said)
+            if path.endswith(".log")
+        }
+    )
     if not paths:
         return []
     try:
