@@ -8,7 +8,9 @@ agent.lock
 .agent_lock
 .locks/
 wrapper_*.log*
-wrapper_*.log*
+# The agents keep these open while they run, so a self-update cannot
+# delete them on Windows; untracked they never block a pull again.
+*.log
 
 # Per-machine local config and persistent counter state.
 # Not tracked so restart scripts (git reset --hard) never overwrite them.

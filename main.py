@@ -920,6 +920,40 @@ def _pending_update_commit() -> str:
     return remote
 
 
+_LOCKED_FILE_PATTERN = re.compile(r"unable to unlink old '([^']+)'")
+
+
+def _release_locked_paths(said: str) -> list[str]:
+    """Tell git to leave alone the files it could not delete; those paths.
+
+    The agent's own log files are open while it runs, and Windows refuses to
+    unlink an open file, so every self-update failed on them and the campus PC
+    ran the previous day's code. Marking them skip-worktree lets the code move
+    without touching those files.
+    """
+    paths = sorted(set(_LOCKED_FILE_PATTERN.findall(said)))
+    if not paths:
+        return []
+    try:
+        done = subprocess.run(
+            ["git", "update-index", "--skip-worktree", "--", *paths],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception as exc:
+        logger.debug("git update-index failed: %s", _exception_text(exc))
+        return []
+    if done.returncode != 0:
+        logger.debug(
+            "git update-index failed: %s", done.stderr.strip()[:200]
+        )
+        return []
+    return paths
+
+
 def _pull_merged_code(commit: str) -> str:
     """Move this checkout onto the merged code; '' when HEAD actually moved.
 
@@ -938,20 +972,24 @@ def _pull_merged_code(commit: str) -> str:
         ("reset", "--hard", "refs/remotes/origin/main", "--"),
     )
     for args in steps:
-        try:
-            done = subprocess.run(
-                ["git", *args],
-                cwd=str(Path(__file__).resolve().parent),
-                capture_output=True,
-                text=True,
-                timeout=180,
-                check=False,
-            )
-        except Exception as exc:
-            return f"git {args[0]} failed: {_exception_text(exc)}"
-        if done.returncode != 0:
-            said = (done.stderr or done.stdout).strip()[:200]
-            return f"git {args[0]} failed: {said or done.returncode}"
+        for attempt in (0, 1):
+            try:
+                done = subprocess.run(
+                    ["git", *args],
+                    cwd=str(Path(__file__).resolve().parent),
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    check=False,
+                )
+            except Exception as exc:
+                return f"git {args[0]} failed: {_exception_text(exc)}"
+            if done.returncode == 0:
+                break
+            said = (done.stderr or done.stdout).strip()
+            if attempt == 0 and _release_locked_paths(said):
+                continue
+            return f"git {args[0]} failed: {said[:200] or done.returncode}"
     after = _git("rev-parse", "--short", "HEAD")
     if not after or after == before:
         return f"still on {before or 'unknown'} after pulling {commit}"
