@@ -52,6 +52,33 @@ class SecondAngleRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts[26], 2)
         self.assertEqual(attempts[22], 1)
 
+    async def test_a_silent_classroom_is_tried_again_before_failing(self):
+        """A busy recorder usually serves the second attempt."""
+        attempts = {22: 0, 26: 0}
+
+        async def capture(classroom, camera):
+            _, channel, desc = camera
+            attempts[channel] += 1
+            if attempts[channel] == 1:
+                return None
+            return JPEG, f"{desc}.jpg", desc, {}
+
+        ws = FakeWs()
+        with patch.object(
+            main, "find_all_cameras_for_classroom", return_value=CAMERAS
+        ), patch.object(main, "_capture_classroom_camera", capture), patch.object(
+            main, "compress_jpeg", lambda data, *a, **k: data
+        ):
+            await main._handle_snapshot_request(ws, "NUR-3", "req-silent")
+
+        images = [m for m in ws.sent if m["type"] == "snapshot_image"]
+        self.assertEqual(
+            sorted(m["description"] for m in images), ["NUR-3 C1", "NUR-3 C2"]
+        )
+        self.assertFalse(
+            [m for m in ws.sent if m["type"] == "snapshot_response"], ws.sent
+        )
+
     async def test_no_retry_when_the_request_has_no_time_left(self):
         """Retrying must never cost the parent the photo already taken."""
         attempts = {22: 0, 26: 0}

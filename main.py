@@ -3556,10 +3556,15 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         return missed
 
     missed = await send_captured(wanted)
-    if missed and sent_count:
+    if missed:
         # One angle answering and the other not is what makes a parent see a
         # single photo of a two-camera classroom; the room is reachable, so
         # the quiet camera is worth one more try while the request lives.
+        # A classroom where neither camera answered is worth the same second
+        # try: a recorder that was busy for the first attempt usually serves
+        # the second, and telling the parent "unable to capture" with request
+        # time still in hand is the failure they actually see. A recorder that
+        # refused our login answers the retry without a login attempt.
         deadline = _live_request_deadline.get()
         left = _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS if deadline is None else (
             deadline - time.monotonic()
