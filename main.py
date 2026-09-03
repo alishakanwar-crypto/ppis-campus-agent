@@ -2057,9 +2057,12 @@ async def _capture_snapshot_once(
                 timeout=max(0.1, door_budget),
             )
         except (asyncio.TimeoutError, httpx.ReadTimeout):
+            # Remembered before anything is returned: a door that hangs while
+            # we probe for a sharper picture would otherwise be probed again
+            # by the next parent, and each of them waits out the same hang.
+            _live_capture_slow_doors.setdefault(key, {})[variant] = time.monotonic()
             if best is not None:
                 return keep(*best)
-            _live_capture_slow_doors.setdefault(key, {})[variant] = time.monotonic()
             silent_variants.add(variant)
             if metrics is not None:
                 metrics["door_timeouts"] = metrics.get("door_timeouts", 0) + 1

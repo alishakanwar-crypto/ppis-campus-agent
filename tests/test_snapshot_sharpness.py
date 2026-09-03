@@ -25,6 +25,7 @@ class SnapshotSharpnessTests(unittest.IsolatedAsyncioTestCase):
         main._live_capture_preference_age.clear()
         main._live_capture_best_pixels.clear()
         main._live_capture_size_logged.clear()
+        main._live_capture_slow_doors.clear()
 
     def _client(self, pictures: dict[str, bytes], requested: list[str]):
         class Response:
@@ -148,6 +149,43 @@ class SnapshotSharpnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("videoResolutionWidth" in url for url in requested), requested
         )
+
+    async def test_a_hung_full_size_door_is_probed_once_only(self):
+        """Otherwise every parent in turn waits out the same dead door."""
+        requested: list[str] = []
+        tiny = jpeg(704, 480)
+
+        class Response:
+            status_code = 200
+            headers = {"content-type": "image/jpeg"}
+            content = tiny
+
+        class Client:
+            async def get(_self, url, auth):
+                requested.append(url)
+                if "videoResolutionWidth" in url:
+                    await asyncio.sleep(30)
+                return Response()
+
+        dvr = {
+            "ip": "192.0.2.57",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        now = main.time.monotonic()
+        main._live_capture_preferences[("192.0.2.57", 3)] = ("digest", 2)
+        main._live_capture_preference_age[("192.0.2.57", 3)] = now
+        with patch.object(main, "_save_capture_doors"), patch.object(
+            main, "_LIVE_CAPTURE_PROBE_BUDGET_SECONDS", 0.2
+        ), patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            self.assertEqual(await main.capture_snapshot(dvr, 3), tiny)
+            self.assertEqual(len(requested), 2)
+            requested.clear()
+            self.assertEqual(await main.capture_snapshot(dvr, 3), tiny)
+
+        self.assertEqual(len(requested), 1)
+        self.assertNotIn("videoResolutionWidth", requested[0])
 
     async def test_a_720p_camera_is_measured_once_and_then_trusted(self):
         requested: list[str] = []
