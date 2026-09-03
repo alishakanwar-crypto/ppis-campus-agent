@@ -2098,7 +2098,19 @@ async def _capture_snapshot_once(
             if best is None or pixels > best[3]:
                 best = (scheme, variant, response.content, pixels)
             pictures += 1
-            if (
+            # A door serving far less than was asked for (a sub-stream giving
+            # 704x480 against 1080p) reaches the parent as a soft classroom,
+            # so the full-size door is worth one try inside the probe budget.
+            soft = bool(
+                wanted_pixels
+                and pixels
+                and pixels * 3 < wanted_pixels
+                and 0 not in sized_variants
+                and 0 not in silent_variants
+                and 0 not in (slow_doors or {})
+                and time.monotonic() - started < probe_budget
+            )
+            if not soft and (
                 not pixels
                 or variant >= 1
                 or pixels >= wanted_pixels

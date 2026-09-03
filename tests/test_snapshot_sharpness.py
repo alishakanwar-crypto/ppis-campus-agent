@@ -122,6 +122,33 @@ class SnapshotSharpnessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(requested), 1)
 
+    async def test_a_sub_stream_door_does_not_settle_a_parents_photo(self):
+        """704x480 out of a sub-stream door is what parents call blurred.
+
+        The remembered door is taken first, so a channel remembered on its
+        sub-stream kept handing parents a quarter-size classroom.
+        """
+        requested: list[str] = []
+        tiny = jpeg(704, 480)
+        sharp = jpeg(1920, 1080)
+        pictures = {"/302/picture": tiny, "videoResolutionWidth": sharp}
+        dvr = {
+            "ip": "192.0.2.56",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        main._live_capture_preferences[("192.0.2.56", 3)] = ("digest", 2)
+        main._live_capture_preference_age[("192.0.2.56", 3)] = main.time.monotonic()
+        with patch.object(main, "_save_capture_doors"), patch.object(
+            main.httpx, "AsyncClient", return_value=self._client(pictures, requested)
+        ):
+            self.assertEqual(await main.capture_snapshot(dvr, 3), sharp)
+
+        self.assertTrue(
+            any("videoResolutionWidth" in url for url in requested), requested
+        )
+
     async def test_a_720p_camera_is_measured_once_and_then_trusted(self):
         requested: list[str] = []
         soft = jpeg(1280, 720)
