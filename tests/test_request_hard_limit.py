@@ -6,6 +6,7 @@ which stops the agent taking merged fixes at all — the campus PC ran a whole
 day's parent traffic on old code because of one such request.
 """
 import asyncio
+import importlib
 import os
 import sys
 import unittest
@@ -33,6 +34,19 @@ class RequestHardLimitTests(unittest.IsolatedAsyncioTestCase):
             main._SNAPSHOT_REQUEST_HARD_LIMIT_SECONDS,
             main._SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS * 2,
         )
+
+    async def test_a_longer_configured_budget_still_fits(self):
+        """A raised request budget must raise the backstop with it."""
+        with patch.dict(
+            os.environ,
+            {"SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS": "120"},
+        ):
+            importlib.reload(main)
+            self.assertGreater(
+                main._SNAPSHOT_REQUEST_HARD_LIMIT_SECONDS,
+                main._SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS * 2,
+            )
+        importlib.reload(main)
 
 
 if __name__ == "__main__":

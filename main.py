@@ -2892,8 +2892,12 @@ _SNAPSHOT_SECOND_ANGLE_RETRY_SECONDS = max(
 # to a cloud link that has died can block with nothing to time it out, and
 # such a request is then counted as work in flight for ever: that is what
 # held merged fixes off the campus PC for a whole day.
+# It is a backstop and never a shorter leash than the request's own budget,
+# whatever that budget is set to, so it cannot take a photo off a parent.
 _SNAPSHOT_REQUEST_HARD_LIMIT_SECONDS = max(
-    30.0, float(os.environ.get("SNAPSHOT_REQUEST_HARD_LIMIT_SECONDS", "90"))
+    30.0,
+    _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS * 2 + 30.0,
+    float(os.environ.get("SNAPSHOT_REQUEST_HARD_LIMIT_SECONDS", "90")),
 )
 
 
