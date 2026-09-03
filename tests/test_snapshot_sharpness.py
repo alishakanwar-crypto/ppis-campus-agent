@@ -177,7 +177,9 @@ class SnapshotSharpnessTests(unittest.IsolatedAsyncioTestCase):
         main._live_capture_preferences[("192.0.2.57", 3)] = ("digest", 2)
         main._live_capture_preference_age[("192.0.2.57", 3)] = now
         with patch.object(main, "_save_capture_doors"), patch.object(
-            main, "_LIVE_CAPTURE_PROBE_BUDGET_SECONDS", 0.2
+            main, "_LIVE_CAPTURE_PROBE_BUDGET_SECONDS", 1.0
+        ), patch.object(
+            main, "_LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS", 0.2
         ), patch.object(main.httpx, "AsyncClient", return_value=Client()):
             self.assertEqual(await main.capture_snapshot(dvr, 3), tiny)
             self.assertEqual(len(requested), 2)
@@ -186,6 +188,44 @@ class SnapshotSharpnessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(requested), 1)
         self.assertNotIn("videoResolutionWidth", requested[0])
+
+    async def test_a_door_cut_short_by_the_probe_budget_is_not_rested(self):
+        """Resting it would keep parents on the quarter-size picture."""
+        requested: list[str] = []
+        tiny = jpeg(704, 480)
+        sharp = jpeg(1920, 1080)
+
+        class Response:
+            def __init__(_self, content):
+                _self.status_code = 200
+                _self.headers = {"content-type": "image/jpeg"}
+                _self.content = content
+
+        class Client:
+            async def get(_self, url, auth):
+                requested.append(url)
+                if "videoResolutionWidth" in url:
+                    await asyncio.sleep(0.3)
+                    return Response(sharp)
+                return Response(tiny)
+
+        dvr = {
+            "ip": "192.0.2.58",
+            "port": 80,
+            "username": "admin",
+            "password": "password",
+        }
+        now = main.time.monotonic()
+        main._live_capture_preferences[("192.0.2.58", 3)] = ("digest", 2)
+        main._live_capture_preference_age[("192.0.2.58", 3)] = now
+        with patch.object(main, "_save_capture_doors"), patch.object(
+            main, "_LIVE_CAPTURE_PROBE_BUDGET_SECONDS", 0.1
+        ), patch.object(
+            main, "_LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS", 3.0
+        ), patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            self.assertEqual(await main.capture_snapshot(dvr, 3), tiny)
+
+        self.assertEqual(main._live_capture_slow_doors.get(("192.0.2.58", 3)), None)
 
     async def test_a_720p_camera_is_measured_once_and_then_trusted(self):
         requested: list[str] = []

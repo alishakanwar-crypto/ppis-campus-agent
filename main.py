@@ -2041,16 +2041,19 @@ async def _capture_snapshot_once(
             continue
         seen.add((scheme, variant))
         auth = digest_auth if scheme == "digest" else httpx.BasicAuth(user, pwd)
-        door_budget = (
+        full_budget = (
             _LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS
             if door_budget_seconds is None else door_budget_seconds
         )
+        door_budget = full_budget
         if best is not None:
             # Probing for something sharper must never cost the picture we have.
             door_budget = min(
                 door_budget,
                 probe_budget - (time.monotonic() - started),
             )
+        # Whether the door was given enough time for silence to mean anything.
+        fair_chance = door_budget >= full_budget / 2
         try:
             response = await asyncio.wait_for(
                 client.get(urls[variant], auth=auth),
@@ -2060,7 +2063,12 @@ async def _capture_snapshot_once(
             # Remembered before anything is returned: a door that hangs while
             # we probe for a sharper picture would otherwise be probed again
             # by the next parent, and each of them waits out the same hang.
-            _live_capture_slow_doors.setdefault(key, {})[variant] = time.monotonic()
+            # A door cut short by the little probe time left is not slow, and
+            # resting it would keep sending the smaller picture we already hold.
+            if fair_chance:
+                _live_capture_slow_doors.setdefault(key, {})[variant] = (
+                    time.monotonic()
+                )
             if best is not None:
                 return keep(*best)
             silent_variants.add(variant)
