@@ -836,6 +836,11 @@ _STARTED_BY_WRAPPER = os.environ.get("PPIS_WRAPPER", "") == "1"
 _AUTO_UPDATE_MAX_HOLD_SECONDS = max(
     60.0, float(os.environ.get("AUTO_UPDATE_MAX_HOLD_SECONDS", "900"))
 )
+# A last pause before taking the code anyway, long enough for a photo that
+# started while we were counting to be delivered rather than cut off.
+_AUTO_UPDATE_GRACE_SECONDS = max(
+    5.0, float(os.environ.get("AUTO_UPDATE_GRACE_SECONDS", "30"))
+)
 
 
 def _git(*args: str) -> str:
@@ -971,6 +976,16 @@ def _work_in_flight() -> str:
     return ", ".join(reasons)
 
 
+async def _work_clears(within: float) -> bool:
+    """Wait up to `within` seconds for the agent to fall idle."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        if not _work_in_flight():
+            return True
+        await asyncio.sleep(1.0)
+    return not _work_in_flight()
+
+
 async def _auto_update_loop() -> None:
     """Restart onto merged code by ourselves, so no one has to do it.
 
@@ -987,7 +1002,6 @@ async def _auto_update_loop() -> None:
             "so merged fixes will not reach this PC by themselves"
         )
         return
-    held_commit = ""
     held_since = 0.0
     while True:
         try:
@@ -997,12 +1011,14 @@ async def _auto_update_loop() -> None:
                 continue
             busy = _work_in_flight()
             if not busy:
-                held_commit = ""
+                held_since = 0.0
                 _auto_update_state["held_by"] = ""
                 _auto_update_state["held_since_ist"] = ""
             else:
-                if held_commit != commit:
-                    held_commit = commit
+                # The hold is timed from when work first stood in the way of
+                # any update, not from this commit: a merge every few minutes
+                # would otherwise reset the clock and nothing would ever land.
+                if not held_since:
                     held_since = time.monotonic()
                     _auto_update_state["held_since_ist"] = datetime.now(
                         _IST
@@ -1017,11 +1033,15 @@ async def _auto_update_loop() -> None:
                     continue
                 # Work that outlasts every real job is stuck work, and a fix
                 # merged for parents cannot sit behind it for the rest of the
-                # day: the wrapper brings the agent straight back.
-                logger.warning(
-                    "Taking merged code %s after holding %.0fs for %s",
-                    commit, held_for, busy,
-                )
+                # day. A last grace pause first, so a job that started while
+                # we were counting is not cut off mid-delivery.
+                if await _work_clears(_AUTO_UPDATE_GRACE_SECONDS):
+                    logger.info("Work cleared; taking merged code %s", commit)
+                else:
+                    logger.warning(
+                        "Taking merged code %s after holding %.0fs for %s",
+                        commit, held_for, busy,
+                    )
             failed = await asyncio.to_thread(_pull_merged_code, commit)
             if failed:
                 # Restarting now would only bring the agent back on the same
