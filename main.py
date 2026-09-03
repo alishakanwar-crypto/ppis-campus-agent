@@ -3289,9 +3289,13 @@ async def _capture_classroom_camera(
     _live_capture_report.set(report)
     try:
         request_deadline = _live_request_deadline.get()
+        # capture_snapshot() keeps the camera to its own budget from the moment
+        # the camera is actually asked; cutting it off here at the same number
+        # charges the queue behind other parents on the recorder to the camera
+        # again, and the request dies without a camera having been asked.
         timeout = _SNAPSHOT_CAMERA_TIMEOUT_SECONDS
         if request_deadline is not None:
-            timeout = max(0.1, min(timeout, request_deadline - time.monotonic()))
+            timeout = max(0.1, request_deadline - time.monotonic())
         snapshot = await asyncio.wait_for(
             capture_snapshot(dvr, channel),
             timeout=timeout,
