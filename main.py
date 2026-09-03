@@ -641,6 +641,10 @@ _RTSP_COOLDOWN_SECONDS = max(
     1.0, float(os.environ.get("RTSP_FAILURE_COOLDOWN_SECONDS", "120"))
 )
 _rtsp_cooldowns: dict[str, float] = {}
+# One camera whose video stream cannot be opened is a camera, not a recorder:
+# kept per channel so its classroom stops being pushed onto a road that does
+# not work for it, while its recorder keeps serving every other classroom.
+_rtsp_channel_cooldowns: dict[tuple[str, int], float] = {}
 _rtsp_timeout_warning_logged = False
 _rtsp_timeout_warning_lock = threading.Lock()
 _live_dvr_clients: dict[str, httpx.AsyncClient] = {}
@@ -1096,17 +1100,40 @@ def _rtsp_cooldown_active(ip: str) -> bool:
     return True
 
 
-def _mark_rtsp_failure(ip: str) -> None:
-    _rtsp_cooldowns[ip] = time.monotonic() + _RTSP_COOLDOWN_SECONDS
+def _rtsp_channel_cooldown_active(ip: str, channel: int) -> bool:
+    """True while this one channel's video stream is resting after failing."""
+    expires_at = _rtsp_channel_cooldowns.get((ip, channel), 0.0)
+    if expires_at <= time.monotonic():
+        _rtsp_channel_cooldowns.pop((ip, channel), None)
+        return False
+    return True
+
+
+def _mark_rtsp_failure(ip: str, channel: int | None = None) -> None:
+    now = time.monotonic()
     # A stream that worked before the recorder locked itself must stop
     # vouching for the login, or every later failure goes uncounted and the
     # fallback keeps knocking on a locked account.
     if ip in _refused_credentials:
         _rtsp_credentials_worked.pop(ip, None)
+    if channel is not None:
+        _rtsp_channel_cooldowns[(ip, channel)] = now + _RTSP_COOLDOWN_SECONDS
+        others = any(
+            key[0] == ip and key[1] != channel and until > now
+            for key, until in _rtsp_channel_cooldowns.items()
+        )
+        if not others:
+            # The recorder itself is only rested once a second channel fails
+            # too: resting it for one dead camera sent every classroom on it
+            # down the wrong road for two minutes.
+            return
+    _rtsp_cooldowns[ip] = now + _RTSP_COOLDOWN_SECONDS
 
 
-def _clear_rtsp_failure(ip: str) -> None:
+def _clear_rtsp_failure(ip: str, channel: int | None = None) -> None:
     _rtsp_cooldowns.pop(ip, None)
+    if channel is not None:
+        _rtsp_channel_cooldowns.pop((ip, channel), None)
 
 
 # A recorder that refuses our credentials locks the account for a while after a
@@ -2343,6 +2370,7 @@ async def _capture_snapshot_now(
         if (
             not cooldown_reason
             and not _rtsp_cooldown_active(ip)
+            and not _rtsp_channel_cooldown_active(ip, channel)
             and _channel_doors_silent(ip, channel)
         ):
             # Every door of this channel was silent a moment ago; waiting on
@@ -2524,6 +2552,13 @@ async def _capture_snapshot_now(
                     or _isapi_cooldown(ip)
                 )
                 and not _rtsp_cooldown_active(ip)
+                # A stream that just failed for this camera is worth one more
+                # try only when its snapshot doors were not tried at all —
+                # otherwise it is the road with nothing left to give.
+                and not (
+                    _rtsp_channel_cooldown_active(ip, channel)
+                    and not skip_isapi
+                )
             ):
                 logger.info("ISAPI exhausted for %s ch%d, trying RTSP fallback", ip, channel)
                 _note_rtsp_attempt_while_refused(dvr)
@@ -2537,14 +2572,14 @@ async def _capture_snapshot_now(
                     if rtsp_frame:
                         metrics["rtsp"] = True
                         metrics["outcome"] = "success"
-                        _clear_rtsp_failure(ip)
+                        _clear_rtsp_failure(ip, channel)
                         _note_rtsp_success(dvr)
                         _last_capture_error = ""
                         return rtsp_frame
-                    _mark_rtsp_failure(ip)
+                    _mark_rtsp_failure(ip, channel)
                     metrics["rtsp"] = True
                 except asyncio.TimeoutError:
-                    _mark_rtsp_failure(ip)
+                    _mark_rtsp_failure(ip, channel)
                     metrics["rtsp"] = True
                     logger.warning(
                         "RTSP fallback timed out from %s ch%d",
@@ -2552,7 +2587,7 @@ async def _capture_snapshot_now(
                         channel,
                     )
                 except Exception as exc:
-                    _mark_rtsp_failure(ip)
+                    _mark_rtsp_failure(ip, channel)
                     metrics["rtsp"] = True
                     metrics["exception"] = type(exc).__name__
                     logger.warning(
