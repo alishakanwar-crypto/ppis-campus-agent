@@ -906,7 +906,10 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(main, "capture_snapshot", side_effect=capture), patch.object(
             main, "SNAPSHOT_DIR", Path(directory)
         ), patch.object(main, "compress_jpeg", side_effect=lambda data, **_: data), patch.object(
-            main, "_SNAPSHOT_CAMERA_TIMEOUT_SECONDS", 0.01
+            # The request's own budget is what abandons the slow camera; the
+            # camera budget is kept inside capture_snapshot so that a queue
+            # behind other parents is not charged to the camera.
+            main, "_SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS", 0.01
         ):
             await main._handle_snapshot_request(websocket, "TEST", "request-1")
 

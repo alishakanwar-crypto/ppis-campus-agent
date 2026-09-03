@@ -6,6 +6,7 @@ the wait used to be charged to the camera: a request could spend its whole
 having asked a camera. Those are the bursts of "unable to capture" while the
 same room answers in under a second on its own.
 """
+import asyncio
 import time
 import unittest
 from unittest.mock import patch
@@ -98,6 +99,35 @@ class QueuedCaptureBudgetTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(main._channel_doors_silent(DVR["ip"], 5))
         self.assertEqual(main._live_capture_busy_silences[(DVR["ip"], 5)], 1)
+
+    async def test_the_request_wrapper_allows_for_the_queue_too(self):
+        """The outer cap must not re-charge the queue to the camera."""
+        captured: list[float] = []
+
+        async def capture(dvr, channel, **_kwargs):
+            # Slower than the camera's own budget, because a queue came first.
+            await asyncio.sleep(0.4)
+            captured.append(time.monotonic())
+            return JPEG
+
+        async def repaired(picture, camera):
+            return picture
+
+        token = main._live_request_deadline.set(time.monotonic() + 2.0)
+        try:
+            with patch.object(main, "capture_snapshot", capture), \
+                    patch.object(main, "_SNAPSHOT_CAMERA_TIMEOUT_SECONDS", 0.2), \
+                    patch.object(
+                        main, "_repair_colour_if_night_mode", repaired
+                    ):
+                result = await main._capture_classroom_camera(
+                    "GRADE 3C", (DVR, 4, "GRADE 3C C1")
+                )
+        finally:
+            main._live_request_deadline.reset(token)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(captured)
 
     async def test_a_genuinely_dead_channel_is_still_shortcut(self):
         """Forgiveness is bounded: a dead door cannot cost every parent a wait."""
