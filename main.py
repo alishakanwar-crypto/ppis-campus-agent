@@ -1052,6 +1052,17 @@ async def _auto_update_loop() -> None:
                     commit, _running_commit() or "unknown", failed,
                 )
                 continue
+            # Taking the code is not instant, and a parent's request that
+            # arrived while it was being taken would be killed by the exit
+            # below. Give whatever is in hand the same grace it would have
+            # been given before, then restart regardless.
+            if _work_in_flight() and not await _work_clears(
+                _AUTO_UPDATE_GRACE_SECONDS
+            ):
+                logger.warning(
+                    "Restarting onto %s with %s still running",
+                    commit, _work_in_flight() or "work",
+                )
             logger.warning(
                 "Restarting onto merged code %s (was running %s)",
                 commit, _running_commit() or "unknown",
