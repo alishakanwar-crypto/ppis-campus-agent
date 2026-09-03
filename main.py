@@ -926,7 +926,14 @@ def _pull_merged_code(commit: str) -> str:
     happens once HEAD has really moved.
     """
     before = _git("rev-parse", "--short", "HEAD")
-    for args in (("fetch", "origin", "main"), ("reset", "--hard", "FETCH_HEAD")):
+    # The fetched commit is named by its full ref, and paths are cut off with
+    # '--': a working copy holding a file of the same name made git refuse the
+    # reset as ambiguous, and the agent then ran yesterday's code all day.
+    steps = (
+        ("fetch", "origin", "+main:refs/remotes/origin/main"),
+        ("reset", "--hard", "refs/remotes/origin/main", "--"),
+    )
+    for args in steps:
         try:
             done = subprocess.run(
                 ["git", *args],
