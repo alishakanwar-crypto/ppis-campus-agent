@@ -649,6 +649,9 @@ _live_capture_preference_age: dict[tuple[str, int], float] = {}
 # The door each channel actually serves pictures through, kept on disk so a
 # restart does not make the next parent pay for relearning it.
 _LIVE_CAPTURE_DOORS_FILE = Path(__file__).parent / "snapshot_doors.json"
+# How many snapshot URLs a channel has; a remembered door outside this range
+# belongs to an older layout and is discarded rather than used.
+_LIVE_CAPTURE_DOOR_COUNT = 4
 
 
 def _load_capture_doors() -> None:
@@ -660,7 +663,12 @@ def _load_capture_doors() -> None:
     except Exception as exc:  # noqa: BLE001 - a bad file must not stop the agent
         logger.warning("Could not read remembered snapshot doors: %s", exc)
         return
-    for name, door in (stored.get("doors") or {}).items():
+    doors = stored.get("doors") if isinstance(stored, dict) else None
+    if not isinstance(doors, dict):
+        if doors is not None:
+            logger.warning("Remembered snapshot doors are not a mapping, ignoring")
+        return
+    for name, door in doors.items():
         ip, _, channel = name.rpartition("|")
         try:
             key = (ip, int(channel))
@@ -668,6 +676,10 @@ def _load_capture_doors() -> None:
         except Exception:  # noqa: BLE001 - skip only the malformed entry
             continue
         if scheme not in ("digest", "basic"):
+            continue
+        if not ip or not 0 <= variant < _LIVE_CAPTURE_DOOR_COUNT:
+            # A door number we no longer have would send every capture of this
+            # channel at a URL that does not exist.
             continue
         _live_capture_preferences[key] = (scheme, variant)
         _live_capture_preference_age[key] = time.monotonic()
@@ -1863,6 +1875,10 @@ async def _capture_snapshot_once(
     candidates = []
     key = (ip, channel)
     remembered = _live_capture_preferences.get(key)
+    if remembered is not None and not 0 <= remembered[1] < len(urls):
+        _live_capture_preferences.pop(key, None)
+        _live_capture_best_pixels.pop(key, None)
+        remembered = None
     if remembered is not None and remembered[1] != 0:
         age = time.monotonic() - _live_capture_preference_age.get(key, 0.0)
         if age > _LIVE_CAPTURE_FALLBACK_TTL_SECONDS:
@@ -2022,7 +2038,7 @@ async def _capture_snapshot_once(
                 not pixels
                 or variant >= 1
                 or pixels >= wanted_pixels
-                or (known_best and pixels >= known_best)
+                or (known_best and pixels >= known_best and not measuring)
                 or pictures >= probe_pictures
                 or time.monotonic() - started >= probe_budget
             ):
