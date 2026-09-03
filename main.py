@@ -890,6 +890,37 @@ def _pending_update_commit() -> str:
     return remote
 
 
+def _pull_merged_code(commit: str) -> str:
+    """Move this checkout onto the merged code; '' when HEAD actually moved.
+
+    Exiting and trusting the wrapper to pull was enough to restart the agent
+    but not to update it: when the pull did not take, the agent came back on
+    the same commit, found the same fix pending and exited again every ten
+    minutes. So the pull happens here, before the exit, and the exit only
+    happens once HEAD has really moved.
+    """
+    before = _git("rev-parse", "--short", "HEAD")
+    for args in (("fetch", "origin", "main"), ("reset", "--hard", "FETCH_HEAD")):
+        try:
+            done = subprocess.run(
+                ["git", *args],
+                cwd=str(Path(__file__).resolve().parent),
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+        except Exception as exc:
+            return f"git {args[0]} failed: {_exception_text(exc)}"
+        if done.returncode != 0:
+            said = (done.stderr or done.stdout).strip()[:200]
+            return f"git {args[0]} failed: {said or done.returncode}"
+    after = _git("rev-parse", "--short", "HEAD")
+    if not after or after == before:
+        return f"still on {before or 'unknown'} after pulling {commit}"
+    return ""
+
+
 def auto_update_state() -> dict:
     """What the cloud needs to see to trust that fixes reach the campus PC."""
     return {
@@ -922,9 +953,10 @@ def _work_in_flight() -> str:
 async def _auto_update_loop() -> None:
     """Restart onto merged code by ourselves, so no one has to do it.
 
-    The wrapper pulls origin/main every time the agent exits, so exiting on a
-    quiet moment is all that is needed to run a fix the day it is merged —
-    nobody has to be at the campus PC to run a restart script.
+    The checkout is moved onto the merged code here and the agent exits on a
+    quiet moment, so a fix runs the day it is merged and nobody has to be at
+    the campus PC to run a restart script. An exit without the code having
+    moved is refused: that is a restart loop, not an update.
     """
     if not _AUTO_UPDATE_ENABLED:
         return
@@ -944,9 +976,18 @@ async def _auto_update_loop() -> None:
             if busy:
                 logger.info("Update %s is waiting for %s", commit, busy)
                 continue
+            failed = await asyncio.to_thread(_pull_merged_code, commit)
+            if failed:
+                # Restarting now would only bring the agent back on the same
+                # code, which is a restart every ten minutes and no fix.
+                _auto_update_state["last_error"] = failed
+                logger.error(
+                    "Cannot take merged code %s, staying on %s: %s",
+                    commit, _running_commit() or "unknown", failed,
+                )
+                continue
             logger.warning(
-                "Restarting onto merged code %s (running %s); the wrapper "
-                "pulls it on the way back up",
+                "Restarting onto merged code %s (was running %s)",
                 commit, _running_commit() or "unknown",
             )
             logging.shutdown()
