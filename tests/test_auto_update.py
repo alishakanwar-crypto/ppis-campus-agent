@@ -219,6 +219,7 @@ class AutoUpdateLoopTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "_STARTED_BY_WRAPPER", True), \
                 patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
                 patch.object(main, "_AUTO_UPDATE_MAX_HOLD_SECONDS", 0.0), \
+                patch.object(main, "_AUTO_UPDATE_GRACE_SECONDS", 0.0), \
                 patch.object(
                     main, "_work_in_flight", return_value="1 queued snapshot(s)"
                 ), \
@@ -232,6 +233,39 @@ class AutoUpdateLoopTests(unittest.IsolatedAsyncioTestCase):
 
         pull.assert_called_once_with("new1234")
         exit_now.assert_called_once_with(0)
+
+    async def test_a_new_merge_does_not_restart_the_hold_clock(self):
+        """Merging often must not postpone every fix behind stuck work."""
+        commits = iter(["new1234", "new5678"])
+
+        with patch.object(main, "_STARTED_BY_WRAPPER", True), \
+                patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
+                patch.object(main, "_AUTO_UPDATE_MAX_HOLD_SECONDS", 0.0), \
+                patch.object(main, "_AUTO_UPDATE_GRACE_SECONDS", 0.0), \
+                patch.object(
+                    main, "_work_in_flight", return_value="1 queued snapshot(s)"
+                ), \
+                patch.object(
+                    main,
+                    "_pending_update_commit",
+                    side_effect=lambda: next(commits),
+                ), \
+                patch.object(main, "_pull_merged_code", return_value="") as pull, \
+                patch.object(main.os, "_exit"), \
+                patch.object(main.logging, "shutdown"):
+            await self._run_one_pass()
+
+        pull.assert_called_once_with("new1234")
+
+    async def test_the_grace_pause_lets_live_work_finish(self):
+        """A job started while we counted must be allowed to deliver."""
+        with patch.object(main, "_work_in_flight", return_value=""):
+            self.assertTrue(await main._work_clears(0.0))
+
+        with patch.object(
+            main, "_work_in_flight", return_value="1 queued snapshot(s)"
+        ):
+            self.assertFalse(await main._work_clears(0.0))
 
     async def test_a_broken_git_check_does_not_kill_the_loop(self):
         with patch.object(main, "_STARTED_BY_WRAPPER", True), \
