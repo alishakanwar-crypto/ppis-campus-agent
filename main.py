@@ -1232,21 +1232,29 @@ def _channel_doors_silent(ip: str, channel: int) -> bool:
     return True
 
 
-def _mark_channel_doors_silent(ip: str, channel: int) -> None:
+def _mark_channel_doors_silent(
+    ip: str, channel: int, *, squeezed: bool = False
+) -> None:
     # A recorder that served another classroom moments ago is busy, not deaf:
     # blacklisting the channel then sends every later request down the slow
-    # video road for minutes because of one crowded moment.
+    # video road for minutes because of one crowded moment. The same holds for
+    # doors that were never given their full time because the request was
+    # already half spent: silence they had no chance to break says nothing
+    # about them.
     if (
         (ip, channel) not in _live_capture_silent_channels
-        and _isapi_served_recently(ip)
+        and (squeezed or _isapi_served_recently(ip))
     ):
         silences = _live_capture_busy_silences.get((ip, channel), 0) + 1
         _live_capture_busy_silences[(ip, channel)] = silences
         if silences < _LIVE_CAPTURE_BUSY_FORGIVENESS:
             logger.info(
-                "%s ch%d: no door answered, but the recorder served another "
-                "classroom moments ago; keeping its doors in use (%d/%d)",
-                ip, channel, silences, _LIVE_CAPTURE_BUSY_FORGIVENESS,
+                "%s ch%d: no door answered, but %s; keeping its doors in use "
+                "(%d/%d)",
+                ip, channel,
+                "the doors were not given their full time" if squeezed
+                else "the recorder served another classroom moments ago",
+                silences, _LIVE_CAPTURE_BUSY_FORGIVENESS,
             )
             return
     if (ip, channel) not in _live_capture_silent_channels:
@@ -1794,9 +1802,11 @@ _rtsp_capture_executor = concurrent.futures.ThreadPoolExecutor(
 _rtsp_capture_semaphore = asyncio.Semaphore(_RTSP_CAPTURE_CONCURRENCY)
 _rtsp_background_semaphore = asyncio.Semaphore(_RTSP_BACKGROUND_CONCURRENCY)
 # A parent either gets the photo quickly or a straight answer: waiting out a
-# dead camera for most of a minute is what made the feature feel broken.
+# dead camera for most of a minute is what made the feature feel broken. The
+# budget still has to cover a queue behind other parents on the same recorder,
+# or a crowded minute answers nobody.
 _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS = max(
-    1.0, float(os.environ.get("SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS", "12"))
+    1.0, float(os.environ.get("SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS", "15"))
 )
 
 
@@ -2161,6 +2171,11 @@ async def _capture_snapshot_now(
     limiter_wait_started = time.monotonic()
     limiter = await _acquire_dvr_capture(ip, background)
     limiter_wait = time.monotonic() - limiter_wait_started
+    # The camera's time starts when the camera is actually asked. Charging the
+    # queue behind other captures on the same recorder to the camera spent a
+    # parent's whole budget waiting, so a crowded minute failed requests that
+    # had never reached a camera at all.
+    camera_started = time.monotonic()
     metrics: dict[str, object] = {
         "round_trips": 0,
         "attempt_elapsed": [],
@@ -2186,9 +2201,13 @@ async def _capture_snapshot_now(
             if background else _SNAPSHOT_CONNECT_TIMEOUT_SECONDS
         )
         request_deadline = deadline if deadline is not None else _live_request_deadline.get()
-        capture_deadline = capture_started + camera_timeout
+        capture_deadline = camera_started + camera_timeout
         if not background and request_deadline is not None:
             capture_deadline = min(capture_deadline, request_deadline)
+        # The camera gets less than its own time when what is left of the
+        # request decides it — usually a queue behind other parents on this
+        # recorder. Silence under that squeeze proves nothing about the doors.
+        squeezed = capture_deadline < camera_started + camera_timeout - 0.05
         timeout = httpx.Timeout(
             http_timeout,
             connect=connect_timeout,
@@ -2270,6 +2289,13 @@ async def _capture_snapshot_now(
                     break
                 attempt_started = time.monotonic()
                 _note_auth_attempt(ip)
+                # Two doors must fit inside one attempt, or a silent first door
+                # still costs every later one — the background sweep's attempt
+                # is shorter than the default door budget.
+                door_budget = min(
+                    _LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS,
+                    max(1.0, min(http_timeout, remaining) / 2),
+                )
                 try:
                     snapshot = await asyncio.wait_for(
                         _capture_snapshot_once(
@@ -2277,14 +2303,7 @@ async def _capture_snapshot_now(
                             channel,
                             client,
                             metrics,
-                            # Two doors must fit inside one attempt, or a silent
-                            # first door still costs every later one — the
-                            # background sweep's attempt is shorter than the
-                            # default door budget.
-                            door_budget_seconds=min(
-                                _LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS,
-                                max(1.0, min(http_timeout, remaining) / 2),
-                            ),
+                            door_budget_seconds=door_budget,
                         ),
                         timeout=min(http_timeout, remaining),
                     )
@@ -2312,7 +2331,9 @@ async def _capture_snapshot_now(
                         # Not one door on this channel replied: further attempts
                         # knock on the same silent doors and cost the parent the
                         # time the video fallback needs.
-                        _mark_channel_doors_silent(ip, channel)
+                        _mark_channel_doors_silent(
+                            ip, channel, squeezed=squeezed
+                        )
                         break
                     if attempt < attempts - 1:
                         await asyncio.sleep(min(
@@ -2342,7 +2363,9 @@ async def _capture_snapshot_now(
                         attempt + 1, attempts, ip, channel, _exception_text(exc),
                     )
                     if isinstance(exc, httpx.ReadTimeout) and not metrics["answered"]:
-                        _mark_channel_doors_silent(ip, channel)
+                        _mark_channel_doors_silent(
+                            ip, channel, squeezed=squeezed
+                        )
                         break
                     if attempt < attempts - 1:
                         await asyncio.sleep(min(
@@ -2362,7 +2385,9 @@ async def _capture_snapshot_now(
                         attempt + 1, attempts, ip, channel,
                     )
                     if not metrics["answered"]:
-                        _mark_channel_doors_silent(ip, channel)
+                        _mark_channel_doors_silent(
+                            ip, channel, squeezed=squeezed
+                        )
                         break
                     if attempt < attempts - 1:
                         await asyncio.sleep(min(

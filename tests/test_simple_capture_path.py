@@ -83,7 +83,10 @@ class RememberedDoorTests(unittest.TestCase):
 class ParentWaitTests(unittest.TestCase):
     def test_a_parent_is_never_asked_to_wait_out_a_dead_camera(self):
         self.assertLessEqual(main._SNAPSHOT_CAMERA_TIMEOUT_SECONDS, 8.0)
-        self.assertLessEqual(main._SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS, 12.0)
+        # A few seconds above the camera's own budget, so a request queued
+        # behind other parents on the same recorder still reaches the camera
+        # instead of being failed in the queue.
+        self.assertLessEqual(main._SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS, 15.0)
         self.assertLessEqual(main._SNAPSHOT_RETRIES, 2)
         self.assertLessEqual(main._LIVE_CAPTURE_DOOR_TIMEOUT_SECONDS, 3.0)
         # The second angle must still fit inside the shortened request.
