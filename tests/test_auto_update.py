@@ -4,7 +4,7 @@ import asyncio
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -256,6 +256,29 @@ class AutoUpdateLoopTests(unittest.IsolatedAsyncioTestCase):
             await self._run_one_pass()
 
         pull.assert_called_once_with("new1234")
+
+    async def test_a_request_that_arrives_while_taking_code_is_not_cut(self):
+        """Nothing was in flight at the check, but taking code takes time."""
+        states = iter(["", "1 queued snapshot(s)"])
+
+        def in_flight():
+            return next(states, "")
+
+        clears = AsyncMock(return_value=True)
+        with patch.object(main, "_STARTED_BY_WRAPPER", True), \
+                patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
+                patch.object(main, "_work_in_flight", side_effect=in_flight), \
+                patch.object(main, "_work_clears", clears), \
+                patch.object(
+                    main, "_pending_update_commit", return_value="new1234"
+                ), \
+                patch.object(main, "_pull_merged_code", return_value=""), \
+                patch.object(main.os, "_exit") as exit_now, \
+                patch.object(main.logging, "shutdown"):
+            await self._run_one_pass()
+
+        clears.assert_awaited_once_with(main._AUTO_UPDATE_GRACE_SECONDS)
+        exit_now.assert_called_once_with(0)
 
     async def test_the_grace_pause_lets_live_work_finish(self):
         """A job started while we counted must be allowed to deliver."""
