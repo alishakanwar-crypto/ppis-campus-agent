@@ -89,11 +89,17 @@ class PullMergedCodeTests(unittest.TestCase):
         ) as run, patch.object(main, "_git", side_effect=["old1234", "new1234"]):
             self.assertEqual(main._pull_merged_code("new1234"), "")
 
+        # Named by ref and with paths cut off: a working copy holding a file
+        # called FETCH_HEAD made git refuse the reset as ambiguous, and the
+        # agent kept serving parents from yesterday's code.
         self.assertEqual(
             [call.args[0] for call in run.call_args_list],
             [
-                ["git", "fetch", "origin", "main"],
-                ["git", "reset", "--hard", "FETCH_HEAD"],
+                ["git", "fetch", "origin", "+main:refs/remotes/origin/main"],
+                [
+                    "git", "reset", "--hard",
+                    "refs/remotes/origin/main", "--",
+                ],
             ],
         )
 
