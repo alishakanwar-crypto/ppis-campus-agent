@@ -705,6 +705,15 @@ def _save_capture_doors() -> None:
 # do 1080p is not re-probed on every parent request.
 _live_capture_best_pixels: dict[tuple[str, int], int] = {}
 _live_capture_size_logged: set[tuple[str, int]] = set()
+# Largest frame a channel's video stream has handed us. Some channels answer
+# only on their sub-stream snapshot door (704x480) while the stream carries the
+# main one, and the stream is then the sharper road for that channel.
+_live_capture_video_pixels: dict[tuple[str, int], int] = {}
+# How much sharper the stream must be before a parent's request waits for it
+# instead of taking the quarter-size picture a door hands over at once.
+_LIVE_CAPTURE_VIDEO_PREFERENCE_RATIO = max(
+    1.5, float(os.environ.get("SNAPSHOT_VIDEO_PREFERENCE_RATIO", "2"))
+)
 # Hikvision returns a small default JPEG (704x480) unless the wanted size is
 # asked for, which parents see as a blurred classroom photo.
 _LIVE_SNAPSHOT_WIDTH = max(0, int(os.environ.get("SNAPSHOT_WIDTH", "1920")))
@@ -2023,6 +2032,36 @@ async def _remeasure_soft_channel(dvr: dict, channel: int) -> None:
         )
 
 
+def _note_video_frame_size(ip: str, channel: int, frame: bytes) -> None:
+    """Remember how big a picture this channel's video stream carries."""
+    width, height = _jpeg_size(frame)
+    pixels = width * height
+    if not pixels:
+        return
+    key = (ip, channel)
+    if pixels > _live_capture_video_pixels.get(key, 0):
+        _live_capture_video_pixels[key] = pixels
+
+
+def _video_road_is_sharper(ip: str, channel: int) -> bool:
+    """Whether this channel's stream beats the picture its doors hand over.
+
+    A channel whose only answering door is its sub-stream serves 704x480 while
+    the stream carries 1280x720, and 704x480 is what parents call blurred. The
+    stream costs a few seconds, so it is taken only when it is materially
+    sharper and the doors are materially short of what was asked for.
+    """
+    key = (ip, channel)
+    door_pixels = _live_capture_best_pixels.get(key, 0)
+    video_pixels = _live_capture_video_pixels.get(key, 0)
+    wanted = _LIVE_SNAPSHOT_WIDTH * _LIVE_SNAPSHOT_HEIGHT
+    if not door_pixels or not video_pixels or not wanted:
+        return False
+    if door_pixels * 3 >= wanted:
+        return False
+    return video_pixels >= door_pixels * _LIVE_CAPTURE_VIDEO_PREFERENCE_RATIO
+
+
 async def _get_live_dvr_client(
     dvr: dict, timeout: httpx.Timeout
 ) -> httpx.AsyncClient:
@@ -2514,6 +2553,23 @@ async def _capture_snapshot_now(
                 "%s ch%d: channel is resting after refusing our login, "
                 "using RTSP", ip, channel,
             )
+        elif (
+            not skip_isapi
+            and not background
+            and not _rtsp_cooldown_active(ip)
+            and not _rtsp_channel_cooldown_active(ip, channel)
+            and _video_road_is_sharper(ip, channel)
+        ):
+            # Its doors only serve a quarter-size classroom; the stream is
+            # slower but it is the picture the parent asked for.
+            skip_isapi = True
+            logger.info(
+                "%s ch%d: doors serve %d pixels against the stream's %d, "
+                "taking the stream",
+                ip, channel,
+                _live_capture_best_pixels.get((ip, channel), 0),
+                _live_capture_video_pixels.get((ip, channel), 0),
+            )
         elif cooldown_reason:
             logger.info(
                 "%s ch%d: recorder is %s, %s",
@@ -2691,6 +2747,7 @@ async def _capture_snapshot_now(
                         timeout=remaining,
                     )
                     if rtsp_frame:
+                        _note_video_frame_size(ip, channel, rtsp_frame)
                         metrics["rtsp"] = True
                         metrics["outcome"] = "success"
                         _clear_rtsp_failure(ip, channel)
