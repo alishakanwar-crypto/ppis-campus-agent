@@ -1954,6 +1954,73 @@ _rtsp_background_semaphore = asyncio.Semaphore(_RTSP_BACKGROUND_CONCURRENCY)
 _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS = max(
     1.0, float(os.environ.get("SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS", "15"))
 )
+# How often a channel that served a quarter-size picture is measured again in
+# the background, and how long that measurement waits so it never shares the
+# recorder with the request that triggered it.
+_LIVE_CAPTURE_SOFT_REMEASURE_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_SOFT_REMEASURE_SECONDS", "900"))
+)
+_LIVE_CAPTURE_SOFT_REMEASURE_DELAY_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_SOFT_REMEASURE_DELAY_SECONDS", "2"))
+)
+_live_capture_soft_remeasure_at: dict[tuple[str, int], float] = {}
+
+
+def _schedule_soft_channel_remeasure(dvr: dict, channel: int) -> None:
+    """Measure a channel that just served a soft picture, out of the way.
+
+    A channel settles on whichever door answered first, and a sub-stream door
+    answering 704x480 against 1080p is what parents see as a blurred
+    classroom. The sharper doors cannot be tried inside the request without
+    making somebody wait, so they are tried behind it instead.
+    """
+    key = (dvr["ip"], channel)
+    now = time.monotonic()
+    last = _live_capture_soft_remeasure_at.get(key)
+    if last is not None and now - last < _LIVE_CAPTURE_SOFT_REMEASURE_SECONDS:
+        return
+    _live_capture_soft_remeasure_at[key] = now
+    try:
+        asyncio.create_task(_remeasure_soft_channel(dvr, channel))
+    except RuntimeError:
+        # No running loop (a synchronous caller); nothing to measure.
+        _live_capture_soft_remeasure_at.pop(key, None)
+
+
+async def _remeasure_soft_channel(dvr: dict, channel: int) -> None:
+    """Find a channel's sharpest door with nobody waiting on the answer."""
+    key = (dvr["ip"], channel)
+    await asyncio.sleep(_LIVE_CAPTURE_SOFT_REMEASURE_DELAY_SECONDS)
+    if _credentials_refused(dvr):
+        return
+    # The full-size doors are the ones worth another try, and a door that hangs
+    # here costs no parent their photo.
+    slow = _live_capture_slow_doors.get(key)
+    if slow:
+        for variant in (0, 1):
+            slow.pop(variant, None)
+        if not slow:
+            _live_capture_slow_doors.pop(key, None)
+    before = _live_capture_best_pixels.get(key, 0)
+    token = _measuring_cameras.set(True)
+    try:
+        await capture_snapshot(dvr, channel, background=True)
+    except Exception as exc:  # noqa: BLE001 - a measurement must never raise
+        logger.debug(
+            "%s ch%d: background measurement failed: %s",
+            key[0], channel, _exception_text(exc),
+        )
+        return
+    finally:
+        _measuring_cameras.reset(token)
+    after = _live_capture_best_pixels.get(key, 0)
+    if after > before:
+        logger.info(
+            "%s ch%d serves %d pixels through door %s; parents get that from "
+            "now on instead of %d",
+            key[0], channel, after,
+            (_live_capture_preferences.get(key) or ("", "-"))[1], before,
+        )
 
 
 async def _get_live_dvr_client(
@@ -2110,6 +2177,13 @@ async def _capture_snapshot_once(
                 "the parent's photo will look soft",
                 ip, channel, pixels, wanted_pixels,
             )
+        if (
+            pixels
+            and wanted_pixels
+            and pixels * 3 < wanted_pixels
+            and not measuring
+        ):
+            _schedule_soft_channel_remeasure(dvr, channel)
         return picture
 
     silent_variants: set[int] = set()
