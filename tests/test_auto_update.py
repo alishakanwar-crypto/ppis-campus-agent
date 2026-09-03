@@ -196,6 +196,43 @@ class AutoUpdateLoopTests(unittest.IsolatedAsyncioTestCase):
             await self._run_one_pass()
         exit_now.assert_not_called()
 
+    async def test_the_work_holding_a_fix_back_is_published(self):
+        """Health has to name it, or old code looks like healthy code."""
+        with patch.object(main, "_STARTED_BY_WRAPPER", True), \
+                patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
+                patch.object(
+                    main, "_work_in_flight", return_value="1 queued snapshot(s)"
+                ), \
+                patch.object(
+                    main, "_pending_update_commit", return_value="new1234"
+                ), \
+                patch.object(main.os, "_exit") as exit_now:
+            await self._run_one_pass()
+
+        exit_now.assert_not_called()
+        state = main.auto_update_state()
+        self.assertEqual(state["held_by"], "1 queued snapshot(s)")
+        self.assertTrue(state["held_since_ist"].endswith("IST"))
+
+    async def test_stuck_work_cannot_hold_a_fix_back_all_day(self):
+        """A photo takes seconds and a job minutes; anything longer is stuck."""
+        with patch.object(main, "_STARTED_BY_WRAPPER", True), \
+                patch.object(main, "_AUTO_UPDATE_ENABLED", True), \
+                patch.object(main, "_AUTO_UPDATE_MAX_HOLD_SECONDS", 0.0), \
+                patch.object(
+                    main, "_work_in_flight", return_value="1 queued snapshot(s)"
+                ), \
+                patch.object(
+                    main, "_pending_update_commit", return_value="new1234"
+                ), \
+                patch.object(main, "_pull_merged_code", return_value="") as pull, \
+                patch.object(main.os, "_exit") as exit_now, \
+                patch.object(main.logging, "shutdown"):
+            await self._run_one_pass()
+
+        pull.assert_called_once_with("new1234")
+        exit_now.assert_called_once_with(0)
+
     async def test_a_broken_git_check_does_not_kill_the_loop(self):
         with patch.object(main, "_STARTED_BY_WRAPPER", True), \
                 patch.object(main, "_AUTO_UPDATE_ENABLED", True), \

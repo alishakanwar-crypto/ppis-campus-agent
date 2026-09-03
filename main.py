@@ -829,6 +829,13 @@ _AUTO_UPDATE_ENABLED = (
 # Exiting only updates the agent when the wrapper is there to bring it back;
 # started by hand, an exit would simply leave the campus without an agent.
 _STARTED_BY_WRAPPER = os.environ.get("PPIS_WRAPPER", "") == "1"
+# How long a merged fix may be held back for work in flight. A parent's photo
+# is bounded in seconds and an attendance job in minutes, so anything still
+# counted after this is stuck, and holding a fix behind stuck work is how the
+# campus PC ran old code all day while reporting itself perfectly healthy.
+_AUTO_UPDATE_MAX_HOLD_SECONDS = max(
+    60.0, float(os.environ.get("AUTO_UPDATE_MAX_HOLD_SECONDS", "900"))
+)
 
 
 def _git(*args: str) -> str:
@@ -858,6 +865,8 @@ _auto_update_state: dict[str, str] = {
     "origin_commit": "",
     "last_error": "",
     "checked_at_ist": "",
+    "held_by": "",
+    "held_since_ist": "",
 }
 
 
@@ -978,6 +987,8 @@ async def _auto_update_loop() -> None:
             "so merged fixes will not reach this PC by themselves"
         )
         return
+    held_commit = ""
+    held_since = 0.0
     while True:
         try:
             await asyncio.sleep(_AUTO_UPDATE_CHECK_SECONDS)
@@ -985,9 +996,32 @@ async def _auto_update_loop() -> None:
             if not commit:
                 continue
             busy = _work_in_flight()
-            if busy:
-                logger.info("Update %s is waiting for %s", commit, busy)
-                continue
+            if not busy:
+                held_commit = ""
+                _auto_update_state["held_by"] = ""
+                _auto_update_state["held_since_ist"] = ""
+            else:
+                if held_commit != commit:
+                    held_commit = commit
+                    held_since = time.monotonic()
+                    _auto_update_state["held_since_ist"] = datetime.now(
+                        _IST
+                    ).strftime("%d-%m-%Y %H:%M:%S IST")
+                held_for = time.monotonic() - held_since
+                _auto_update_state["held_by"] = busy
+                if held_for < _AUTO_UPDATE_MAX_HOLD_SECONDS:
+                    logger.info(
+                        "Update %s is waiting for %s (%.0fs so far)",
+                        commit, busy, held_for,
+                    )
+                    continue
+                # Work that outlasts every real job is stuck work, and a fix
+                # merged for parents cannot sit behind it for the rest of the
+                # day: the wrapper brings the agent straight back.
+                logger.warning(
+                    "Taking merged code %s after holding %.0fs for %s",
+                    commit, held_for, busy,
+                )
             failed = await asyncio.to_thread(_pull_merged_code, commit)
             if failed:
                 # Restarting now would only bring the agent back on the same
