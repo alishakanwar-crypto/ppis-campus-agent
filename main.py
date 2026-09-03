@@ -2888,6 +2888,13 @@ _SNAPSHOT_CAMERA_TIMEOUT_SECONDS = max(
 _SNAPSHOT_SECOND_ANGLE_RETRY_SECONDS = max(
     1.0, float(os.environ.get("SNAPSHOT_SECOND_ANGLE_RETRY_SECONDS", "4"))
 )
+# The longest a parent's request may exist, queue included. Sending an image
+# to a cloud link that has died can block with nothing to time it out, and
+# such a request is then counted as work in flight for ever: that is what
+# held merged fixes off the campus PC for a whole day.
+_SNAPSHOT_REQUEST_HARD_LIMIT_SECONDS = max(
+    30.0, float(os.environ.get("SNAPSHOT_REQUEST_HARD_LIMIT_SECONDS", "90"))
+)
 
 
 def _snapshot_task_done(task: asyncio.Task) -> None:
@@ -3376,7 +3383,16 @@ async def handle_snapshot_request(ws, classroom: str, request_id: str):
     queued_at = time.monotonic()
     _live_requests_in_flight += 1
     try:
-        await _serve_snapshot_request(ws, classroom, request_id, queued_at)
+        await asyncio.wait_for(
+            _serve_snapshot_request(ws, classroom, request_id, queued_at),
+            timeout=_SNAPSHOT_REQUEST_HARD_LIMIT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            "Abandoning the request for %s after %.0fs: it is no longer "
+            "serving anybody and must not be counted as work for ever",
+            classroom, _SNAPSHOT_REQUEST_HARD_LIMIT_SECONDS,
+        )
     finally:
         _live_requests_in_flight -= 1
 
