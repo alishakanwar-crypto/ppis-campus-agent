@@ -59,6 +59,28 @@ class LockedLogPullTests(unittest.TestCase):
 
         self.assertIn("unable to unlink", said)
 
+    def test_a_locked_source_file_is_never_frozen(self):
+        """Freezing main.py would leave the agent on stale code for good."""
+        calls: list[tuple[str, ...]] = []
+
+        def run(args, **kwargs):
+            calls.append(tuple(args[1:]))
+            if args[1] == "reset":
+                return _Run(
+                    1,
+                    "error: unable to unlink old 'main.py': Invalid argument",
+                )
+            return _Run()
+
+        with patch.object(main.subprocess, "run", side_effect=run), \
+                patch.object(main, "_git", side_effect=["old1234", "old1234"]):
+            said = main._pull_merged_code("new5678")
+
+        self.assertIn("main.py", said)
+        self.assertEqual(
+            [call for call in calls if call[0] == "update-index"], []
+        )
+
     def test_a_failure_with_no_locked_file_is_not_retried(self):
         calls: list[tuple[str, ...]] = []
 
