@@ -33,7 +33,15 @@ def torn(smear_fraction=0.25, height=HEIGHT, width=WIDTH):
 def letterboxed(height=HEIGHT, width=WIDTH):
     """A 4:3 camera's picture padded with a black bar along the bottom."""
     frame = room(height, width)
-    frame[int(height * 0.85):] = 0
+    frame[int(height * 0.7):] = 0
+    return frame
+
+
+def torn_and_letterboxed(height=HEIGHT, width=WIDTH):
+    """A smeared band above a black bar taller than the smear itself."""
+    frame = letterboxed(height, width)
+    smear = int(height * 0.55)
+    frame[smear:int(height * 0.7)] = frame[smear - 1]
     return frame
 
 
@@ -53,6 +61,10 @@ class TornStreamFrameTests(unittest.TestCase):
     def test_a_black_bar_is_not_called_torn(self):
         """Padding holds no detail across, so it is the camera, not a tear."""
         self.assertFalse(main._frame_is_torn(letterboxed()))
+
+    def test_a_smear_above_a_taller_black_bar_is_recognised(self):
+        """The padding must not stand in for the smear above it."""
+        self.assertTrue(main._frame_is_torn(torn_and_letterboxed()))
 
     def test_a_grey_frame_is_left_to_the_blank_check(self):
         self.assertFalse(main._frame_is_torn(grey(HEIGHT, WIDTH)))

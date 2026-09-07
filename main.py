@@ -1781,7 +1781,7 @@ _RTSP_TEAR_FLAT_ROW_RATIO = max(
     0.01, float(os.environ.get("RTSP_TEAR_FLAT_ROW_RATIO", "0.2"))
 )
 _RTSP_TEAR_MIN_BAND_FRACTION = max(
-    0.005, float(os.environ.get("RTSP_TEAR_MIN_BAND_FRACTION", "0.015"))
+    0.005, float(os.environ.get("RTSP_TEAR_MIN_BAND_FRACTION", "0.03"))
 )
 _RTSP_TEAR_MIN_SIDE_DETAIL = max(
     0.0, float(os.environ.get("RTSP_TEAR_MIN_SIDE_DETAIL", "0.5"))
@@ -1818,19 +1818,22 @@ def _frame_is_torn(frame) -> bool:
         lowest = int(height * 0.4)
         least = max(8, int(height * _RTSP_TEAR_MIN_BAND_FRACTION))
         run = 0
-        longest = 0
-        ends_at = 0
-        for row in range(lowest, len(copied)):
-            run = run + 1 if copied[row] else 0
-            if run > longest:
-                longest, ends_at = run, row
-        if longest < least:
-            return False
-        band = frame[ends_at - longest + 1:ends_at + 2]
-        sideways = numpy.abs(
-            band[:, 1:].astype(numpy.int16) - band[:, :-1]
-        ).mean()
-        return float(sideways) >= _RTSP_TEAR_MIN_SIDE_DETAIL
+        # Every run tall enough is judged, not only the tallest: a camera's
+        # black bottom bar is itself a run of copied rows and would otherwise
+        # hide a shorter smear above it.
+        for row in range(lowest, len(copied) + 1):
+            if row < len(copied) and copied[row]:
+                run += 1
+                continue
+            if run >= least:
+                band = frame[row - run:row + 1]
+                sideways = numpy.abs(
+                    band[:, 1:].astype(numpy.int16) - band[:, :-1]
+                ).mean()
+                if float(sideways) >= _RTSP_TEAR_MIN_SIDE_DETAIL:
+                    return True
+            run = 0
+        return False
     except Exception:
         return False
 
