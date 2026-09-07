@@ -688,14 +688,35 @@ def _load_capture_doors() -> None:
             continue
         _live_capture_preferences[key] = (scheme, variant)
         _live_capture_preference_age[key] = time.monotonic()
+        # The sizes are remembered with the door: without them a restart puts
+        # every channel whose door serves 704x480 back on that picture until a
+        # background measurement has run again.
+        for field, store in (
+            ("door_pixels", _live_capture_best_pixels),
+            ("video_pixels", _live_capture_video_pixels),
+        ):
+            try:
+                pixels = int(door.get(field) or 0)
+            except Exception:  # noqa: BLE001 - skip only the bad number
+                continue
+            if pixels > 0:
+                store[key] = pixels
 
 
 def _save_capture_doors() -> None:
     """Keep the learned doors across a restart; never fail a capture over it."""
-    doors = {
-        f"{ip}|{channel}": {"scheme": scheme, "variant": variant}
-        for (ip, channel), (scheme, variant) in _live_capture_preferences.items()
-    }
+    doors = {}
+    for (ip, channel), (scheme, variant) in _live_capture_preferences.items():
+        key = (ip, channel)
+        door = {"scheme": scheme, "variant": variant}
+        for field, store in (
+            ("door_pixels", _live_capture_best_pixels),
+            ("video_pixels", _live_capture_video_pixels),
+        ):
+            pixels = store.get(key, 0)
+            if pixels:
+                door[field] = pixels
+        doors[f"{ip}|{channel}"] = door
     try:
         _LIVE_CAPTURE_DOORS_FILE.write_text(json.dumps({"doors": doors}, indent=1))
     except Exception as exc:  # noqa: BLE001
@@ -1781,7 +1802,7 @@ _RTSP_TEAR_FLAT_ROW_RATIO = max(
     0.01, float(os.environ.get("RTSP_TEAR_FLAT_ROW_RATIO", "0.2"))
 )
 _RTSP_TEAR_MIN_BAND_FRACTION = max(
-    0.005, float(os.environ.get("RTSP_TEAR_MIN_BAND_FRACTION", "0.015"))
+    0.005, float(os.environ.get("RTSP_TEAR_MIN_BAND_FRACTION", "0.03"))
 )
 _RTSP_TEAR_MIN_SIDE_DETAIL = max(
     0.0, float(os.environ.get("RTSP_TEAR_MIN_SIDE_DETAIL", "0.5"))
@@ -1818,19 +1839,22 @@ def _frame_is_torn(frame) -> bool:
         lowest = int(height * 0.4)
         least = max(8, int(height * _RTSP_TEAR_MIN_BAND_FRACTION))
         run = 0
-        longest = 0
-        ends_at = 0
-        for row in range(lowest, len(copied)):
-            run = run + 1 if copied[row] else 0
-            if run > longest:
-                longest, ends_at = run, row
-        if longest < least:
-            return False
-        band = frame[ends_at - longest + 1:ends_at + 2]
-        sideways = numpy.abs(
-            band[:, 1:].astype(numpy.int16) - band[:, :-1]
-        ).mean()
-        return float(sideways) >= _RTSP_TEAR_MIN_SIDE_DETAIL
+        # Every run tall enough is judged, not only the tallest: a camera's
+        # black bottom bar is itself a run of copied rows and would otherwise
+        # hide a shorter smear above it.
+        for row in range(lowest, len(copied) + 1):
+            if row < len(copied) and copied[row]:
+                run += 1
+                continue
+            if run >= least:
+                band = frame[row - run:row + 1]
+                sideways = numpy.abs(
+                    band[:, 1:].astype(numpy.int16) - band[:, :-1]
+                ).mean()
+                if float(sideways) >= _RTSP_TEAR_MIN_SIDE_DETAIL:
+                    return True
+            run = 0
+        return False
     except Exception:
         return False
 
@@ -1840,7 +1864,10 @@ def _read_detailed_frame(cap, ip: str, channel: int):
     deadline = time.monotonic() + _RTSP_FRAME_SEARCH_SECONDS
     blank = 0
     torn = 0
-    for _ in range(_RTSP_MAX_FRAMES_READ):
+    # A recorder under load can smear a run of keyframes, and the frame count
+    # alone was spent inside a second of video, so the search is given its
+    # whole window and stops counting frames only to stay bounded.
+    for _ in range(_RTSP_MAX_FRAMES_READ * 10):
         ret, frame = cap.read()
         if not ret or frame is None:
             break
@@ -1856,6 +1883,8 @@ def _read_detailed_frame(cap, ip: str, channel: int):
         else:
             blank += 1
         if time.monotonic() >= deadline:
+            break
+        if blank >= _RTSP_MAX_FRAMES_READ and not torn:
             break
     if torn:
         logger.warning(
@@ -2157,6 +2186,7 @@ def _note_video_frame_size(ip: str, channel: int, frame: bytes) -> None:
     key = (ip, channel)
     if pixels > _live_capture_video_pixels.get(key, 0):
         _live_capture_video_pixels[key] = pixels
+        _save_capture_doors()
 
 
 def _video_road_is_sharper(ip: str, channel: int) -> bool:
@@ -2319,7 +2349,9 @@ async def _capture_snapshot_once(
             _live_capture_preference_age[key] = time.monotonic()
             _live_capture_preferences[key] = (scheme, variant)
             _save_capture_doors()
-        _live_capture_best_pixels[key] = max(known_best, pixels)
+        if max(known_best, pixels) > _live_capture_best_pixels.get(key, 0):
+            _live_capture_best_pixels[key] = max(known_best, pixels)
+            _save_capture_doors()
         if (
             pixels
             and wanted_pixels

@@ -33,7 +33,15 @@ def torn(smear_fraction=0.25, height=HEIGHT, width=WIDTH):
 def letterboxed(height=HEIGHT, width=WIDTH):
     """A 4:3 camera's picture padded with a black bar along the bottom."""
     frame = room(height, width)
-    frame[int(height * 0.85):] = 0
+    frame[int(height * 0.7):] = 0
+    return frame
+
+
+def torn_and_letterboxed(height=HEIGHT, width=WIDTH):
+    """A smeared band above a black bar taller than the smear itself."""
+    frame = letterboxed(height, width)
+    smear = int(height * 0.55)
+    frame[smear:int(height * 0.7)] = frame[smear - 1]
     return frame
 
 
@@ -54,6 +62,10 @@ class TornStreamFrameTests(unittest.TestCase):
         """Padding holds no detail across, so it is the camera, not a tear."""
         self.assertFalse(main._frame_is_torn(letterboxed()))
 
+    def test_a_smear_above_a_taller_black_bar_is_recognised(self):
+        """The padding must not stand in for the smear above it."""
+        self.assertTrue(main._frame_is_torn(torn_and_letterboxed()))
+
     def test_a_grey_frame_is_left_to_the_blank_check(self):
         self.assertFalse(main._frame_is_torn(grey(HEIGHT, WIDTH)))
 
@@ -65,6 +77,15 @@ class TornStreamFrameTests(unittest.TestCase):
 
         self.assertTrue(numpy.array_equal(frame, whole))
         self.assertEqual(cap.reads, 3)
+
+    def test_a_long_run_of_smears_is_read_past(self):
+        """A loaded recorder smears more frames than a second of video has."""
+        whole = room()
+        cap = FakeCapture([torn() for _ in range(60)] + [whole])
+
+        frame = main._read_detailed_frame(cap, "192.168.0.12", 17)
+
+        self.assertTrue(numpy.array_equal(frame, whole))
 
     def test_a_stream_that_only_ever_tears_sends_nothing(self):
         """A retry beats a photo with a smeared band across the children."""
