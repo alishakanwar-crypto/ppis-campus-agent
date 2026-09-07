@@ -78,6 +78,15 @@ class TornStreamFrameTests(unittest.TestCase):
         self.assertTrue(numpy.array_equal(frame, whole))
         self.assertEqual(cap.reads, 3)
 
+    def test_a_long_run_of_smears_is_read_past(self):
+        """A loaded recorder smears more frames than a second of video has."""
+        whole = room()
+        cap = FakeCapture([torn() for _ in range(60)] + [whole])
+
+        frame = main._read_detailed_frame(cap, "192.168.0.12", 17)
+
+        self.assertTrue(numpy.array_equal(frame, whole))
+
     def test_a_stream_that_only_ever_tears_sends_nothing(self):
         """A retry beats a photo with a smeared band across the children."""
         cap = FakeCapture([torn(0.08) for _ in range(4)])

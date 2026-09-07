@@ -1843,7 +1843,10 @@ def _read_detailed_frame(cap, ip: str, channel: int):
     deadline = time.monotonic() + _RTSP_FRAME_SEARCH_SECONDS
     blank = 0
     torn = 0
-    for _ in range(_RTSP_MAX_FRAMES_READ):
+    # A recorder under load can smear a run of keyframes, and the frame count
+    # alone was spent inside a second of video, so the search is given its
+    # whole window and stops counting frames only to stay bounded.
+    for _ in range(_RTSP_MAX_FRAMES_READ * 10):
         ret, frame = cap.read()
         if not ret or frame is None:
             break
@@ -1859,6 +1862,8 @@ def _read_detailed_frame(cap, ip: str, channel: int):
         else:
             blank += 1
         if time.monotonic() >= deadline:
+            break
+        if blank >= _RTSP_MAX_FRAMES_READ and not torn:
             break
     if torn:
         logger.warning(
