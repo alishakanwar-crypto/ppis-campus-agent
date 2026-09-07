@@ -3967,7 +3967,12 @@ async def _serve_snapshot_request(
                 classroom,
                 waited,
             )
-        await _handle_snapshot_request(ws, classroom, request_id)
+        try:
+            await _handle_snapshot_request(ws, classroom, request_id)
+        finally:
+            # A photo cut short by an error, a dead cloud link or the hard
+            # limit still has to release its place in the camera ledger.
+            _forget_request_outcomes(request_id)
 
 
 async def _handle_snapshot_request(ws, classroom: str, request_id: str):
@@ -3989,7 +3994,6 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         _live_request_deadline.reset(request_token)
         _live_request_classroom.reset(classroom_token)
         _live_request_id.reset(request_id_token)
-        _forget_request_outcomes(request_id)
         return
 
     logger.info(f"Capturing from {len(all_cameras)} camera(s) for {classroom}")
@@ -4122,7 +4126,6 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         _live_request_deadline.reset(request_token)
         _live_request_classroom.reset(classroom_token)
         _live_request_id.reset(request_id_token)
-        _forget_request_outcomes(request_id)
         return
 
     # Send completion message
@@ -4142,7 +4145,6 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
     _live_request_deadline.reset(request_token)
     _live_request_classroom.reset(classroom_token)
     _live_request_id.reset(request_id_token)
-    _forget_request_outcomes(request_id)
 
 
 # ---------------------------------------------------------------------------

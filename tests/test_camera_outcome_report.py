@@ -1,3 +1,4 @@
+import asyncio
 import json
 import unittest
 from unittest.mock import patch
@@ -174,6 +175,41 @@ class SilentCameraRetryTests(unittest.IsolatedAsyncioTestCase):
         main._live_request_id.reset(token)
 
         main._forget_request_outcomes("req-done")
+
+        entry = main._camera_outcomes[("192.0.2.90", 12)]
+        self.assertEqual(entry["counted_requests"], set())
+
+    async def test_a_photo_that_breaks_is_still_forgotten(self):
+        """A raised error or the hard limit must not leave the id behind."""
+        async def blow_up(ws, classroom, request_id):
+            token = main._live_request_id.set(request_id)
+            main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+            main._live_request_id.reset(token)
+            raise RuntimeError("cloud link died")
+
+        with patch.object(main, "_handle_snapshot_request", blow_up):
+            with self.assertRaises(RuntimeError):
+                await main._serve_snapshot_request(
+                    FakeWs(), "GRADE 1A", "req-broken", main.time.monotonic(),
+                )
+
+        entry = main._camera_outcomes[("192.0.2.90", 12)]
+        self.assertEqual(entry["counted_requests"], set())
+
+    async def test_a_photo_cut_off_by_the_hard_limit_is_forgotten(self):
+        async def never_finish(ws, classroom, request_id):
+            token = main._live_request_id.set(request_id)
+            main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+            main._live_request_id.reset(token)
+            await asyncio.sleep(30)
+
+        with patch.object(main, "_handle_snapshot_request", never_finish):
+            with patch.object(
+                main, "_SNAPSHOT_REQUEST_HARD_LIMIT_SECONDS", 0.05
+            ):
+                await main.handle_snapshot_request(
+                    FakeWs(), "GRADE 1A", "req-cut-off",
+                )
 
         entry = main._camera_outcomes[("192.0.2.90", 12)]
         self.assertEqual(entry["counted_requests"], set())
