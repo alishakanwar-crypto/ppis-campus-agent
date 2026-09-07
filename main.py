@@ -1781,6 +1781,76 @@ def dvr_snapshot_health() -> list[dict]:
     return health
 
 
+# What each classroom camera did the last time a parent's photo asked it. The
+# campus PC's log cannot be read from the cloud, so a channel that has stopped
+# answering altogether — a dead camera, an unplugged cable — looks from outside
+# exactly like a busy recorder, and parents of that one class keep being told
+# "camera unavailable" with nobody knowing which camera to go and look at.
+_camera_outcomes: dict[tuple[str, int], dict] = {}
+# A camera that has failed this many parent photos in a row without a single
+# success in between is treated as one to name rather than to keep knocking on.
+_CAMERA_SILENT_AFTER_FAILURES = max(
+    2, int(os.environ.get("CAMERA_SILENT_AFTER_FAILURES", "4"))
+)
+
+
+def _note_camera_outcome(
+    camera: tuple[dict, int, str],
+    classroom: str,
+    served: bool,
+    report: dict,
+) -> None:
+    """Remember whether this camera gave a parent a picture, and why not."""
+    dvr, channel, desc = camera
+    ip = str(dvr.get("ip", ""))
+    entry = _camera_outcomes.setdefault(
+        (ip, channel),
+        {
+            "ip": ip,
+            "channel": channel,
+            "camera": desc,
+            "classroom": classroom,
+            "failures_in_a_row": 0,
+            "last_served_ist": "",
+            "last_failed_ist": "",
+            "reason": "",
+        },
+    )
+    entry["camera"] = desc or entry["camera"]
+    entry["classroom"] = classroom or entry["classroom"]
+    now = datetime.now(_IST).strftime("%d-%m-%Y %H:%M:%S IST")
+    if served:
+        entry["failures_in_a_row"] = 0
+        entry["last_served_ist"] = now
+        entry["reason"] = ""
+        return
+    entry["failures_in_a_row"] = int(entry["failures_in_a_row"]) + 1
+    entry["last_failed_ist"] = now
+    outcome = str(report.get("outcome") or "no picture")
+    exception = str(report.get("exception") or "")
+    if report.get("rtsp"):
+        outcome = f"{outcome} over the video stream"
+    entry["reason"] = f"{outcome}: {exception}" if exception else outcome
+
+
+def _camera_is_silent(camera: tuple[dict, int, str]) -> bool:
+    """True for a camera that has answered nothing for several photos running."""
+    dvr, channel, _ = camera
+    entry = _camera_outcomes.get((str(dvr.get("ip", "")), channel))
+    if not entry:
+        return False
+    return int(entry["failures_in_a_row"]) >= _CAMERA_SILENT_AFTER_FAILURES
+
+
+def camera_snapshot_health() -> list[dict]:
+    """Classroom cameras that are currently giving parents nothing."""
+    return [
+        dict(entry)
+        for _, entry in sorted(_camera_outcomes.items())
+        if int(entry["failures_in_a_row"]) >= 2
+    ]
+
+
 # The first frames a recorder's video stream decodes are usually grey filler
 # while the decoder waits for a keyframe, so a picture is only worth sending
 # once it actually carries detail.
@@ -3494,6 +3564,7 @@ async def websocket_client():
                     "dvr_count": len(config.get("dvrs", [])),
                     "camera_count": len(config.get("camera_mapping", {})),
                     "dvr_health": dvr_snapshot_health(),
+                    "camera_health": camera_snapshot_health(),
                     "code_commit": _running_commit(),
                     "started_at_ist": _process_started_at_ist(),
                     "auto_update": auto_update_state(),
@@ -3519,6 +3590,7 @@ async def websocket_client():
                             await ws.send(json.dumps({
                                 "type": "pong",
                                 "dvr_health": dvr_snapshot_health(),
+                                "camera_health": camera_snapshot_health(),
                                 "auto_update": auto_update_state(),
                             }))
 
@@ -3810,12 +3882,16 @@ async def _capture_classroom_camera(
             channel,
             desc,
         )
+        report.setdefault("outcome", "timed out")
+        _note_camera_outcome(camera, classroom, False, report)
         return None
     if not snapshot:
         logger.warning(
             f"Failed to capture from DVR {dvr['ip']} channel {channel} ({desc})"
         )
+        _note_camera_outcome(camera, classroom, False, report)
         return None
+    _note_camera_outcome(camera, classroom, True, report)
 
     snapshot = await _repair_colour_if_night_mode(snapshot, camera)
 
@@ -3958,12 +4034,19 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
                 time.monotonic() - request_started,
             )
         for task, camera in tasks.items():
-            if (
-                task.cancelled()
-                or task.exception() is not None
-                or task.result() is None
-            ):
+            broke = task.cancelled() or task.exception() is not None
+            if broke or task.result() is None:
                 missed.append(camera)
+            if broke:
+                # A capture that raised never reached the point where the
+                # camera's outcome is noted, and an always-raising channel is
+                # exactly the one somebody has to go and look at.
+                reason = "cancelled" if task.cancelled() else _exception_text(
+                    task.exception()
+                )
+                _note_camera_outcome(
+                    camera, classroom, False, {"outcome": reason},
+                )
         return missed
 
     missed = await send_captured(wanted)
@@ -3981,11 +4064,27 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
             deadline - time.monotonic()
         )
         if left >= _SNAPSHOT_SECOND_ANGLE_RETRY_SECONDS:
-            logger.info(
-                "Retrying %d camera(s) for %s that gave no picture",
-                len(missed), classroom,
-            )
-            await send_captured(missed)
+            # A camera that has answered nothing for several photos running is
+            # not busy, it is out of order, and a second ask only spends a
+            # recorder slot the classroom's working angle needs.
+            worth_retrying = [
+                camera for camera in missed if not _camera_is_silent(camera)
+            ]
+            for camera in missed:
+                if camera in worth_retrying:
+                    continue
+                logger.warning(
+                    "Not asking %s again in this request: it has given nothing "
+                    "for %d photos running and needs looking at on the camera "
+                    "itself",
+                    camera[2], _CAMERA_SILENT_AFTER_FAILURES,
+                )
+            if worth_retrying:
+                logger.info(
+                    "Retrying %d camera(s) for %s that gave no picture",
+                    len(worth_retrying), classroom,
+                )
+                await send_captured(worth_retrying)
 
     if sent_count == 0:
         await ws.send(json.dumps({
