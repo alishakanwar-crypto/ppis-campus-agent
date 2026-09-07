@@ -784,6 +784,16 @@ _LIVE_CAPTURE_SHARING = (
     not in {"0", "false", "no"}
 )
 _live_capture_in_flight: dict[tuple[str, int], asyncio.Task] = {}
+# A recorder whose snapshot doors are dead has to serve every camera over its
+# video stream, and it will only open so many streams at once: at 8-9 AM that
+# limit, not a broken camera, is what answers a parent with "unable to
+# capture". A stream picture from seconds ago is the same classroom, so it is
+# handed over instead of spending another of those few slots. Pictures from a
+# working snapshot door are never reused — that road has no such limit.
+_LIVE_CAPTURE_FRESH_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_FRESH_FRAME_SECONDS", "20"))
+)
+_live_capture_fresh_frames: dict[tuple[str, int], tuple[float, bytes]] = {}
 # A parent's photo is worth the bytes: WhatsApp accepts images up to 5 MB, so
 # only squeeze quality when the picture is far bigger than that.
 _LIVE_SNAPSHOT_MAX_BYTES = max(
@@ -1761,6 +1771,19 @@ _RTSP_MAX_FRAMES_READ = max(
 _RTSP_FRAME_SEARCH_SECONDS = max(
     0.5, float(os.environ.get("RTSP_FRAME_SEARCH_SECONDS", "5"))
 )
+# How much of a frame's height is examined for the decoder's smear, how little
+# vertical variation a column may carry before that band is smear rather than
+# classroom, and how much more variation the picture above must carry for the
+# band to be the decoder's fault instead of the room's own flat wall.
+_RTSP_TEAR_BAND_FRACTION = min(
+    0.9, max(0.05, float(os.environ.get("RTSP_TEAR_BAND_FRACTION", "0.25")))
+)
+_RTSP_TEAR_MAX_COLUMN_STDDEV = max(
+    0.0, float(os.environ.get("RTSP_TEAR_MAX_COLUMN_STDDEV", "3"))
+)
+_RTSP_TEAR_TOP_RATIO = max(
+    1.0, float(os.environ.get("RTSP_TEAR_TOP_RATIO", "4"))
+)
 
 
 def _frame_carries_detail(frame) -> bool:
@@ -1771,24 +1794,64 @@ def _frame_carries_detail(frame) -> bool:
         return True
 
 
+def _frame_is_torn(frame) -> bool:
+    """True for a frame whose lower part is the decoder's vertical smear.
+
+    A keyframe that arrives with slices missing decodes as a real classroom on
+    top and columns of dragged colour underneath, and it passes every check a
+    whole JPEG passes. Dragged columns hold no vertical variation at all, so a
+    band that is flat down every column while the picture above it varies is
+    the decoder tearing rather than a plain floor, and must not be sent.
+    """
+    try:
+        height = int(frame.shape[0])
+        if height < 10:
+            return False
+        band = frame[int(height * (1.0 - _RTSP_TEAR_BAND_FRACTION)):]
+        top = frame[: int(height * 0.5)]
+        if not float(top.std()) >= _RTSP_MIN_FRAME_STDDEV:
+            return False
+        smear = float(band.std(axis=0).mean())
+        if smear >= _RTSP_TEAR_MAX_COLUMN_STDDEV:
+            return False
+        return (
+            float(top.std(axis=0).mean())
+            >= max(smear, 1.0) * _RTSP_TEAR_TOP_RATIO
+        )
+    except Exception:
+        return False
+
+
 def _read_detailed_frame(cap, ip: str, channel: int):
     """Read past the decoder's grey filler frames to a real classroom picture."""
     deadline = time.monotonic() + _RTSP_FRAME_SEARCH_SECONDS
     blank = 0
+    torn = 0
+    last_torn = None
     for _ in range(_RTSP_MAX_FRAMES_READ):
         ret, frame = cap.read()
         if not ret or frame is None:
             break
         if _frame_carries_detail(frame):
-            if blank:
-                logger.info(
-                    "[RTSP] %s ch%d: skipped %d blank frame(s) before a real "
-                    "picture", ip, channel, blank,
-                )
-            return frame
-        blank += 1
+            if not _frame_is_torn(frame):
+                if blank or torn:
+                    logger.info(
+                        "[RTSP] %s ch%d: skipped %d blank and %d torn frame(s) "
+                        "before a whole picture", ip, channel, blank, torn,
+                    )
+                return frame
+            torn += 1
+            last_torn = frame
+        else:
+            blank += 1
         if time.monotonic() >= deadline:
             break
+    if torn:
+        logger.warning(
+            "[RTSP] %s ch%d: %d frame(s) came half-decoded; sending the last "
+            "one rather than nothing", ip, channel, torn,
+        )
+        return last_torn
     if blank:
         logger.warning(
             "[RTSP] %s ch%d: every one of %d frame(s) was blank, refusing to "
@@ -2425,6 +2488,23 @@ async def capture_snapshot(
         )
     key = (dvr["ip"], channel)
     report = _live_capture_report.get()
+    fresh = _fresh_frame(key)
+    if fresh is not None:
+        age = time.monotonic() - _live_capture_fresh_frames[key][0]
+        logger.info(
+            "%s ch%d: serving the picture taken %.1fs ago for %s",
+            key[0], channel, age,
+            classroom or _live_request_classroom.get() or "-",
+        )
+        if report is not None and not report:
+            report.update({
+                "seconds": 0.0,
+                "reused_age": round(age, 2),
+                "recorder": key[0],
+                "channel": channel,
+                "outcome": "success",
+            })
+        return fresh
     task = _live_capture_in_flight.get(key)
     mine = task is None or task.done()
     if mine:
@@ -2461,6 +2541,20 @@ async def capture_snapshot(
             "channel": channel,
             "outcome": "success" if picture else "failed",
         })
+    return picture
+
+
+def _fresh_frame(key: tuple[str, int]) -> bytes | None:
+    """This channel's last stream picture, while it is still the same class."""
+    if not _LIVE_CAPTURE_FRESH_SECONDS:
+        return None
+    entry = _live_capture_fresh_frames.get(key)
+    if entry is None:
+        return None
+    taken_at, picture = entry
+    if time.monotonic() - taken_at > _LIVE_CAPTURE_FRESH_SECONDS:
+        _live_capture_fresh_frames.pop(key, None)
+        return None
     return picture
 
 
@@ -2790,6 +2884,10 @@ async def _capture_snapshot_now(
                     )
                     if rtsp_frame:
                         _note_video_frame_size(ip, channel, rtsp_frame)
+                        if not background and _LIVE_CAPTURE_FRESH_SECONDS:
+                            _live_capture_fresh_frames[(ip, channel)] = (
+                                time.monotonic(), rtsp_frame,
+                            )
                         metrics["rtsp"] = True
                         metrics["outcome"] = "success"
                         _clear_rtsp_failure(ip, channel)
