@@ -2030,6 +2030,48 @@ async def _remeasure_soft_channel(dvr: dict, channel: int) -> None:
             key[0], channel, after,
             (_live_capture_preferences.get(key) or ("", "-"))[1], before,
         )
+    await _measure_video_road(dvr, channel)
+
+
+async def _measure_video_road(dvr: dict, channel: int) -> None:
+    """See how big a picture this channel's stream carries, if it matters.
+
+    A channel whose door still serves a quarter-size classroom after being
+    measured is only rescued by its video stream, and the stream's size is
+    never learned from a request that a working door answers first. It is
+    sampled here instead, where a few seconds cost nobody their photo.
+    """
+    ip = dvr["ip"]
+    key = (ip, channel)
+    wanted = _LIVE_SNAPSHOT_WIDTH * _LIVE_SNAPSHOT_HEIGHT
+    door_pixels = _live_capture_best_pixels.get(key, 0)
+    if not door_pixels or not wanted or door_pixels * 3 >= wanted:
+        return
+    if key in _live_capture_video_pixels:
+        return
+    if (
+        _credentials_refused(dvr)
+        or _rtsp_cooldown_active(ip)
+        or _rtsp_channel_cooldown_active(ip, channel)
+    ):
+        return
+    try:
+        frame = await _capture_snapshot_rtsp(dvr, channel, background=True)
+    except Exception as exc:  # noqa: BLE001 - a measurement must never raise
+        logger.debug(
+            "%s ch%d: stream measurement failed: %s",
+            ip, channel, _exception_text(exc),
+        )
+        return
+    if not frame:
+        return
+    _note_video_frame_size(ip, channel, frame)
+    if _video_road_is_sharper(ip, channel):
+        logger.info(
+            "%s ch%d: stream carries %d pixels against the doors' %d; "
+            "parents get the stream from now on",
+            ip, channel, _live_capture_video_pixels.get(key, 0), door_pixels,
+        )
 
 
 def _note_video_frame_size(ip: str, channel: int, frame: bytes) -> None:

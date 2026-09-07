@@ -82,6 +82,43 @@ class VideoRoadPreferenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(requested, [])
 
+    async def test_the_stream_size_is_learned_without_a_parent_waiting(self):
+        """A working small door must not hide the stream's bigger picture."""
+        requested: list[str] = []
+        tiny = jpeg(704, 480)
+        frame = jpeg(1280, 720)
+        dvr = self._dvr("192.0.2.85")
+        key = ("192.0.2.85", 3)
+        main._live_capture_preferences[key] = ("digest", 3)
+        main._live_capture_preference_age[key] = main.time.monotonic()
+
+        async def rtsp(recorder, channel, background=False):
+            return frame
+
+        with patch.object(main, "_save_capture_doors"), patch.object(
+            main, "_LIVE_CAPTURE_SOFT_REMEASURE_DELAY_SECONDS", 0.0
+        ), patch.object(
+            main, "_capture_snapshot_rtsp", rtsp
+        ), patch.object(
+            main.httpx,
+            "AsyncClient",
+            return_value=self._client(tiny, requested),
+        ):
+            # The parent gets the quarter-size picture the door hands over,
+            # and the background work then samples the stream.
+            self.assertEqual(await main.capture_snapshot(dvr, 3), tiny)
+            for _ in range(20):
+                await main.asyncio.sleep(0.01)
+                if key in main._live_capture_video_pixels:
+                    break
+            self.assertEqual(
+                main._live_capture_video_pixels.get(key), 1280 * 720
+            )
+            requested.clear()
+            self.assertEqual(await main.capture_snapshot(dvr, 3), frame)
+
+        self.assertEqual(requested, [])
+
     async def test_a_door_serving_the_wanted_size_keeps_the_stream_out(self):
         """The stream costs seconds, so it is not taken for nothing."""
         key = ("192.0.2.81", 3)
