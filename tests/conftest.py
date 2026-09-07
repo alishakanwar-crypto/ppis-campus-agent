@@ -13,6 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import main
 import recorder_auth
 
 
@@ -24,3 +25,9 @@ def isolated_recorder_auth_state(monkeypatch, tmp_path_factory):
     yield
 
 
+@pytest.fixture(autouse=True)
+def no_reused_picture_between_tests():
+    """One test's stream picture must not reach the next one's parent."""
+    main._live_capture_fresh_frames.clear()
+    yield
+    main._live_capture_fresh_frames.clear()
