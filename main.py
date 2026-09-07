@@ -1847,6 +1847,51 @@ def _note_camera_outcome(
     entry["reason"] = f"{outcome}: {exception}" if exception else outcome
 
 
+_LOOP_LAG_SAMPLE_SECONDS = max(
+    0.2, float(os.environ.get("LOOP_LAG_SAMPLE_SECONDS", "1"))
+)
+_LOOP_LAG_WINDOW_SECONDS = max(
+    30.0, float(os.environ.get("LOOP_LAG_WINDOW_SECONDS", "300"))
+)
+_loop_lag_samples: list[tuple[float, float]] = []
+
+
+async def watch_event_loop_lag() -> None:
+    """Measure how long other work keeps a parent's request waiting.
+
+    A photo whose camera answers in under a second can still reach the parent
+    twenty seconds late, or not at all, when the agent's own scanning work
+    holds the loop. Without this number the delay gets blamed on the cameras.
+    """
+    while True:
+        started = time.monotonic()
+        await asyncio.sleep(_LOOP_LAG_SAMPLE_SECONDS)
+        lag = time.monotonic() - started - _LOOP_LAG_SAMPLE_SECONDS
+        now = time.monotonic()
+        _loop_lag_samples.append((now, max(0.0, lag)))
+        cutoff = now - _LOOP_LAG_WINDOW_SECONDS
+        while _loop_lag_samples and _loop_lag_samples[0][0] < cutoff:
+            _loop_lag_samples.pop(0)
+        if lag >= 2.0:
+            logger.warning(
+                "Other work held the agent for %.1fs; a parent's photo waits "
+                "that long before a camera is even asked", lag,
+            )
+
+
+def event_loop_lag_health() -> dict:
+    """The worst and the usual delay before any request can get going."""
+    lags = [lag for _, lag in _loop_lag_samples]
+    if not lags:
+        return {"worst_seconds": 0.0, "usual_seconds": 0.0, "samples": 0}
+    lags_sorted = sorted(lags)
+    return {
+        "worst_seconds": round(lags_sorted[-1], 2),
+        "usual_seconds": round(lags_sorted[len(lags_sorted) // 2], 3),
+        "samples": len(lags),
+    }
+
+
 def _forget_request_outcomes(request_id: str) -> None:
     """Drop a finished photo's id, so the ledger cannot grow with requests."""
     if not request_id:
@@ -3432,6 +3477,12 @@ _snapshot_request_semaphore = asyncio.Semaphore(
 _SNAPSHOT_CAMERA_TIMEOUT_SECONDS = max(
     1.0, float(os.environ.get("SNAPSHOT_CAMERA_TIMEOUT_SECONDS", "8"))
 )
+# However long a request waited to get going, the camera is still asked for
+# this long: a room whose cameras answer in under a second must never be
+# reported to a parent as unavailable because the request was held up.
+_SNAPSHOT_CAMERA_MIN_ATTEMPT_SECONDS = max(
+    0.5, float(os.environ.get("SNAPSHOT_CAMERA_MIN_ATTEMPT_SECONDS", "4"))
+)
 # Request budget that must remain before a classroom's quiet second camera is
 # tried again, so the retry never costs the parent the photo already taken.
 _SNAPSHOT_SECOND_ANGLE_RETRY_SECONDS = max(
@@ -3587,6 +3638,7 @@ async def websocket_client():
                     "camera_count": len(config.get("camera_mapping", {})),
                     "dvr_health": dvr_snapshot_health(),
                     "camera_health": camera_snapshot_health(),
+                    "agent_lag": event_loop_lag_health(),
                     "code_commit": _running_commit(),
                     "started_at_ist": _process_started_at_ist(),
                     "auto_update": auto_update_state(),
@@ -3613,6 +3665,7 @@ async def websocket_client():
                                 "type": "pong",
                                 "dvr_health": dvr_snapshot_health(),
                                 "camera_health": camera_snapshot_health(),
+                                "agent_lag": event_loop_lag_health(),
                                 "auto_update": auto_update_state(),
                             }))
 
@@ -3891,7 +3944,14 @@ async def _capture_classroom_camera(
         # again, and the request dies without a camera having been asked.
         timeout = _SNAPSHOT_CAMERA_TIMEOUT_SECONDS
         if request_deadline is not None:
-            timeout = max(0.1, request_deadline - time.monotonic())
+            # A request that spent its whole budget before this point has not
+            # asked the camera at all, and cutting the ask down to a fraction
+            # of a second reports a working camera as timed out and tells the
+            # parent the room is unavailable. Every camera gets a real ask.
+            timeout = max(
+                _SNAPSHOT_CAMERA_MIN_ATTEMPT_SECONDS,
+                request_deadline - time.monotonic(),
+            )
         snapshot = await asyncio.wait_for(
             capture_snapshot(dvr, channel),
             timeout=timeout,
@@ -4509,6 +4569,9 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_unlock_watch_loop())
     # Pick up merged fixes without anyone running a restart script.
     asyncio.create_task(_auto_update_loop())
+    # Measure delay caused by the agent's own work, so a slow morning is
+    # attributed honestly instead of being blamed on the cameras.
+    asyncio.create_task(watch_event_loop_lag())
     # Measure every camera nightly, so a parent's request is never the probe.
     _load_capture_doors()
     asyncio.create_task(_camera_warmup_loop())
