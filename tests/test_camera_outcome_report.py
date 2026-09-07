@@ -137,7 +137,18 @@ class SilentCameraRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry["failures_in_a_row"], 2)
         self.assertFalse(main._camera_is_silent(CAMERAS[1]))
 
-    async def test_the_internal_request_id_is_not_reported_to_the_cloud(self):
+    async def test_two_overlapping_photos_count_two_not_four(self):
+        """Two parents asking together interleave their attempts."""
+        for request_id in ("req-one", "req-two", "req-one", "req-two"):
+            token = main._live_request_id.set(request_id)
+            main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+            main._live_request_id.reset(token)
+
+        entry = main._camera_outcomes[("192.0.2.90", 12)]
+        self.assertEqual(entry["failures_in_a_row"], 2)
+        self.assertFalse(main._camera_is_silent(CAMERAS[1]))
+
+    async def test_the_internal_request_ids_are_not_reported_to_the_cloud(self):
         for request_id in ("req-a", "req-b"):
             token = main._live_request_id.set(request_id)
             main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
@@ -146,7 +157,8 @@ class SilentCameraRetryTests(unittest.IsolatedAsyncioTestCase):
         reported = main.camera_snapshot_health()
 
         self.assertEqual(reported[0]["failures_in_a_row"], 2)
-        self.assertNotIn("failed_request", reported[0])
+        self.assertNotIn("counted_requests", reported[0])
+        json.dumps(reported)
 
     async def test_a_busy_camera_is_still_asked_twice(self):
         attempts = {5: 0, 12: 0}
