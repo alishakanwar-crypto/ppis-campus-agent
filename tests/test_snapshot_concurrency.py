@@ -910,6 +910,10 @@ class SnapshotConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             # camera budget is kept inside capture_snapshot so that a queue
             # behind other parents is not charged to the camera.
             main, "_SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS", 0.01
+        ), patch.object(
+            # Every camera is asked for at least this long even when the budget
+            # has gone, or a camera that answers quickly is reported silent.
+            main, "_SNAPSHOT_CAMERA_MIN_ATTEMPT_SECONDS", 0.05
         ):
             await main._handle_snapshot_request(websocket, "TEST", "request-1")
 

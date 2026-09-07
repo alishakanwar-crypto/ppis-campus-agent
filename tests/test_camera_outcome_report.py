@@ -1,3 +1,4 @@
+import asyncio
 import json
 import unittest
 from unittest.mock import patch
@@ -147,6 +148,71 @@ class SilentCameraRetryTests(unittest.IsolatedAsyncioTestCase):
         entry = main._camera_outcomes[("192.0.2.90", 12)]
         self.assertEqual(entry["failures_in_a_row"], 2)
         self.assertFalse(main._camera_is_silent(CAMERAS[1]))
+
+    async def test_a_long_wait_behind_other_photos_still_counts_once(self):
+        """One photo's retry can arrive after many other photos failed."""
+        first = main._live_request_id.set("req-slow")
+        main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+        main._live_request_id.reset(first)
+        for n in range(12):
+            token = main._live_request_id.set(f"req-{n}")
+            main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+            main._live_request_id.reset(token)
+            main._forget_request_outcomes(f"req-{n}")
+        before = main._camera_outcomes[("192.0.2.90", 12)]["failures_in_a_row"]
+
+        retry = main._live_request_id.set("req-slow")
+        main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+        main._live_request_id.reset(retry)
+
+        entry = main._camera_outcomes[("192.0.2.90", 12)]
+        self.assertEqual(entry["failures_in_a_row"], before)
+
+    async def test_a_finished_photo_is_forgotten(self):
+        """Or the ledger would grow with every photo the campus serves."""
+        token = main._live_request_id.set("req-done")
+        main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+        main._live_request_id.reset(token)
+
+        main._forget_request_outcomes("req-done")
+
+        entry = main._camera_outcomes[("192.0.2.90", 12)]
+        self.assertEqual(entry["counted_requests"], set())
+
+    async def test_a_photo_that_breaks_is_still_forgotten(self):
+        """A raised error or the hard limit must not leave the id behind."""
+        async def blow_up(ws, classroom, request_id):
+            token = main._live_request_id.set(request_id)
+            main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+            main._live_request_id.reset(token)
+            raise RuntimeError("cloud link died")
+
+        with patch.object(main, "_handle_snapshot_request", blow_up):
+            with self.assertRaises(RuntimeError):
+                await main._serve_snapshot_request(
+                    FakeWs(), "GRADE 1A", "req-broken", main.time.monotonic(),
+                )
+
+        entry = main._camera_outcomes[("192.0.2.90", 12)]
+        self.assertEqual(entry["counted_requests"], set())
+
+    async def test_a_photo_cut_off_by_the_hard_limit_is_forgotten(self):
+        async def never_finish(ws, classroom, request_id):
+            token = main._live_request_id.set(request_id)
+            main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+            main._live_request_id.reset(token)
+            await asyncio.sleep(30)
+
+        with patch.object(main, "_handle_snapshot_request", never_finish):
+            with patch.object(
+                main, "_SNAPSHOT_REQUEST_HARD_LIMIT_SECONDS", 0.05
+            ):
+                await main.handle_snapshot_request(
+                    FakeWs(), "GRADE 1A", "req-cut-off",
+                )
+
+        entry = main._camera_outcomes[("192.0.2.90", 12)]
+        self.assertEqual(entry["counted_requests"], set())
 
     async def test_the_internal_request_ids_are_not_reported_to_the_cloud(self):
         for request_id in ("req-a", "req-b"):
