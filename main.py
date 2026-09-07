@@ -85,6 +85,7 @@ if __name__ == "__main__":
         pass
 
 import httpx
+import numpy
 import websockets
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
@@ -1771,18 +1772,19 @@ _RTSP_MAX_FRAMES_READ = max(
 _RTSP_FRAME_SEARCH_SECONDS = max(
     0.5, float(os.environ.get("RTSP_FRAME_SEARCH_SECONDS", "5"))
 )
-# How much of a frame's height is examined for the decoder's smear, how little
-# vertical variation a column may carry before that band is smear rather than
-# classroom, and how much more variation the picture above must carry for the
-# band to be the decoder's fault instead of the room's own flat wall.
-_RTSP_TEAR_BAND_FRACTION = min(
-    0.9, max(0.05, float(os.environ.get("RTSP_TEAR_BAND_FRACTION", "0.25")))
+# The decoder's smear is a run of rows that are copies of the row above them.
+# A row counts as copied when it differs from the row above by far less than
+# this frame's own normal row-to-row change; a run has to be this tall to be
+# a smear rather than a still wall, and has to carry side-to-side detail so
+# the black bar a 4:3 camera is padded with is never mistaken for one.
+_RTSP_TEAR_FLAT_ROW_RATIO = max(
+    0.01, float(os.environ.get("RTSP_TEAR_FLAT_ROW_RATIO", "0.2"))
 )
-_RTSP_TEAR_MAX_COLUMN_STDDEV = max(
-    0.0, float(os.environ.get("RTSP_TEAR_MAX_COLUMN_STDDEV", "3"))
+_RTSP_TEAR_MIN_BAND_FRACTION = max(
+    0.005, float(os.environ.get("RTSP_TEAR_MIN_BAND_FRACTION", "0.015"))
 )
-_RTSP_TEAR_TOP_RATIO = max(
-    1.0, float(os.environ.get("RTSP_TEAR_TOP_RATIO", "4"))
+_RTSP_TEAR_MIN_SIDE_DETAIL = max(
+    0.0, float(os.environ.get("RTSP_TEAR_MIN_SIDE_DETAIL", "0.5"))
 )
 
 
@@ -1798,26 +1800,37 @@ def _frame_is_torn(frame) -> bool:
     """True for a frame whose lower part is the decoder's vertical smear.
 
     A keyframe that arrives with slices missing decodes as a real classroom on
-    top and columns of dragged colour underneath, and it passes every check a
-    whole JPEG passes. Dragged columns hold no vertical variation at all, so a
-    band that is flat down every column while the picture above it varies is
-    the decoder tearing rather than a plain floor, and must not be sent.
+    top and dragged columns of colour underneath, and it passes every check a
+    whole JPEG passes, so parents were being sent it. Those columns are the
+    last good row repeated over and over, so the giveaway is a run of rows in
+    the lower part of the frame that barely differ from the row above them
+    while still carrying detail across, which is what tells a smear apart
+    from a black bar or a blank wall.
     """
     try:
         height = int(frame.shape[0])
-        if height < 10:
+        if height < 40:
             return False
-        band = frame[int(height * (1.0 - _RTSP_TEAR_BAND_FRACTION)):]
-        top = frame[: int(height * 0.5)]
-        if not float(top.std()) >= _RTSP_MIN_FRAME_STDDEV:
+        rows = frame.astype(numpy.int16)
+        change = numpy.abs(rows[1:] - rows[:-1]).mean(axis=(1, 2))
+        usual = float(numpy.median(change))
+        copied = change < max(0.5, usual * _RTSP_TEAR_FLAT_ROW_RATIO)
+        lowest = int(height * 0.4)
+        least = max(8, int(height * _RTSP_TEAR_MIN_BAND_FRACTION))
+        run = 0
+        longest = 0
+        ends_at = 0
+        for row in range(lowest, len(copied)):
+            run = run + 1 if copied[row] else 0
+            if run > longest:
+                longest, ends_at = run, row
+        if longest < least:
             return False
-        smear = float(band.std(axis=0).mean())
-        if smear >= _RTSP_TEAR_MAX_COLUMN_STDDEV:
-            return False
-        return (
-            float(top.std(axis=0).mean())
-            >= max(smear, 1.0) * _RTSP_TEAR_TOP_RATIO
-        )
+        band = frame[ends_at - longest + 1:ends_at + 2]
+        sideways = numpy.abs(
+            band[:, 1:].astype(numpy.int16) - band[:, :-1]
+        ).mean()
+        return float(sideways) >= _RTSP_TEAR_MIN_SIDE_DETAIL
     except Exception:
         return False
 
@@ -1827,7 +1840,6 @@ def _read_detailed_frame(cap, ip: str, channel: int):
     deadline = time.monotonic() + _RTSP_FRAME_SEARCH_SECONDS
     blank = 0
     torn = 0
-    last_torn = None
     for _ in range(_RTSP_MAX_FRAMES_READ):
         ret, frame = cap.read()
         if not ret or frame is None:
@@ -1841,17 +1853,16 @@ def _read_detailed_frame(cap, ip: str, channel: int):
                     )
                 return frame
             torn += 1
-            last_torn = frame
         else:
             blank += 1
         if time.monotonic() >= deadline:
             break
     if torn:
         logger.warning(
-            "[RTSP] %s ch%d: %d frame(s) came half-decoded; sending the last "
-            "one rather than nothing", ip, channel, torn,
+            "[RTSP] %s ch%d: every one of %d frame(s) came half-decoded, "
+            "refusing to send a smeared photo", ip, channel, torn,
         )
-        return last_torn
+        return None
     if blank:
         logger.warning(
             "[RTSP] %s ch%d: every one of %d frame(s) was blank, refusing to "
