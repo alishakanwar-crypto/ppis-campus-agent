@@ -148,6 +148,36 @@ class SilentCameraRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry["failures_in_a_row"], 2)
         self.assertFalse(main._camera_is_silent(CAMERAS[1]))
 
+    async def test_a_long_wait_behind_other_photos_still_counts_once(self):
+        """One photo's retry can arrive after many other photos failed."""
+        first = main._live_request_id.set("req-slow")
+        main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+        main._live_request_id.reset(first)
+        for n in range(12):
+            token = main._live_request_id.set(f"req-{n}")
+            main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+            main._live_request_id.reset(token)
+            main._forget_request_outcomes(f"req-{n}")
+        before = main._camera_outcomes[("192.0.2.90", 12)]["failures_in_a_row"]
+
+        retry = main._live_request_id.set("req-slow")
+        main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+        main._live_request_id.reset(retry)
+
+        entry = main._camera_outcomes[("192.0.2.90", 12)]
+        self.assertEqual(entry["failures_in_a_row"], before)
+
+    async def test_a_finished_photo_is_forgotten(self):
+        """Or the ledger would grow with every photo the campus serves."""
+        token = main._live_request_id.set("req-done")
+        main._note_camera_outcome(CAMERAS[1], "GRADE 1A", False, {})
+        main._live_request_id.reset(token)
+
+        main._forget_request_outcomes("req-done")
+
+        entry = main._camera_outcomes[("192.0.2.90", 12)]
+        self.assertEqual(entry["counted_requests"], set())
+
     async def test_the_internal_request_ids_are_not_reported_to_the_cloud(self):
         for request_id in ("req-a", "req-b"):
             token = main._live_request_id.set(request_id)

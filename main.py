@@ -11,7 +11,6 @@ Features:
 
 from __future__ import annotations
 
-import collections
 import concurrent.futures
 import contextvars
 import faulthandler
@@ -1818,7 +1817,7 @@ def _note_camera_outcome(
             "last_served_ist": "",
             "last_failed_ist": "",
             "reason": "",
-            "counted_requests": collections.deque(maxlen=8),
+            "counted_requests": set(),
         },
     )
     entry["camera"] = desc or entry["camera"]
@@ -1832,20 +1831,28 @@ def _note_camera_outcome(
         return
     # One parent's photo can ask the same camera twice, and counting both
     # attempts would call a camera out of order after two busy requests
-    # instead of four. Photos overlap, so the last few requests counted are
-    # remembered rather than only the latest one.
+    # instead of four. Photos overlap, so every request counted is remembered
+    # until that request finishes, not just the latest one.
     request = _live_request_id.get()
     counted = bool(request) and request in entry["counted_requests"]
     if not counted:
         entry["failures_in_a_row"] = int(entry["failures_in_a_row"]) + 1
         if request:
-            entry["counted_requests"].append(request)
+            entry["counted_requests"].add(request)
     entry["last_failed_ist"] = now
     outcome = str(report.get("outcome") or "no picture")
     exception = str(report.get("exception") or "")
     if report.get("rtsp"):
         outcome = f"{outcome} over the video stream"
     entry["reason"] = f"{outcome}: {exception}" if exception else outcome
+
+
+def _forget_request_outcomes(request_id: str) -> None:
+    """Drop a finished photo's id, so the ledger cannot grow with requests."""
+    if not request_id:
+        return
+    for entry in _camera_outcomes.values():
+        entry["counted_requests"].discard(request_id)
 
 
 def _camera_is_silent(camera: tuple[dict, int, str]) -> bool:
@@ -3982,6 +3989,7 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         _live_request_deadline.reset(request_token)
         _live_request_classroom.reset(classroom_token)
         _live_request_id.reset(request_id_token)
+        _forget_request_outcomes(request_id)
         return
 
     logger.info(f"Capturing from {len(all_cameras)} camera(s) for {classroom}")
@@ -4114,6 +4122,7 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         _live_request_deadline.reset(request_token)
         _live_request_classroom.reset(classroom_token)
         _live_request_id.reset(request_id_token)
+        _forget_request_outcomes(request_id)
         return
 
     # Send completion message
@@ -4133,6 +4142,7 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
     _live_request_deadline.reset(request_token)
     _live_request_classroom.reset(classroom_token)
     _live_request_id.reset(request_id_token)
+    _forget_request_outcomes(request_id)
 
 
 # ---------------------------------------------------------------------------
