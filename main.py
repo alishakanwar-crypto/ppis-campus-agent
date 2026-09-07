@@ -11,6 +11,7 @@ Features:
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import contextvars
 import faulthandler
@@ -1817,7 +1818,7 @@ def _note_camera_outcome(
             "last_served_ist": "",
             "last_failed_ist": "",
             "reason": "",
-            "failed_request": "",
+            "counted_requests": collections.deque(maxlen=8),
         },
     )
     entry["camera"] = desc or entry["camera"]
@@ -1827,16 +1828,18 @@ def _note_camera_outcome(
         entry["failures_in_a_row"] = 0
         entry["last_served_ist"] = now
         entry["reason"] = ""
-        entry["failed_request"] = ""
+        entry["counted_requests"].clear()
         return
     # One parent's photo can ask the same camera twice, and counting both
     # attempts would call a camera out of order after two busy requests
-    # instead of four.
+    # instead of four. Photos overlap, so the last few requests counted are
+    # remembered rather than only the latest one.
     request = _live_request_id.get()
-    counted = bool(request) and entry["failed_request"] == request
+    counted = bool(request) and request in entry["counted_requests"]
     if not counted:
         entry["failures_in_a_row"] = int(entry["failures_in_a_row"]) + 1
-        entry["failed_request"] = request
+        if request:
+            entry["counted_requests"].append(request)
     entry["last_failed_ist"] = now
     outcome = str(report.get("outcome") or "no picture")
     exception = str(report.get("exception") or "")
@@ -1857,7 +1860,7 @@ def _camera_is_silent(camera: tuple[dict, int, str]) -> bool:
 def camera_snapshot_health() -> list[dict]:
     """Classroom cameras that are currently giving parents nothing."""
     return [
-        {k: v for k, v in entry.items() if k != "failed_request"}
+        {k: v for k, v in entry.items() if k != "counted_requests"}
         for _, entry in sorted(_camera_outcomes.items())
         if int(entry["failures_in_a_row"]) >= 2
     ]
