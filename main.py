@@ -688,14 +688,35 @@ def _load_capture_doors() -> None:
             continue
         _live_capture_preferences[key] = (scheme, variant)
         _live_capture_preference_age[key] = time.monotonic()
+        # The sizes are remembered with the door: without them a restart puts
+        # every channel whose door serves 704x480 back on that picture until a
+        # background measurement has run again.
+        for field, store in (
+            ("door_pixels", _live_capture_best_pixels),
+            ("video_pixels", _live_capture_video_pixels),
+        ):
+            try:
+                pixels = int(door.get(field) or 0)
+            except Exception:  # noqa: BLE001 - skip only the bad number
+                continue
+            if pixels > 0:
+                store[key] = pixels
 
 
 def _save_capture_doors() -> None:
     """Keep the learned doors across a restart; never fail a capture over it."""
-    doors = {
-        f"{ip}|{channel}": {"scheme": scheme, "variant": variant}
-        for (ip, channel), (scheme, variant) in _live_capture_preferences.items()
-    }
+    doors = {}
+    for (ip, channel), (scheme, variant) in _live_capture_preferences.items():
+        key = (ip, channel)
+        door = {"scheme": scheme, "variant": variant}
+        for field, store in (
+            ("door_pixels", _live_capture_best_pixels),
+            ("video_pixels", _live_capture_video_pixels),
+        ):
+            pixels = store.get(key, 0)
+            if pixels:
+                door[field] = pixels
+        doors[f"{ip}|{channel}"] = door
     try:
         _LIVE_CAPTURE_DOORS_FILE.write_text(json.dumps({"doors": doors}, indent=1))
     except Exception as exc:  # noqa: BLE001
@@ -2165,6 +2186,7 @@ def _note_video_frame_size(ip: str, channel: int, frame: bytes) -> None:
     key = (ip, channel)
     if pixels > _live_capture_video_pixels.get(key, 0):
         _live_capture_video_pixels[key] = pixels
+        _save_capture_doors()
 
 
 def _video_road_is_sharper(ip: str, channel: int) -> bool:
@@ -2327,7 +2349,9 @@ async def _capture_snapshot_once(
             _live_capture_preference_age[key] = time.monotonic()
             _live_capture_preferences[key] = (scheme, variant)
             _save_capture_doors()
-        _live_capture_best_pixels[key] = max(known_best, pixels)
+        if max(known_best, pixels) > _live_capture_best_pixels.get(key, 0):
+            _live_capture_best_pixels[key] = max(known_best, pixels)
+            _save_capture_doors()
         if (
             pixels
             and wanted_pixels

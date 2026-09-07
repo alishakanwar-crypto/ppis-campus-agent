@@ -27,6 +27,8 @@ class RememberedDoorTests(unittest.TestCase):
     def setUp(self):
         main._live_capture_preferences.clear()
         main._live_capture_preference_age.clear()
+        main._live_capture_best_pixels.clear()
+        main._live_capture_video_pixels.clear()
 
     tearDown = setUp
 
@@ -39,6 +41,22 @@ class RememberedDoorTests(unittest.TestCase):
         self.assertEqual(
             main._live_capture_preferences.get(("192.0.2.60", 7)), ("digest", 1)
         )
+
+    def test_the_learned_picture_sizes_survive_a_restart(self):
+        """Or a restart serves the 704x480 door until measured again."""
+        key = ("192.0.2.60", 7)
+        main._live_capture_preferences[key] = ("digest", 1)
+        main._live_capture_best_pixels[key] = 704 * 480
+        main._live_capture_video_pixels[key] = 1280 * 720
+        with patch.object(main, "_LIVE_CAPTURE_DOORS_FILE", self._file()):
+            main._save_capture_doors()
+            main._live_capture_preferences.clear()
+            main._live_capture_best_pixels.clear()
+            main._live_capture_video_pixels.clear()
+            main._load_capture_doors()
+        self.assertEqual(main._live_capture_best_pixels.get(key), 704 * 480)
+        self.assertEqual(main._live_capture_video_pixels.get(key), 1280 * 720)
+        self.assertTrue(main._video_road_is_sharper(*key))
 
     def test_a_damaged_file_does_not_stop_the_agent(self):
         path = self._file()
