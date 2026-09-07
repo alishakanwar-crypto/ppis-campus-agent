@@ -831,6 +831,9 @@ _live_request_deadline: contextvars.ContextVar[float | None] = (
 _live_request_classroom: contextvars.ContextVar[str] = contextvars.ContextVar(
     "live_request_classroom", default=""
 )
+_live_request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "live_request_id", default=""
+)
 # Where a live capture writes its own timing, so the cloud can see which stage
 # of a parent's request was slow without reading the campus PC's log.
 _live_capture_report: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
@@ -1814,6 +1817,7 @@ def _note_camera_outcome(
             "last_served_ist": "",
             "last_failed_ist": "",
             "reason": "",
+            "failed_request": "",
         },
     )
     entry["camera"] = desc or entry["camera"]
@@ -1823,8 +1827,16 @@ def _note_camera_outcome(
         entry["failures_in_a_row"] = 0
         entry["last_served_ist"] = now
         entry["reason"] = ""
+        entry["failed_request"] = ""
         return
-    entry["failures_in_a_row"] = int(entry["failures_in_a_row"]) + 1
+    # One parent's photo can ask the same camera twice, and counting both
+    # attempts would call a camera out of order after two busy requests
+    # instead of four.
+    request = _live_request_id.get()
+    counted = bool(request) and entry["failed_request"] == request
+    if not counted:
+        entry["failures_in_a_row"] = int(entry["failures_in_a_row"]) + 1
+        entry["failed_request"] = request
     entry["last_failed_ist"] = now
     outcome = str(report.get("outcome") or "no picture")
     exception = str(report.get("exception") or "")
@@ -1845,7 +1857,7 @@ def _camera_is_silent(camera: tuple[dict, int, str]) -> bool:
 def camera_snapshot_health() -> list[dict]:
     """Classroom cameras that are currently giving parents nothing."""
     return [
-        dict(entry)
+        {k: v for k, v in entry.items() if k != "failed_request"}
         for _, entry in sorted(_camera_outcomes.items())
         if int(entry["failures_in_a_row"]) >= 2
     ]
@@ -3954,6 +3966,7 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         request_started + _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS
     )
     classroom_token = _live_request_classroom.set(classroom)
+    request_id_token = _live_request_id.set(request_id)
     all_cameras = find_all_cameras_for_classroom(classroom)
 
     if not all_cameras:
@@ -3965,6 +3978,7 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         }))
         _live_request_deadline.reset(request_token)
         _live_request_classroom.reset(classroom_token)
+        _live_request_id.reset(request_id_token)
         return
 
     logger.info(f"Capturing from {len(all_cameras)} camera(s) for {classroom}")
@@ -4096,6 +4110,7 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
         }))
         _live_request_deadline.reset(request_token)
         _live_request_classroom.reset(classroom_token)
+        _live_request_id.reset(request_id_token)
         return
 
     # Send completion message
@@ -4114,6 +4129,7 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
     )
     _live_request_deadline.reset(request_token)
     _live_request_classroom.reset(classroom_token)
+    _live_request_id.reset(request_id_token)
 
 
 # ---------------------------------------------------------------------------
