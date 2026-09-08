@@ -646,6 +646,9 @@ _rtsp_cooldowns: dict[str, float] = {}
 # kept per channel so its classroom stops being pushed onto a road that does
 # not work for it, while its recorder keeps serving every other classroom.
 _rtsp_channel_cooldowns: dict[tuple[str, int], float] = {}
+# When each channel's stream last failed, so a parent whose snapshot doors have
+# just failed is not refused on the strength of a failure from minutes ago.
+_rtsp_channel_failed_at: dict[tuple[str, int], float] = {}
 _rtsp_timeout_warning_logged = False
 _rtsp_timeout_warning_lock = threading.Lock()
 _live_dvr_clients: dict[str, httpx.AsyncClient] = {}
@@ -1196,8 +1199,26 @@ def _rtsp_channel_cooldown_active(ip: str, channel: int) -> bool:
     expires_at = _rtsp_channel_cooldowns.get((ip, channel), 0.0)
     if expires_at <= time.monotonic():
         _rtsp_channel_cooldowns.pop((ip, channel), None)
+        _rtsp_channel_failed_at.pop((ip, channel), None)
         return False
     return True
+
+
+def _rtsp_channel_failed_in_this_request(ip: str, channel: int) -> bool:
+    """Whether this camera's stream failed during the photo being taken now.
+
+    A stream that failed minutes ago is stale news. When the snapshot doors
+    have just failed too, it is the only road this parent has left, and
+    refusing to drive it returns "unable to capture" with most of the
+    request's time unspent.
+    """
+    failed_at = _rtsp_channel_failed_at.get((ip, channel))
+    if failed_at is None:
+        return False
+    deadline = _live_request_deadline.get()
+    if deadline is None:
+        return True
+    return failed_at >= deadline - _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS
 
 
 def _mark_rtsp_failure(ip: str, channel: int | None = None) -> None:
@@ -1209,6 +1230,7 @@ def _mark_rtsp_failure(ip: str, channel: int | None = None) -> None:
         _rtsp_credentials_worked.pop(ip, None)
     if channel is not None:
         _rtsp_channel_cooldowns[(ip, channel)] = now + _RTSP_COOLDOWN_SECONDS
+        _rtsp_channel_failed_at[(ip, channel)] = now
         others = any(
             key[0] == ip and key[1] != channel and until > now
             for key, until in _rtsp_channel_cooldowns.items()
@@ -1225,6 +1247,7 @@ def _clear_rtsp_failure(ip: str, channel: int | None = None) -> None:
     _rtsp_cooldowns.pop(ip, None)
     if channel is not None:
         _rtsp_channel_cooldowns.pop((ip, channel), None)
+        _rtsp_channel_failed_at.pop((ip, channel), None)
 
 
 # A recorder that refuses our credentials locks the account for a while after a
@@ -3051,6 +3074,10 @@ async def _capture_snapshot_now(
                 and not (
                     _rtsp_channel_cooldown_active(ip, channel)
                     and not skip_isapi
+                    and (
+                        background
+                        or _rtsp_channel_failed_in_this_request(ip, channel)
+                    )
                 )
             ):
                 logger.info("ISAPI exhausted for %s ch%d, trying RTSP fallback", ip, channel)

@@ -35,6 +35,7 @@ class ChannelRtspCooldownTests(unittest.IsolatedAsyncioTestCase):
         main._isapi_consecutive_timeouts.clear()
         main._rtsp_cooldowns.clear()
         main._rtsp_channel_cooldowns.clear()
+        main._rtsp_channel_failed_at.clear()
         main._channel_auth_cooldowns.clear()
         main._isapi_last_success.clear()
 
@@ -72,6 +73,54 @@ class ChannelRtspCooldownTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await main.capture_snapshot(DVR, 17), picture)
 
         self.assertTrue(requested)
+
+    async def test_a_stale_stream_failure_is_still_the_parents_last_road(self):
+        """Doors just failed; a failure from minutes ago must not refuse them.
+
+        GRADE 2B returned nothing in 3s of a 15s budget for exactly this.
+        """
+
+        class Client:
+            async def get(_self, url, auth):
+                return Response(b"")
+
+        main._mark_rtsp_failure(DVR["ip"], 9)
+        main._rtsp_channel_failed_at[(DVR["ip"], 9)] = (
+            main.time.monotonic() - 60
+        )
+        token = main._live_request_deadline.set(main.time.monotonic() + 15)
+        try:
+            with patch.object(
+                main, "_get_live_dvr_client", return_value=Client()
+            ), patch.object(
+                main, "_capture_snapshot_rtsp", return_value=JPEG
+            ) as stream:
+                self.assertEqual(await main.capture_snapshot(DVR, 9), JPEG)
+        finally:
+            main._live_request_deadline.reset(token)
+
+        self.assertTrue(stream.called)
+
+    async def test_a_stream_that_just_failed_is_not_asked_twice(self):
+        """Within one photo it is the road with nothing left to give."""
+
+        class Client:
+            async def get(_self, url, auth):
+                return Response(b"")
+
+        token = main._live_request_deadline.set(main.time.monotonic() + 15)
+        try:
+            main._mark_rtsp_failure(DVR["ip"], 9)
+            with patch.object(
+                main, "_get_live_dvr_client", return_value=Client()
+            ), patch.object(
+                main, "_capture_snapshot_rtsp", return_value=JPEG
+            ) as stream:
+                self.assertIsNone(await main.capture_snapshot(DVR, 9))
+        finally:
+            main._live_request_deadline.reset(token)
+
+        self.assertFalse(stream.called)
 
 
 if __name__ == "__main__":
