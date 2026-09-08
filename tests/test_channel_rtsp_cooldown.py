@@ -122,6 +122,26 @@ class ChannelRtspCooldownTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(stream.called)
 
+    async def test_a_stale_rest_is_stale_without_a_request_to_measure(self):
+        """A capture outside a parent's request has no deadline to compare."""
+
+        class Client:
+            async def get(_self, url, auth):
+                return Response(b"")
+
+        main._mark_rtsp_failure(DVR["ip"], 9)
+        main._rtsp_channel_failed_at[(DVR["ip"], 9)] = (
+            main.time.monotonic() - 60
+        )
+        with patch.object(
+            main, "_get_live_dvr_client", return_value=Client()
+        ), patch.object(
+            main, "_capture_snapshot_rtsp", return_value=JPEG
+        ) as stream:
+            self.assertEqual(await main.capture_snapshot(DVR, 9), JPEG)
+
+        self.assertTrue(stream.called)
+
 
 if __name__ == "__main__":
     unittest.main()
