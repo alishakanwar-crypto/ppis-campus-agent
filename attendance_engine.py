@@ -506,6 +506,11 @@ class AttendanceEngine:
         self.confidence_threshold = 0.40  # Student min confidence 40%
         self.confidence_max = 0.75  # Student max confidence 75%
         self.review_threshold = 0.30  # Below 30% gets rejected outright
+        # How far ahead of the next-closest child in the same class a match
+        # must be. Every record in the database sits between 40% and 52%,
+        # i.e. at the noise floor, so a name that barely beats its classmates
+        # is a guess and must not be marked present.
+        self.identity_margin = 0.05
         self.min_sightings = 2  # Students: require 2 independent sightings
         self.sighting_window = 600  # 10-minute window for sightings to accumulate
         self.teacher_confidence_threshold = 0.35  # Teacher min threshold 35%
@@ -1014,7 +1019,9 @@ class AttendanceEngine:
 
                 self.add_debug_log("face_matched",
                                    f"Matched {match_result['name']} "
-                                   f"(confidence: {confidence:.1%})",
+                                   f"(confidence: {confidence:.1%}, "
+                                   f"next child: "
+                                   f"{match_result.get('runner_up_confidence', 0.0):.1%})",
                                    person_id=person_id,
                                    confidence=confidence)
 
@@ -1032,6 +1039,7 @@ class AttendanceEngine:
                         camera_source=camera_source,
                         embedding=encoding,
                         face_size=(face_w, face_h),
+                        margin=match_result.get("margin"),
                     )
                     if result:
                         results.append(result)
@@ -1129,6 +1137,7 @@ class AttendanceEngine:
 
         best_match = None
         best_confidence = 0.0
+        runner_up_confidence = 0.0
 
         for person_id, person_data in faces.items():
             known_encodings = person_data["encodings"]
@@ -1140,6 +1149,8 @@ class AttendanceEngine:
             confidence = max(0.0, 1.0 - min_distance)
 
             if confidence > best_confidence:
+                if best_match is not None:
+                    runner_up_confidence = best_confidence
                 best_confidence = confidence
                 best_match = {
                     "person_id": person_id,
@@ -1148,6 +1159,12 @@ class AttendanceEngine:
                     "confidence": confidence,
                     "distance": min_distance,
                 }
+            elif confidence > runner_up_confidence:
+                runner_up_confidence = confidence
+
+        if best_match is not None:
+            best_match["runner_up_confidence"] = runner_up_confidence
+            best_match["margin"] = best_confidence - runner_up_confidence
 
         return best_match
 
@@ -1239,6 +1256,8 @@ class AttendanceEngine:
                 self.add_debug_log("face_matched",
                                    f"Matched {match_result['name']} "
                                    f"(confidence: {confidence:.1%}, "
+                                   f"next child: "
+                                   f"{match_result.get('runner_up_confidence', 0.0):.1%}, "
                                    f"face: {face_w:.0f}x{face_h:.0f}px, "
                                    f"det: {det_score:.2f}) [InsightFace]",
                                    person_id=person_id,
@@ -1258,6 +1277,7 @@ class AttendanceEngine:
                         camera_source=camera_source,
                         embedding=embedding,
                         face_size=(int(face_w), int(face_h)),
+                        margin=match_result.get("margin"),
                     )
                     if result:
                         results.append(result)
@@ -1293,23 +1313,35 @@ class AttendanceEngine:
         """
         best_match = None
         best_sim = 0.0
+        runner_up_sim = 0.0
 
         for person_id, person_data in faces.items():
             known_embeddings = person_data["encodings"]
             if not known_embeddings:
                 continue
 
-            for known_emb in known_embeddings:
-                sim = float(np.dot(embedding, known_emb))
-                if sim > best_sim:
-                    best_sim = sim
-                    best_match = {
-                        "person_id": person_id,
-                        "name": person_data["name"],
-                        "phone": person_data["phone"],
-                        "confidence": sim,
-                        "distance": 1.0 - sim,
-                    }
+            person_sim = max(
+                (float(np.dot(embedding, known_emb))
+                 for known_emb in known_embeddings),
+                default=0.0,
+            )
+            if person_sim > best_sim:
+                if best_match is not None:
+                    runner_up_sim = best_sim
+                best_sim = person_sim
+                best_match = {
+                    "person_id": person_id,
+                    "name": person_data["name"],
+                    "phone": person_data["phone"],
+                    "confidence": person_sim,
+                    "distance": 1.0 - person_sim,
+                }
+            elif person_sim > runner_up_sim:
+                runner_up_sim = person_sim
+
+        if best_match is not None:
+            best_match["runner_up_confidence"] = runner_up_sim
+            best_match["margin"] = best_sim - runner_up_sim
 
         # Return None for weak matches so the legacy fallback can be tried.
         # Without this threshold, cosine similarity is almost always positive
@@ -1698,7 +1730,8 @@ class AttendanceEngine:
                             face_location: tuple,
                             camera_source: str,
                             embedding: np.ndarray | None = None,
-                            face_size: tuple[int, int] | None = None) -> dict | None:
+                            face_size: tuple[int, int] | None = None,
+                            margin: float | None = None) -> dict | None:
         """Process an attendance detection with multi-layer verification.
 
         All checks must pass before marking attendance:
@@ -1733,6 +1766,19 @@ class AttendanceEngine:
             self.add_debug_log("confidence_too_high",
                                f"{name} confidence {confidence:.1%} > "
                                f"{effective_max:.0%} max — doubtful match, ignoring",
+                               person_id=person_id, confidence=confidence)
+            self._record_false_positive()
+            return None
+
+        # --- CHECK 2: Clear of the next-closest child in the class ---
+        # At these similarity levels the closest name is often only a shade
+        # ahead of a classmate, which is a guess, not a recognition.
+        if margin is not None and margin < self.identity_margin:
+            self.add_debug_log("ambiguous_match",
+                               f"{name} at {confidence:.1%} is only "
+                               f"{margin:.1%} ahead of the next child in the "
+                               f"class (need {self.identity_margin:.0%}) — "
+                               f"not marking",
                                person_id=person_id, confidence=confidence)
             self._record_false_positive()
             return None
