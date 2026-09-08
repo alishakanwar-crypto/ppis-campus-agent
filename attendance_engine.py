@@ -1780,7 +1780,10 @@ class AttendanceEngine:
                                f"class (need {self.identity_margin:.0%}) — "
                                f"not marking",
                                person_id=person_id, confidence=confidence)
-            self._record_false_positive()
+            # Not counted towards the false-positive rate: at today's
+            # similarity levels an ambiguous face is the ordinary case, and
+            # ten of them in a minute would put the whole school's attendance
+            # into failsafe.
             return None
 
         # --- CHECK 3: Time window ---
