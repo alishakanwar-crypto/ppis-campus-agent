@@ -46,6 +46,29 @@ class MatchMarginTests(unittest.TestCase):
             match["confidence"] - match["runner_up_confidence"],
         )
 
+    def test_ambiguity_does_not_put_the_school_into_failsafe(self):
+        """Ambiguous faces are the ordinary case, not a system fault.
+
+        Ten counted rejections in a minute suspend marking for every child,
+        so an ambiguous match must not be counted as a false positive.
+        """
+        engine._false_positive_count_window.clear()
+
+        for _ in range(12):
+            engine._process_attendance(
+                person_id="TANISHQ_GRADE2B",
+                name="TANISHQ",
+                phone="9",
+                confidence=0.418,
+                image_bytes=b"",
+                face_location=(0, 0, 0, 0),
+                camera_source="GRADE 2B (DVR 2 Ch 41)",
+                margin=0.006,
+            )
+
+        self.assertFalse(engine._check_false_positive_rate())
+        self.assertFalse(engine._failsafe_active)
+
     def test_a_child_barely_ahead_of_a_classmate_is_not_marked(self):
         engine.identity_margin = 0.05
 
