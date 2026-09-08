@@ -1217,8 +1217,13 @@ def _rtsp_channel_failed_in_this_request(ip: str, channel: int) -> bool:
         return False
     deadline = _live_request_deadline.get()
     if deadline is None:
-        return True
-    return failed_at >= deadline - _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS
+        # A capture outside a parent's request has no start to measure from,
+        # so age the failure instead: any older than one request's worth of
+        # time is stale news there too, and must not refuse the last road.
+        started = time.monotonic() - _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS
+    else:
+        started = deadline - _SNAPSHOT_LIVE_REQUEST_BUDGET_SECONDS
+    return failed_at >= started
 
 
 def _mark_rtsp_failure(ip: str, channel: int | None = None) -> None:
