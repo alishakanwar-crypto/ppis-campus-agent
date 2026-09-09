@@ -1332,6 +1332,12 @@ _auth_refusal_detail: dict[str, str] = {}
 _rtsp_credentials_worked: dict[str, str] = {}
 # (ip, credentials) -> RTSP attempts made since the recorder refused that login
 _rtsp_attempts_while_refused: dict[tuple[str, str], int] = {}
+# (ip, credentials) -> when the last of those attempts was made, so a recorder
+# is not shut out for the rest of the day by a few failures in one bad minute
+_rtsp_attempt_while_refused_at: dict[tuple[str, str], float] = {}
+_RTSP_REFUSED_ATTEMPT_RETRY_SECONDS = max(
+    60.0, float(os.environ.get("RTSP_REFUSED_ATTEMPT_RETRY_SECONDS", "600"))
+)
 _RTSP_ATTEMPTS_WHILE_REFUSED = max(
     1, int(os.environ.get("RTSP_ATTEMPTS_WHILE_REFUSED", "1"))
 )
@@ -1582,9 +1588,17 @@ def _rtsp_worth_trying(dvr: dict) -> bool:
     key = _dvr_credential_key(dvr)
     if _rtsp_credentials_worked.get(ip) == key:
         return True
-    attempts = _rtsp_attempts_while_refused.get((ip, key), 0)
     if ip in _RTSP_FALLBACK_IPS:
-        return attempts < _RTSP_FALLBACK_ATTEMPTS_WHILE_REFUSED
+        # These recorders answer 401 on ISAPI because their firmware has no
+        # working snapshot interface, not because the account is locked, and
+        # video is the only road their classrooms have. Counting stream
+        # failures towards a lockout took every one of their rooms off the air
+        # for the rest of the day.
+        return True
+    attempts = _rtsp_attempts_while_refused.get((ip, key), 0)
+    since = time.monotonic() - _rtsp_attempt_while_refused_at.get((ip, key), 0.0)
+    if since >= _RTSP_REFUSED_ATTEMPT_RETRY_SECONDS:
+        return True
     # One try is enough to tell an ISAPI-only fault from a locked account:
     # each further stream logs in again, which re-arms the lockout and pushes
     # the quiet unlock probe further away.
@@ -1598,6 +1612,12 @@ def _note_rtsp_attempt_while_refused(dvr: dict) -> None:
     key = _dvr_credential_key(dvr)
     if _rtsp_credentials_worked.get(ip) == key:
         return
+    now = time.monotonic()
+    if now - _rtsp_attempt_while_refused_at.get((ip, key), 0.0) >= (
+        _RTSP_REFUSED_ATTEMPT_RETRY_SECONDS
+    ):
+        _rtsp_attempts_while_refused.pop((ip, key), None)
+    _rtsp_attempt_while_refused_at[(ip, key)] = now
     seen = _rtsp_attempts_while_refused.get((ip, key), 0) + 1
     _rtsp_attempts_while_refused[(ip, key)] = seen
     if seen == _RTSP_ATTEMPTS_WHILE_REFUSED:
@@ -1616,6 +1636,7 @@ def _note_rtsp_success(dvr: dict) -> None:
     _note_rtsp_frame(ip)
     _rtsp_credentials_worked[ip] = _dvr_credential_key(dvr)
     _rtsp_attempts_while_refused.pop((ip, _rtsp_credentials_worked[ip]), None)
+    _rtsp_attempt_while_refused_at.pop((ip, _rtsp_credentials_worked[ip]), None)
 
 
 def _mark_isapi_timeout(ip: str) -> None:
@@ -1703,6 +1724,7 @@ async def _probe_locked_recorder(dvr: dict) -> bool:
         _note_isapi_success(ip)
         for key in [k for k in _rtsp_attempts_while_refused if k[0] == ip]:
             _rtsp_attempts_while_refused.pop(key, None)
+            _rtsp_attempt_while_refused_at.pop(key, None)
         _clear_isapi_failures(ip)
         return True
     quiet = min(
