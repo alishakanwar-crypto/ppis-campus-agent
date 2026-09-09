@@ -39,6 +39,9 @@ class ChannelRtspCooldownTests(unittest.IsolatedAsyncioTestCase):
         main._rtsp_last_success_at.clear()
         main._channel_auth_cooldowns.clear()
         main._isapi_last_success.clear()
+        main._refused_credentials.clear()
+        main._rtsp_credentials_worked.clear()
+        main._rtsp_attempts_while_refused.clear()
 
     def test_one_camera_without_a_stream_does_not_rest_the_recorder(self):
         """Its classmates' rooms must keep the video road."""
@@ -66,6 +69,36 @@ class ChannelRtspCooldownTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(main._rtsp_channel_cooldown_active(DVR["ip"], 6))
         self.assertFalse(main._rtsp_cooldown_active(DVR["ip"]))
         self.assertFalse(main._rtsp_channel_cooldown_active(DVR["ip"], 41))
+
+    def test_the_scanner_s_own_frame_proves_the_recorder_streams(self):
+        """The sweep may be the only thing streaming outside parent hours."""
+        main._note_rtsp_success(DVR)
+
+        main._mark_rtsp_failure(DVR["ip"], 4)
+        main._mark_rtsp_failure(DVR["ip"], 6)
+
+        self.assertFalse(main._rtsp_cooldown_active(DVR["ip"]))
+
+    def test_one_dead_camera_does_not_unlearn_a_streaming_login(self):
+        """DVR 2's ISAPI refuses us, so RTSP is its only road for every room."""
+        main._refused_credentials[DVR["ip"]] = main._dvr_credential_key(DVR)
+        main._note_rtsp_success(DVR)
+
+        main._mark_rtsp_failure(DVR["ip"], 4)
+
+        self.assertTrue(main._rtsp_worth_trying(DVR))
+
+    def test_a_login_stops_vouching_once_nothing_streams(self):
+        """No frame within the rest itself means the password, not a camera."""
+        main._refused_credentials[DVR["ip"]] = main._dvr_credential_key(DVR)
+        main._note_rtsp_success(DVR)
+        main._rtsp_last_success_at[DVR["ip"]] = (
+            main.time.monotonic() - main._RTSP_COOLDOWN_SECONDS - 1
+        )
+
+        main._mark_rtsp_failure(DVR["ip"], 4)
+
+        self.assertNotIn(DVR["ip"], main._rtsp_credentials_worked)
 
     def test_a_recorder_that_stopped_streaming_is_still_rested(self):
         """When its last frame is older than the rest itself, it is the recorder."""
