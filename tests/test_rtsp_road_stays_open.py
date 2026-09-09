@@ -23,6 +23,7 @@ class RtspRoadStaysOpenTests(unittest.TestCase):
         main._rtsp_credentials_worked.clear()
         main._rtsp_attempts_while_refused.clear()
         main._rtsp_attempt_while_refused_at.clear()
+        main._auth_unlock_quiet.clear()
 
     def _refuse(self, dvr):
         main._refused_credentials[dvr["ip"]] = main._dvr_credential_key(dvr)
@@ -47,14 +48,31 @@ class RtspRoadStaysOpenTests(unittest.TestCase):
         self._refuse(OTHER)
         main._note_rtsp_attempt_while_refused(OTHER)
         key = (OTHER["ip"], main._dvr_credential_key(OTHER))
-        main._rtsp_attempt_while_refused_at[key] = (
-            main.time.monotonic() - main._RTSP_REFUSED_ATTEMPT_RETRY_SECONDS - 1
+        main._rtsp_attempt_while_refused_at[key] = main.time.monotonic() - (
+            max(
+                main._RTSP_REFUSED_ATTEMPT_RETRY_SECONDS,
+                main._AUTH_UNLOCK_QUIET_SECONDS,
+            )
+            + 1
         )
 
         self.assertTrue(main._rtsp_worth_trying(OTHER))
 
         main._note_rtsp_attempt_while_refused(OTHER)
         self.assertEqual(main._rtsp_attempts_while_refused[key], 1)
+
+    def test_the_retry_waits_out_a_lengthened_unlock_quiet(self):
+        self._refuse(OTHER)
+        main._auth_unlock_quiet[OTHER["ip"]] = (
+            main._AUTH_UNLOCK_QUIET_SECONDS * 4
+        )
+        main._note_rtsp_attempt_while_refused(OTHER)
+        key = (OTHER["ip"], main._dvr_credential_key(OTHER))
+        main._rtsp_attempt_while_refused_at[key] = (
+            main.time.monotonic() - main._AUTH_UNLOCK_QUIET_SECONDS * 2
+        )
+
+        self.assertFalse(main._rtsp_worth_trying(OTHER))
 
     def test_a_frame_forgets_the_attempts(self):
         self._refuse(DVR2)

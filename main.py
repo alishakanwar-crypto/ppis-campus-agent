@@ -1336,7 +1336,7 @@ _rtsp_attempts_while_refused: dict[tuple[str, str], int] = {}
 # is not shut out for the rest of the day by a few failures in one bad minute
 _rtsp_attempt_while_refused_at: dict[tuple[str, str], float] = {}
 _RTSP_REFUSED_ATTEMPT_RETRY_SECONDS = max(
-    60.0, float(os.environ.get("RTSP_REFUSED_ATTEMPT_RETRY_SECONDS", "600"))
+    60.0, float(os.environ.get("RTSP_REFUSED_ATTEMPT_RETRY_SECONDS", "1800"))
 )
 _RTSP_ATTEMPTS_WHILE_REFUSED = max(
     1, int(os.environ.get("RTSP_ATTEMPTS_WHILE_REFUSED", "1"))
@@ -1596,8 +1596,15 @@ def _rtsp_worth_trying(dvr: dict) -> bool:
         # for the rest of the day.
         return True
     attempts = _rtsp_attempts_while_refused.get((ip, key), 0)
+    # A locked Hikvision account only clears while nothing logs in, so the
+    # retry must wait out the same quiet the unlock probe waits for; a shorter
+    # one would keep re-arming the very lock it is waiting on.
+    quiet = max(
+        _RTSP_REFUSED_ATTEMPT_RETRY_SECONDS,
+        _auth_unlock_quiet.get(ip, _AUTH_UNLOCK_QUIET_SECONDS),
+    )
     since = time.monotonic() - _rtsp_attempt_while_refused_at.get((ip, key), 0.0)
-    if since >= _RTSP_REFUSED_ATTEMPT_RETRY_SECONDS:
+    if since >= quiet:
         return True
     # One try is enough to tell an ISAPI-only fault from a locked account:
     # each further stream logs in again, which re-arms the lockout and pushes
@@ -1613,8 +1620,9 @@ def _note_rtsp_attempt_while_refused(dvr: dict) -> None:
     if _rtsp_credentials_worked.get(ip) == key:
         return
     now = time.monotonic()
-    if now - _rtsp_attempt_while_refused_at.get((ip, key), 0.0) >= (
-        _RTSP_REFUSED_ATTEMPT_RETRY_SECONDS
+    if now - _rtsp_attempt_while_refused_at.get((ip, key), 0.0) >= max(
+        _RTSP_REFUSED_ATTEMPT_RETRY_SECONDS,
+        _auth_unlock_quiet.get(ip, _AUTH_UNLOCK_QUIET_SECONDS),
     ):
         _rtsp_attempts_while_refused.pop((ip, key), None)
     _rtsp_attempt_while_refused_at[(ip, key)] = now
