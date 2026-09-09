@@ -637,7 +637,17 @@ def _digest_auth(ip: str, user: str, password: str) -> httpx.DigestAuth:
 # ---------------------------------------------------------------------------
 # RTSP Snapshot Fallback (for DVRs where ISAPI auth is broken)
 # ---------------------------------------------------------------------------
-_RTSP_FALLBACK_IPS: set[str] = {"192.168.0.13"}  # DVR 4 — ISAPI 401 but RTSP works
+# Recorders whose ISAPI refuses us while RTSP streams with the same login.
+# DVR 4 (.13) answers 401 on ISAPI. DVR 2 (.12) is a DS-9664NI-ST on 2015
+# firmware whose snapshot interface is unusable, so its video stream is not a
+# fallback there, it is the road.
+_RTSP_FALLBACK_IPS: set[str] = {
+    ip.strip()
+    for ip in os.environ.get(
+        "RTSP_FALLBACK_IPS", "192.168.0.13,192.168.0.12"
+    ).split(",")
+    if ip.strip()
+}
 _RTSP_COOLDOWN_SECONDS = max(
     1.0, float(os.environ.get("RTSP_FAILURE_COOLDOWN_SECONDS", "120"))
 )
@@ -1233,8 +1243,11 @@ def _mark_rtsp_failure(ip: str, channel: int | None = None) -> None:
     now = time.monotonic()
     # A stream that worked before the recorder locked itself must stop
     # vouching for the login, or every later failure goes uncounted and the
-    # fallback keeps knocking on a locked account.
-    if ip in _refused_credentials:
+    # fallback keeps knocking on a locked account. One channel failing while
+    # the recorder is still streaming for other rooms is not that: it is a
+    # camera, and forgetting the login there shut every classroom on the
+    # recorder out of its only working road.
+    if ip in _refused_credentials and not _rtsp_streamed_recently(ip):
         _rtsp_credentials_worked.pop(ip, None)
     if channel is not None:
         _rtsp_channel_cooldowns[(ip, channel)] = now + _RTSP_COOLDOWN_SECONDS
@@ -1597,6 +1610,9 @@ def _note_rtsp_attempt_while_refused(dvr: dict) -> None:
 
 def _note_rtsp_success(dvr: dict) -> None:
     ip = dvr.get("ip")
+    # Every caller here has a frame in hand, including the classroom scanner,
+    # so this is also proof the recorder's video road is alive.
+    _note_rtsp_frame(ip)
     _rtsp_credentials_worked[ip] = _dvr_credential_key(dvr)
     _rtsp_attempts_while_refused.pop((ip, _rtsp_credentials_worked[ip]), None)
 
