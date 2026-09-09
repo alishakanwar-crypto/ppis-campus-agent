@@ -36,6 +36,7 @@ class ChannelRtspCooldownTests(unittest.IsolatedAsyncioTestCase):
         main._rtsp_cooldowns.clear()
         main._rtsp_channel_cooldowns.clear()
         main._rtsp_channel_failed_at.clear()
+        main._rtsp_last_success_at.clear()
         main._channel_auth_cooldowns.clear()
         main._isapi_last_success.clear()
 
@@ -51,6 +52,30 @@ class ChannelRtspCooldownTests(unittest.IsolatedAsyncioTestCase):
         """Two channels failing is the recorder, not the cameras."""
         main._mark_rtsp_failure(DVR["ip"], 17)
         main._mark_rtsp_failure(DVR["ip"], 13)
+
+        self.assertTrue(main._rtsp_cooldown_active(DVR["ip"]))
+
+    def test_two_broken_cameras_do_not_rest_a_streaming_recorder(self):
+        """GRADE 2A's two dead cameras were taking DVR 2's road from every room."""
+        main._note_rtsp_frame(DVR["ip"])
+
+        main._mark_rtsp_failure(DVR["ip"], 4)
+        main._mark_rtsp_failure(DVR["ip"], 6)
+
+        self.assertTrue(main._rtsp_channel_cooldown_active(DVR["ip"], 4))
+        self.assertTrue(main._rtsp_channel_cooldown_active(DVR["ip"], 6))
+        self.assertFalse(main._rtsp_cooldown_active(DVR["ip"]))
+        self.assertFalse(main._rtsp_channel_cooldown_active(DVR["ip"], 41))
+
+    def test_a_recorder_that_stopped_streaming_is_still_rested(self):
+        """When its last frame is older than the rest itself, it is the recorder."""
+        main._note_rtsp_frame(DVR["ip"])
+        main._rtsp_last_success_at[DVR["ip"]] = (
+            main.time.monotonic() - main._RTSP_COOLDOWN_SECONDS - 1
+        )
+
+        main._mark_rtsp_failure(DVR["ip"], 4)
+        main._mark_rtsp_failure(DVR["ip"], 6)
 
         self.assertTrue(main._rtsp_cooldown_active(DVR["ip"]))
 

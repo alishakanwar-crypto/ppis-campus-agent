@@ -649,6 +649,9 @@ _rtsp_channel_cooldowns: dict[tuple[str, int], float] = {}
 # When each channel's stream last failed, so a parent whose snapshot doors have
 # just failed is not refused on the strength of a failure from minutes ago.
 _rtsp_channel_failed_at: dict[tuple[str, int], float] = {}
+# When a recorder last gave a frame over RTSP: a recorder that is streaming for
+# other classrooms has a working video road, whatever its broken cameras do.
+_rtsp_last_success_at: dict[str, float] = {}
 _rtsp_timeout_warning_logged = False
 _rtsp_timeout_warning_lock = threading.Lock()
 _live_dvr_clients: dict[str, httpx.AsyncClient] = {}
@@ -1245,10 +1248,35 @@ def _mark_rtsp_failure(ip: str, channel: int | None = None) -> None:
             # too: resting it for one dead camera sent every classroom on it
             # down the wrong road for two minutes.
             return
+        if _rtsp_streamed_recently(ip):
+            # Two broken cameras on a forty-channel recorder are two broken
+            # cameras, not a dead recorder. While it is still streaming for
+            # other classrooms, resting it takes the video road away from
+            # every room whose snapshot doors are weak.
+            logger.info(
+                "%s ch%d: stream failed, but the recorder streamed %.0fs ago, "
+                "so its other classrooms keep the video road",
+                ip, channel,
+                now - _rtsp_last_success_at.get(ip, now),
+            )
+            return
     _rtsp_cooldowns[ip] = now + _RTSP_COOLDOWN_SECONDS
 
 
+def _rtsp_streamed_recently(ip: str) -> bool:
+    """Whether this recorder has given a frame over RTSP lately."""
+    last = _rtsp_last_success_at.get(ip)
+    if last is None:
+        return False
+    return time.monotonic() - last < _RTSP_COOLDOWN_SECONDS
+
+
+def _note_rtsp_frame(ip: str) -> None:
+    _rtsp_last_success_at[ip] = time.monotonic()
+
+
 def _clear_rtsp_failure(ip: str, channel: int | None = None) -> None:
+    _note_rtsp_frame(ip)
     _rtsp_cooldowns.pop(ip, None)
     if channel is not None:
         _rtsp_channel_cooldowns.pop((ip, channel), None)
@@ -2333,6 +2361,7 @@ async def _measure_video_road(dvr: dict, channel: int) -> None:
         return
     if not frame:
         return
+    _note_rtsp_frame(ip)
     _note_video_frame_size(ip, channel, frame)
     if _video_road_is_sharper(ip, channel):
         logger.info(
