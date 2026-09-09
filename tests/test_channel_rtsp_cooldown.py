@@ -58,6 +58,19 @@ class ChannelRtspCooldownTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(main._rtsp_cooldown_active(DVR["ip"]))
 
+    def test_a_video_only_recorder_keeps_its_road_for_other_rooms(self):
+        """DVR 2 has no other road: resting it fails every other classroom."""
+        ip = sorted(main._RTSP_FALLBACK_IPS)[0]
+        main._rtsp_cooldowns.pop(ip, None)
+        main._rtsp_channel_cooldowns.clear()
+
+        main._mark_rtsp_failure(ip, 5)
+        main._mark_rtsp_failure(ip, 12)
+
+        self.assertTrue(main._rtsp_channel_cooldown_active(ip, 5))
+        self.assertTrue(main._rtsp_channel_cooldown_active(ip, 12))
+        self.assertFalse(main._rtsp_cooldown_active(ip))
+
     def test_two_broken_cameras_do_not_rest_a_streaming_recorder(self):
         """GRADE 2A's two dead cameras were taking DVR 2's road from every room."""
         main._note_rtsp_frame(DVR["ip"])
