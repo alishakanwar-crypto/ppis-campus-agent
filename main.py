@@ -641,11 +641,12 @@ def _digest_auth(ip: str, user: str, password: str) -> httpx.DigestAuth:
 # DVR 4 (.13) answers 401 on ISAPI. DVR 2 (.12) is a DS-9664NI-ST on 2015
 # firmware whose snapshot interface is unusable, so its video stream is not a
 # fallback there, it is the road.
-_RTSP_FALLBACK_IPS: set[str] = {
+# The environment adds recorders, it does not replace these two: a machine
+# still carrying an older DVR 4-only value would otherwise put DVR 2 back on
+# the road that refuses us.
+_RTSP_FALLBACK_IPS: set[str] = {"192.168.0.13", "192.168.0.12"} | {
     ip.strip()
-    for ip in os.environ.get(
-        "RTSP_FALLBACK_IPS", "192.168.0.13,192.168.0.12"
-    ).split(",")
+    for ip in os.environ.get("RTSP_FALLBACK_IPS", "").split(",")
     if ip.strip()
 }
 _RTSP_COOLDOWN_SECONDS = max(
