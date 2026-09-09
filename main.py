@@ -1957,6 +1957,25 @@ _LOOP_LAG_WINDOW_SECONDS = max(
     30.0, float(os.environ.get("LOOP_LAG_WINDOW_SECONDS", "300"))
 )
 _loop_lag_samples: list[tuple[float, float]] = []
+# The worst few stalls, each with what the agent was doing at the time. The
+# campus PC's log is not reachable from the cloud, so a morning stall has to
+# travel with health or it cannot be attributed at all.
+_loop_stalls: list[dict] = []
+_LOOP_STALL_SECONDS = max(
+    1.0, float(os.environ.get("LOOP_STALL_SECONDS", "2"))
+)
+_LOOP_STALLS_KEPT = max(1, int(os.environ.get("LOOP_STALLS_KEPT", "5")))
+
+
+def _note_loop_stall(lag: float) -> None:
+    """Remember a stall and what was running, worst kept first."""
+    _loop_stalls.append({
+        "at_ist": datetime.now(_IST).strftime("%d-%m-%Y %H:%M:%S IST"),
+        "seconds": round(lag, 1),
+        "work": _work_in_flight() or "nothing the agent counts",
+    })
+    _loop_stalls.sort(key=lambda stall: stall["seconds"], reverse=True)
+    del _loop_stalls[_LOOP_STALLS_KEPT:]
 
 
 async def watch_event_loop_lag() -> None:
@@ -1975,7 +1994,8 @@ async def watch_event_loop_lag() -> None:
         cutoff = now - _LOOP_LAG_WINDOW_SECONDS
         while _loop_lag_samples and _loop_lag_samples[0][0] < cutoff:
             _loop_lag_samples.pop(0)
-        if lag >= 2.0:
+        if lag >= _LOOP_STALL_SECONDS:
+            _note_loop_stall(lag)
             logger.warning(
                 "Other work held the agent for %.1fs; a parent's photo waits "
                 "that long before a camera is even asked", lag,
@@ -1986,12 +2006,20 @@ def event_loop_lag_health() -> dict:
     """The worst and the usual delay before any request can get going."""
     lags = [lag for _, lag in _loop_lag_samples]
     if not lags:
-        return {"worst_seconds": 0.0, "usual_seconds": 0.0, "samples": 0}
+        return {
+            "worst_seconds": 0.0,
+            "usual_seconds": 0.0,
+            "samples": 0,
+            "stalls": list(_loop_stalls),
+        }
     lags_sorted = sorted(lags)
     return {
         "worst_seconds": round(lags_sorted[-1], 2),
         "usual_seconds": round(lags_sorted[len(lags_sorted) // 2], 3),
         "samples": len(lags),
+        # The readings roll past in five minutes; a stall that made parents
+        # wait keeps its time and its cause for the rest of the day.
+        "stalls": list(_loop_stalls),
     }
 
 
