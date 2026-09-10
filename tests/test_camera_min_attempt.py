@@ -82,5 +82,10 @@ class AgentLagReportTests(unittest.IsolatedAsyncioTestCase):
     def test_no_samples_yet_reads_as_no_delay(self):
         self.assertEqual(
             main.event_loop_lag_health(),
-            {"worst_seconds": 0.0, "usual_seconds": 0.0, "samples": 0},
+            {
+                "worst_seconds": 0.0,
+                "usual_seconds": 0.0,
+                "samples": 0,
+                "stalls": [],
+            },
         )
