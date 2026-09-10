@@ -34,6 +34,16 @@ def _other_agent_process_exists() -> bool:
     return False
 
 
+def another_agent_is_running() -> bool:
+    """Whether a campus agent other than this process is alive.
+
+    The wrapper asks this before it gives up on a refused mutex: a mutex held
+    by an agent that has already gone must never end the wrapper, or the
+    campus is left with no agent until somebody restarts it by hand.
+    """
+    return _other_agent_process_exists()
+
+
 def acquire_single_instance() -> bool:
     """Acquire a kernel-backed mutex; Windows releases it after hard termination."""
     global _mutex_handle
