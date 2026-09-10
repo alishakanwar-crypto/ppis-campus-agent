@@ -1985,7 +1985,15 @@ _LOOP_STALLS_KEPT = max(1, int(os.environ.get("LOOP_STALLS_KEPT", "5")))
 _loop_pulse = time.monotonic()
 _loop_block_stack = ""
 _loop_block_seen_at = 0.0
+# The pulse a stall is counted from, and whether the watching thread was
+# itself frozen during that same stall.
+_loop_block_frozen_at_pulse = 0.0
 _LOOP_PULSE_SECONDS = 0.2
+_LOOP_BLOCK_UNREADABLE = (
+    "could not be read: this watching thread was frozen too, which means "
+    "either native code holding the interpreter lock or the PC itself "
+    "starved of processor time"
+)
 
 
 def _main_thread_stack(main_thread_id: int) -> str:
@@ -2002,6 +2010,32 @@ def _main_thread_stack(main_thread_id: int) -> str:
     return " < ".join(lines[-4:])
 
 
+def _catch_the_blocked_loop(
+    main_thread_id: int, starved: bool, at: float
+) -> None:
+    """Keep the best evidence of what is holding the loop right now."""
+    global _loop_block_stack, _loop_block_seen_at, _loop_block_frozen_at_pulse
+    pulse = _loop_pulse
+    if starved:
+        # Not being able to look is itself worth recording, but it says only
+        # that this thread did not run when asked. A real stack read earlier
+        # in the same stall is better evidence and is kept.
+        fresh = _loop_block_seen_at >= pulse
+        if _loop_block_frozen_at_pulse != pulse and not fresh:
+            _loop_block_stack = _LOOP_BLOCK_UNREADABLE
+            _loop_block_seen_at = at
+        _loop_block_frozen_at_pulse = pulse
+        return
+    if _loop_block_frozen_at_pulse == pulse:
+        # This thread was frozen earlier in this same stall, so whatever the
+        # main thread is in now started after the blocker let go.
+        return
+    stack = _main_thread_stack(main_thread_id)
+    if stack:
+        _loop_block_stack = stack
+        _loop_block_seen_at = at
+
+
 def _watch_for_a_blocked_loop(main_thread_id: int) -> None:
     """Catch the main thread in the act while the loop's pulse is late.
 
@@ -2010,16 +2044,18 @@ def _watch_for_a_blocked_loop(main_thread_id: int) -> None:
     held, so the record can say which of the agent's own functions was
     running instead of leaving a ten second gap unexplained.
     """
-    global _loop_block_stack, _loop_block_seen_at
+    last_woke = time.monotonic()
     while True:
         time.sleep(_LOOP_PULSE_SECONDS)
-        late = time.monotonic() - _loop_pulse
-        if late < _LOOP_STALL_SECONDS:
+        woke = time.monotonic()
+        # Waking far later than asked means this thread did not run either,
+        # so any look now is taken after whatever held the loop let go and
+        # the stack would belong to what resumed, not to the blocker.
+        starved = woke - last_woke > _LOOP_PULSE_SECONDS * 2
+        last_woke = woke
+        if woke - _loop_pulse < _LOOP_STALL_SECONDS:
             continue
-        stack = _main_thread_stack(main_thread_id)
-        if stack:
-            _loop_block_stack = stack
-            _loop_block_seen_at = time.monotonic()
+        _catch_the_blocked_loop(main_thread_id, starved, woke)
 
 
 async def keep_the_loop_pulse() -> None:
