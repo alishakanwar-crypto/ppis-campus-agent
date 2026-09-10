@@ -1262,6 +1262,18 @@ def _mark_rtsp_failure(ip: str, channel: int | None = None) -> None:
             # too: resting it for one dead camera sent every classroom on it
             # down the wrong road for two minutes.
             return
+        if ip in _RTSP_FALLBACK_IPS:
+            # Video is the only road this recorder has, so resting the whole
+            # recorder does not protect anything — it just answers every other
+            # classroom on it with "unable to capture" for two minutes. Two of
+            # DVR 2's forty channels failing did exactly that to 1A, PREP-2
+            # and PREP-3 this morning. Rest the channels, keep the road.
+            logger.info(
+                "%s ch%d: stream failed, but its classrooms have no other "
+                "road, so only this camera rests",
+                ip, channel,
+            )
+            return
         if _rtsp_streamed_recently(ip):
             # Two broken cameras on a forty-channel recorder are two broken
             # cameras, not a dead recorder. While it is still streaming for
