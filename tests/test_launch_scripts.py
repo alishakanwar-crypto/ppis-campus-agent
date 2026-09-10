@@ -66,6 +66,16 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertLess(rerun, pull)
         self.assertIn('call "!AGENT_DIR!watchdog.bat"', script)
 
+    def test_wrapper_takes_over_when_the_mutex_holder_has_gone(self):
+        # Exiting on a refused mutex left the campus with no agent at all for
+        # an hour, because the process holding it was already on its way out.
+        script = _read("run_forever.bat")
+        block = script.split('if "%EXIT_CODE%"=="%DUPLICATE_EXIT_CODE%" (', 1)[1]
+        block = block.split("\n)", 1)[0]
+        self.assertIn("another_agent_is_running", block)
+        self.assertIn("goto loop", block)
+        self.assertLess(block.index("goto loop"), block.index("exit /b 0"))
+
     def test_watchdog_detects_launcher_hosted_processes(self):
         script = _read("watchdog.bat")
         self.assertEqual(

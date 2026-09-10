@@ -3726,6 +3726,11 @@ ws_connection = None
 ws_task = None
 _ws_last_activity = 0.0
 _ws_disconnected_since = 0.0
+# When the cloud last stopped seeing us, cleared only by a link that really
+# carries traffic again. Rebuilding the socket must not reset this, or an
+# outage that survives every rebuild looks brand new on each attempt and the
+# agent goes on rebuilding for hours while every parent request is lost.
+_ws_offline_since = 0.0
 _ws_recycles = 0
 _ws_last_recycle = 0.0
 # A parent's request lands nowhere while the cloud cannot see us, so an
@@ -3738,6 +3743,11 @@ _WS_LINK_CHECK_SECONDS = max(
 )
 _WS_RECYCLE_MIN_GAP_SECONDS = max(
     10.0, float(os.environ.get("WS_RECYCLE_MIN_GAP_SECONDS", "45"))
+)
+# Rebuilding the socket cannot cure a process whose link never comes back, so
+# after this long offline the agent exits and the wrapper starts a fresh one.
+_WS_HARD_RESTART_SECONDS = max(
+    120.0, float(os.environ.get("WS_HARD_RESTART_SECONDS", "300"))
 )
 _snapshot_tasks: set[asyncio.Task] = set()
 _live_requests_in_flight = 0
@@ -3787,6 +3797,14 @@ def _snapshot_task_done(task: asyncio.Task) -> None:
 
 
 def _note_ws_activity() -> None:
+    global _ws_last_activity, _ws_disconnected_since, _ws_offline_since
+    _ws_last_activity = time.monotonic()
+    _ws_disconnected_since = 0.0
+    _ws_offline_since = 0.0
+
+
+def _note_ws_rebuilt() -> None:
+    """Give a freshly built link time to connect, without forgetting the outage."""
     global _ws_last_activity, _ws_disconnected_since
     _ws_last_activity = time.monotonic()
     _ws_disconnected_since = 0.0
@@ -3808,6 +3826,11 @@ def ws_link_health() -> dict:
         "connected": _ws_looks_connected(),
         "silent_seconds": silent_for,
         "recycles": _ws_recycles,
+        "offline_seconds": (
+            round(time.monotonic() - _ws_offline_since, 1)
+            if _ws_offline_since
+            else 0.0
+        ),
     }
 
 
@@ -3843,7 +3866,7 @@ async def _recycle_websocket(reason: str) -> None:
         except Exception as exc:
             logger.debug("Old cloud link ended with %s", _exception_text(exc))
     ws_task = asyncio.create_task(websocket_client())
-    _note_ws_activity()
+    _note_ws_rebuilt()
 
 
 async def _cloud_says_we_are_connected() -> bool | None:
@@ -3862,21 +3885,61 @@ async def _cloud_says_we_are_connected() -> bool | None:
         return None
 
 
+def _note_ws_offline() -> None:
+    global _ws_offline_since
+    if not _ws_offline_since:
+        _ws_offline_since = time.monotonic()
+
+
+def _restart_if_the_link_never_returns() -> None:
+    """Exit an agent whose cloud link no rebuild can bring back.
+
+    Every parent request lands nowhere while the cloud cannot see us, and a
+    process that has been offline this long has already been given many fresh
+    sockets. Exiting hands the campus a new process on the merged code.
+    """
+    if not _ws_offline_since:
+        return
+    offline_for = time.monotonic() - _ws_offline_since
+    if offline_for < _WS_HARD_RESTART_SECONDS:
+        return
+    if not _STARTED_BY_WRAPPER:
+        logger.error(
+            "Cloud link dead for %.0fs and no wrapper to restart us; "
+            "still rebuilding the link.",
+            offline_for,
+        )
+        return
+    logger.critical(
+        "Cloud link dead for %.0fs despite %s rebuild(s) at %s; exiting so "
+        "the wrapper starts a fresh agent.",
+        offline_for,
+        _ws_recycles,
+        datetime.now(_IST).strftime("%d-%m-%Y %H:%M:%S IST"),
+    )
+    logging.shutdown()
+    os._exit(0)
+
+
 async def _repair_cloud_link_if_needed() -> None:
     """Force a reconnect when the cloud cannot see us any more."""
     global _ws_disconnected_since
     if not _ws_looks_connected():
+        _note_ws_offline()
         if not _ws_disconnected_since:
             _ws_disconnected_since = time.monotonic()
         elif time.monotonic() - _ws_disconnected_since > _WS_STALE_SECONDS:
             await _recycle_websocket(
                 f"no cloud link for over {_WS_STALE_SECONDS:.0f}s"
             )
+        _restart_if_the_link_never_returns()
         return
     if await _cloud_says_we_are_connected() is False:
         # Our socket looks fine but the cloud has stopped seeing us, so the
         # connection is half-open and every parent request is being lost.
+        _note_ws_offline()
         await _recycle_websocket("cloud reports the agent as offline")
+        _restart_if_the_link_never_returns()
 
 
 async def websocket_client():

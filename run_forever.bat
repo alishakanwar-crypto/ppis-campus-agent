@@ -67,6 +67,15 @@ echo [%DATE% %TIME%] Starting revision !REVISION! >> "%LOGFILE%"
 py -3.12 -B main.py
 set "EXIT_CODE=%ERRORLEVEL%"
 if "%EXIT_CODE%"=="%DUPLICATE_EXIT_CODE%" (
+    REM A mutex still held by an agent that is on its way out must not end this
+    REM wrapper: exiting on that leaves the campus with no agent at all until
+    REM somebody restarts it by hand.
+    timeout /t 20 /nobreak
+    py -3.12 -B -c "import campus_instance, sys; sys.exit(0 if campus_instance.another_agent_is_running() else 1)"
+    if errorlevel 1 (
+        echo [%DATE% %TIME%] WRAPPER: Mutex was held by an agent that has gone; taking over. >> "%LOGFILE%"
+        goto loop
+    )
     echo [%DATE% %TIME%] Another campus agent owns the mutex; wrapper exiting cleanly. >> "%LOGFILE%"
     exit /b 0
 )
