@@ -101,6 +101,25 @@ def _is_visitor_camera(location: str) -> bool:
     return any(kw in loc_upper for kw in VISITOR_CAMERA_KEYWORDS)
 
 
+def _recode_jpeg(frame_bytes: bytes, quality: int = 85) -> str:
+    """Re-encode a captured frame, base64 for the cloud. Blocking work."""
+    if cv2 is None:
+        return ""
+    try:
+        nparr = np.frombuffer(frame_bytes, dtype=np.uint8)
+        bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            return ""
+        ok, buf = cv2.imencode(
+            ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return ""
+        return base64.b64encode(buf).decode()
+    except Exception as e:
+        logger.debug(f"[SIGHTING] Re-encode failed: {e}")
+        return ""
+
+
 _EXIT_CAMERA_KEYWORDS = ("DISPERSAL", "EXIT")
 
 
@@ -577,12 +596,17 @@ class TeacherSightingTracker:
 
                 cam_label = f"{location} (DVR {dvr_idx + 1} Ch {channel})"
 
+                # Face detection and encoding is seconds of solid work. Run
+                # on the event loop it holds every parent's snapshot request
+                # behind it, so it belongs on a worker thread.
                 if is_visitor_cam:
                     # On visitor-eligible cameras: detect teachers + visitors
-                    teachers, unknown_encs = self._detect_faces_with_visitors(frame)
+                    teachers, unknown_encs = await asyncio.to_thread(
+                        self._detect_faces_with_visitors, frame)
                 else:
                     # On teacher-only cameras (staff rooms, admin): only detect teachers
-                    teachers = self._detect_teachers(frame)
+                    teachers = await asyncio.to_thread(
+                        self._detect_teachers, frame)
                     unknown_encs = []
 
                 n_faces = len(teachers) + len(unknown_encs)
@@ -682,28 +706,26 @@ class TeacherSightingTracker:
                 # Try delayed recapture from same camera
                 fresh_frame = await self._capture_frame(dvr, channel)
                 if fresh_frame is not None:
-                    labelled = self._label_frame(fresh_frame)
+                    labelled = await asyncio.to_thread(
+                        self._label_frame, fresh_frame)
                     if labelled is not None:
                         snapshot = labelled
                         best_source = "delayed-gate"
                     # Update context with the delayed (fresher) full frame
-                    nparr = np.frombuffer(fresh_frame, dtype=np.uint8)
-                    bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    if bgr is not None:
-                        _, cb = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        snapshot_context = base64.b64encode(cb).decode()
+                    recoded = await asyncio.to_thread(
+                        _recode_jpeg, fresh_frame)
+                    if recoded:
+                        snapshot_context = recoded
 
                 # Also capture from Reception cameras for a closer indoor shot
                 reception_snapshots = []
                 for rec_loc, rec_dvr, rec_ch in reception_cams:
                     rec_frame = await self._capture_frame(rec_dvr, rec_ch)
                     if rec_frame is not None:
-                        nparr = np.frombuffer(rec_frame, dtype=np.uint8)
-                        bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                        if bgr is not None:
-                            _, buf = cv2.imencode(".jpg", bgr,
-                                                  [cv2.IMWRITE_JPEG_QUALITY, 85])
-                            reception_snapshots.append((rec_loc, base64.b64encode(buf).decode()))
+                        recoded = await asyncio.to_thread(
+                            _recode_jpeg, rec_frame)
+                        if recoded:
+                            reception_snapshots.append((rec_loc, recoded))
 
                 # Pick first Reception snapshot that captured successfully
                 if reception_snapshots:
