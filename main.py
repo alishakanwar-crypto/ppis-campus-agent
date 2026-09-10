@@ -2002,6 +2002,29 @@ def _main_thread_stack(main_thread_id: int) -> str:
     return " < ".join(lines[-4:])
 
 
+def _catch_the_blocked_loop(
+    main_thread_id: int, starved: bool, at: float
+) -> None:
+    """Keep the best evidence of what is holding the loop right now."""
+    global _loop_block_stack, _loop_block_seen_at
+    if starved:
+        # Not being able to look is itself the finding: only native work can
+        # freeze a plain thread, which rules out the agent's own Python and
+        # points at a decode or a face encoding. Keep a real stack read
+        # earlier in this same stall over this weaker reading.
+        if _loop_block_seen_at < _loop_pulse:
+            _loop_block_stack = (
+                "native code (it froze this watching thread too, so the "
+                "stack could not be read)"
+            )
+            _loop_block_seen_at = at
+        return
+    stack = _main_thread_stack(main_thread_id)
+    if stack:
+        _loop_block_stack = stack
+        _loop_block_seen_at = at
+
+
 def _watch_for_a_blocked_loop(main_thread_id: int) -> None:
     """Catch the main thread in the act while the loop's pulse is late.
 
@@ -2010,16 +2033,19 @@ def _watch_for_a_blocked_loop(main_thread_id: int) -> None:
     held, so the record can say which of the agent's own functions was
     running instead of leaving a ten second gap unexplained.
     """
-    global _loop_block_stack, _loop_block_seen_at
+    last_woke = time.monotonic()
     while True:
         time.sleep(_LOOP_PULSE_SECONDS)
-        late = time.monotonic() - _loop_pulse
-        if late < _LOOP_STALL_SECONDS:
+        woke = time.monotonic()
+        # Native code inside a camera decode or a face encoding can hold the
+        # interpreter lock, which freezes this thread as well. Waking far
+        # later than asked means the look is taken after that code returned,
+        # so the stack now belongs to whatever resumed, not to the blocker.
+        starved = woke - last_woke > _LOOP_PULSE_SECONDS * 2
+        last_woke = woke
+        if woke - _loop_pulse < _LOOP_STALL_SECONDS:
             continue
-        stack = _main_thread_stack(main_thread_id)
-        if stack:
-            _loop_block_stack = stack
-            _loop_block_seen_at = time.monotonic()
+        _catch_the_blocked_loop(main_thread_id, starved, woke)
 
 
 async def keep_the_loop_pulse() -> None:

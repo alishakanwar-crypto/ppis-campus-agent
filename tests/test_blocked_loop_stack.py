@@ -35,6 +35,26 @@ class BlockedLoopStackTests(unittest.TestCase):
             main._loop_block_stack,
         )
 
+    def test_a_starved_watcher_does_not_blame_what_resumed(self):
+        """A decode holding the interpreter lock freezes this thread too."""
+        main._loop_pulse = time.monotonic() - 60
+
+        main._catch_the_blocked_loop(
+            threading.get_ident(), True, time.monotonic()
+        )
+
+        self.assertIn("native code", main._loop_block_stack)
+
+    def test_a_stack_read_during_the_stall_beats_the_weaker_reading(self):
+        now = time.monotonic()
+        main._loop_pulse = now - 60
+        main._catch_the_blocked_loop(threading.get_ident(), False, now)
+        caught = main._loop_block_stack
+
+        main._catch_the_blocked_loop(threading.get_ident(), True, now)
+
+        self.assertEqual(main._loop_block_stack, caught)
+
     def test_a_stall_names_the_code_that_held_the_loop(self):
         main._loop_block_stack = "main.py:10 sweep_cameras"
         main._loop_block_seen_at = time.monotonic()
