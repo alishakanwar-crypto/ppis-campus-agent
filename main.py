@@ -15,6 +15,7 @@ import concurrent.futures
 import contextvars
 import faulthandler
 import threading
+import traceback
 faulthandler.enable()  # Print C-level crash tracebacks
 
 import asyncio
@@ -1977,17 +1978,103 @@ _LOOP_STALL_SECONDS = max(
     1.0, float(os.environ.get("LOOP_STALL_SECONDS", "2"))
 )
 _LOOP_STALLS_KEPT = max(1, int(os.environ.get("LOOP_STALLS_KEPT", "5")))
+# The loop's own pulse, and the last stack a watching thread caught the main
+# thread in while that pulse was late. Counted work names only the jobs the
+# agent knows it started; this names the line of code actually holding the
+# loop, which is the only way an unaccounted morning stall gets attributed.
+_loop_pulse = time.monotonic()
+_loop_block_stack = ""
+_loop_block_seen_at = 0.0
+_LOOP_PULSE_SECONDS = 0.2
 
 
-def _note_loop_stall(lag: float) -> None:
-    """Remember a stall and what was running, worst kept first."""
+def _main_thread_stack(main_thread_id: int) -> str:
+    """Where the main thread is, in the agent's own files, innermost last."""
+    frame = sys._current_frames().get(main_thread_id)
+    if frame is None:
+        return ""
+    here = str(Path(__file__).resolve().parent)
+    lines = []
+    for filename, lineno, name, _text in traceback.extract_stack(frame):
+        if not filename.startswith(here):
+            continue
+        lines.append(f"{Path(filename).name}:{lineno} {name}")
+    return " < ".join(lines[-4:])
+
+
+def _watch_for_a_blocked_loop(main_thread_id: int) -> None:
+    """Catch the main thread in the act while the loop's pulse is late.
+
+    A stall is only noticed once the loop is free again, by which time the
+    code that held it has returned. A plain thread can still look while it is
+    held, so the record can say which of the agent's own functions was
+    running instead of leaving a ten second gap unexplained.
+    """
+    global _loop_block_stack, _loop_block_seen_at
+    while True:
+        time.sleep(_LOOP_PULSE_SECONDS)
+        late = time.monotonic() - _loop_pulse
+        if late < _LOOP_STALL_SECONDS:
+            continue
+        stack = _main_thread_stack(main_thread_id)
+        if stack:
+            _loop_block_stack = stack
+            _loop_block_seen_at = time.monotonic()
+
+
+async def keep_the_loop_pulse() -> None:
+    """Mark the loop alive often enough for the watching thread to judge."""
+    global _loop_pulse
+    while True:
+        _loop_pulse = time.monotonic()
+        await asyncio.sleep(_LOOP_PULSE_SECONDS)
+
+
+def _stack_caught_during(lag: float) -> str:
+    """The blocked stack, only if it was caught inside this stall."""
+    if not _loop_block_stack:
+        return ""
+    if time.monotonic() - _loop_block_seen_at > lag:
+        return ""
+    return _loop_block_stack
+
+
+def _note_loop_stall(
+    lag: float, work_last_seen: str, work_seen_at: datetime
+) -> None:
+    """Remember a stall, when it began, and the last work seen before it.
+
+    The watcher only wakes once the loop is free again, so the moment it
+    notices is the end of the stall and the work it can see then includes the
+    parent requests that were waiting on it. The reading is taken before the
+    sleep instead and carries its own time, because it is the last look at the
+    agent's work before the loop went quiet, not proof of what held it: work
+    can begin after that look, and whatever held the loop may not be counted
+    work at all.
+    """
+    ended = datetime.now(_IST)
+    began = ended - timedelta(seconds=lag)
     _loop_stalls.append({
-        "at_ist": datetime.now(_IST).strftime("%d-%m-%Y %H:%M:%S IST"),
+        "began_ist": began.strftime("%d-%m-%Y %H:%M:%S IST"),
+        "noticed_ist": ended.strftime("%d-%m-%Y %H:%M:%S IST"),
         "seconds": round(lag, 1),
-        "work": _work_in_flight() or "nothing the agent counts",
+        "work_last_seen": work_last_seen or "nothing the agent counts",
+        "work_seen_at_ist": work_seen_at.strftime("%d-%m-%Y %H:%M:%S IST"),
+        "held_in": _stack_caught_during(lag),
+        # Sorting on the rounded figure lets an earlier 4.01s stall keep the
+        # last slot against a later 4.04s one.
+        "_lag": lag,
     })
-    _loop_stalls.sort(key=lambda stall: stall["seconds"], reverse=True)
+    _loop_stalls.sort(key=lambda stall: stall["_lag"], reverse=True)
     del _loop_stalls[_LOOP_STALLS_KEPT:]
+
+
+def _reported_stalls() -> list[dict]:
+    """The kept stalls without the figure only the ranking needs."""
+    return [
+        {key: value for key, value in stall.items() if key != "_lag"}
+        for stall in _loop_stalls
+    ]
 
 
 async def watch_event_loop_lag() -> None:
@@ -1999,6 +2086,8 @@ async def watch_event_loop_lag() -> None:
     """
     while True:
         started = time.monotonic()
+        work_last_seen = _work_in_flight()
+        work_seen_at = datetime.now(_IST)
         await asyncio.sleep(_LOOP_LAG_SAMPLE_SECONDS)
         lag = time.monotonic() - started - _LOOP_LAG_SAMPLE_SECONDS
         now = time.monotonic()
@@ -2007,7 +2096,7 @@ async def watch_event_loop_lag() -> None:
         while _loop_lag_samples and _loop_lag_samples[0][0] < cutoff:
             _loop_lag_samples.pop(0)
         if lag >= _LOOP_STALL_SECONDS:
-            _note_loop_stall(lag)
+            _note_loop_stall(lag, work_last_seen, work_seen_at)
             logger.warning(
                 "Other work held the agent for %.1fs; a parent's photo waits "
                 "that long before a camera is even asked", lag,
@@ -2022,7 +2111,7 @@ def event_loop_lag_health() -> dict:
             "worst_seconds": 0.0,
             "usual_seconds": 0.0,
             "samples": 0,
-            "stalls": list(_loop_stalls),
+            "stalls": _reported_stalls(),
         }
     lags_sorted = sorted(lags)
     return {
@@ -2030,8 +2119,8 @@ def event_loop_lag_health() -> dict:
         "usual_seconds": round(lags_sorted[len(lags_sorted) // 2], 3),
         "samples": len(lags),
         # The readings roll past in five minutes; a stall that made parents
-        # wait keeps its time and its cause for the rest of the day.
-        "stalls": list(_loop_stalls),
+        # wait keeps its time and what was running for the rest of the day.
+        "stalls": _reported_stalls(),
     }
 
 
@@ -4720,6 +4809,13 @@ async def lifespan(app: FastAPI):
     # Measure delay caused by the agent's own work, so a slow morning is
     # attributed honestly instead of being blamed on the cameras.
     asyncio.create_task(watch_event_loop_lag())
+    asyncio.create_task(keep_the_loop_pulse())
+    threading.Thread(
+        target=_watch_for_a_blocked_loop,
+        args=(threading.get_ident(),),
+        daemon=True,
+        name="blocked-loop-watch",
+    ).start()
     # Measure every camera nightly, so a parent's request is never the probe.
     _load_capture_doors()
     asyncio.create_task(_camera_warmup_loop())
