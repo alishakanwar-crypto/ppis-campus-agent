@@ -1979,15 +1979,36 @@ _LOOP_STALL_SECONDS = max(
 _LOOP_STALLS_KEPT = max(1, int(os.environ.get("LOOP_STALLS_KEPT", "5")))
 
 
-def _note_loop_stall(lag: float) -> None:
-    """Remember a stall and what was running, worst kept first."""
+def _note_loop_stall(lag: float, work_when_it_began: str) -> None:
+    """Remember a stall, when it began, and what was running as it began.
+
+    The watcher only wakes once the loop is free again, so the moment it
+    notices is the end of the stall and the work it can see then includes the
+    parent requests that were waiting on it. Both are taken from the start of
+    the interval instead, and the work is named as what was running, not as a
+    proven cause: whatever held the loop may not be counted work at all.
+    """
+    ended = datetime.now(_IST)
+    began = ended - timedelta(seconds=lag)
     _loop_stalls.append({
-        "at_ist": datetime.now(_IST).strftime("%d-%m-%Y %H:%M:%S IST"),
+        "began_ist": began.strftime("%d-%m-%Y %H:%M:%S IST"),
+        "noticed_ist": ended.strftime("%d-%m-%Y %H:%M:%S IST"),
         "seconds": round(lag, 1),
-        "work": _work_in_flight() or "nothing the agent counts",
+        "running_then": work_when_it_began or "nothing the agent counts",
+        # Sorting on the rounded figure lets an earlier 4.01s stall keep the
+        # last slot against a later 4.04s one.
+        "_lag": lag,
     })
-    _loop_stalls.sort(key=lambda stall: stall["seconds"], reverse=True)
+    _loop_stalls.sort(key=lambda stall: stall["_lag"], reverse=True)
     del _loop_stalls[_LOOP_STALLS_KEPT:]
+
+
+def _reported_stalls() -> list[dict]:
+    """The kept stalls without the figure only the ranking needs."""
+    return [
+        {key: value for key, value in stall.items() if key != "_lag"}
+        for stall in _loop_stalls
+    ]
 
 
 async def watch_event_loop_lag() -> None:
@@ -1999,6 +2020,7 @@ async def watch_event_loop_lag() -> None:
     """
     while True:
         started = time.monotonic()
+        running_then = _work_in_flight()
         await asyncio.sleep(_LOOP_LAG_SAMPLE_SECONDS)
         lag = time.monotonic() - started - _LOOP_LAG_SAMPLE_SECONDS
         now = time.monotonic()
@@ -2007,7 +2029,7 @@ async def watch_event_loop_lag() -> None:
         while _loop_lag_samples and _loop_lag_samples[0][0] < cutoff:
             _loop_lag_samples.pop(0)
         if lag >= _LOOP_STALL_SECONDS:
-            _note_loop_stall(lag)
+            _note_loop_stall(lag, running_then)
             logger.warning(
                 "Other work held the agent for %.1fs; a parent's photo waits "
                 "that long before a camera is even asked", lag,
@@ -2022,7 +2044,7 @@ def event_loop_lag_health() -> dict:
             "worst_seconds": 0.0,
             "usual_seconds": 0.0,
             "samples": 0,
-            "stalls": list(_loop_stalls),
+            "stalls": _reported_stalls(),
         }
     lags_sorted = sorted(lags)
     return {
@@ -2030,8 +2052,8 @@ def event_loop_lag_health() -> dict:
         "usual_seconds": round(lags_sorted[len(lags_sorted) // 2], 3),
         "samples": len(lags),
         # The readings roll past in five minutes; a stall that made parents
-        # wait keeps its time and its cause for the rest of the day.
-        "stalls": list(_loop_stalls),
+        # wait keeps its time and what was running for the rest of the day.
+        "stalls": _reported_stalls(),
     }
 
 
