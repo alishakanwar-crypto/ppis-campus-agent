@@ -1985,7 +1985,15 @@ _LOOP_STALLS_KEPT = max(1, int(os.environ.get("LOOP_STALLS_KEPT", "5")))
 _loop_pulse = time.monotonic()
 _loop_block_stack = ""
 _loop_block_seen_at = 0.0
+# The pulse a stall is counted from, and whether the watching thread was
+# itself frozen during that same stall.
+_loop_block_frozen_at_pulse = 0.0
 _LOOP_PULSE_SECONDS = 0.2
+_LOOP_BLOCK_UNREADABLE = (
+    "could not be read: this watching thread was frozen too, which means "
+    "either native code holding the interpreter lock or the PC itself "
+    "starved of processor time"
+)
 
 
 def _main_thread_stack(main_thread_id: int) -> str:
@@ -2006,18 +2014,21 @@ def _catch_the_blocked_loop(
     main_thread_id: int, starved: bool, at: float
 ) -> None:
     """Keep the best evidence of what is holding the loop right now."""
-    global _loop_block_stack, _loop_block_seen_at
+    global _loop_block_stack, _loop_block_seen_at, _loop_block_frozen_at_pulse
+    pulse = _loop_pulse
     if starved:
-        # Not being able to look is itself the finding: only native work can
-        # freeze a plain thread, which rules out the agent's own Python and
-        # points at a decode or a face encoding. Keep a real stack read
-        # earlier in this same stall over this weaker reading.
-        if _loop_block_seen_at < _loop_pulse:
-            _loop_block_stack = (
-                "native code (it froze this watching thread too, so the "
-                "stack could not be read)"
-            )
+        # Not being able to look is itself worth recording, but it says only
+        # that this thread did not run when asked. A real stack read earlier
+        # in the same stall is better evidence and is kept.
+        fresh = _loop_block_seen_at >= pulse
+        if _loop_block_frozen_at_pulse != pulse and not fresh:
+            _loop_block_stack = _LOOP_BLOCK_UNREADABLE
             _loop_block_seen_at = at
+        _loop_block_frozen_at_pulse = pulse
+        return
+    if _loop_block_frozen_at_pulse == pulse:
+        # This thread was frozen earlier in this same stall, so whatever the
+        # main thread is in now started after the blocker let go.
         return
     stack = _main_thread_stack(main_thread_id)
     if stack:
@@ -2037,10 +2048,9 @@ def _watch_for_a_blocked_loop(main_thread_id: int) -> None:
     while True:
         time.sleep(_LOOP_PULSE_SECONDS)
         woke = time.monotonic()
-        # Native code inside a camera decode or a face encoding can hold the
-        # interpreter lock, which freezes this thread as well. Waking far
-        # later than asked means the look is taken after that code returned,
-        # so the stack now belongs to whatever resumed, not to the blocker.
+        # Waking far later than asked means this thread did not run either,
+        # so any look now is taken after whatever held the loop let go and
+        # the stack would belong to what resumed, not to the blocker.
         starved = woke - last_woke > _LOOP_PULSE_SECONDS * 2
         last_woke = woke
         if woke - _loop_pulse < _LOOP_STALL_SECONDS:
