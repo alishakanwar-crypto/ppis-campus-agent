@@ -1979,14 +1979,18 @@ _LOOP_STALL_SECONDS = max(
 _LOOP_STALLS_KEPT = max(1, int(os.environ.get("LOOP_STALLS_KEPT", "5")))
 
 
-def _note_loop_stall(lag: float, work_when_it_began: str) -> None:
-    """Remember a stall, when it began, and what was running as it began.
+def _note_loop_stall(
+    lag: float, work_last_seen: str, work_seen_at: datetime
+) -> None:
+    """Remember a stall, when it began, and the last work seen before it.
 
     The watcher only wakes once the loop is free again, so the moment it
     notices is the end of the stall and the work it can see then includes the
-    parent requests that were waiting on it. Both are taken from the start of
-    the interval instead, and the work is named as what was running, not as a
-    proven cause: whatever held the loop may not be counted work at all.
+    parent requests that were waiting on it. The reading is taken before the
+    sleep instead and carries its own time, because it is the last look at the
+    agent's work before the loop went quiet, not proof of what held it: work
+    can begin after that look, and whatever held the loop may not be counted
+    work at all.
     """
     ended = datetime.now(_IST)
     began = ended - timedelta(seconds=lag)
@@ -1994,7 +1998,8 @@ def _note_loop_stall(lag: float, work_when_it_began: str) -> None:
         "began_ist": began.strftime("%d-%m-%Y %H:%M:%S IST"),
         "noticed_ist": ended.strftime("%d-%m-%Y %H:%M:%S IST"),
         "seconds": round(lag, 1),
-        "running_then": work_when_it_began or "nothing the agent counts",
+        "work_last_seen": work_last_seen or "nothing the agent counts",
+        "work_seen_at_ist": work_seen_at.strftime("%d-%m-%Y %H:%M:%S IST"),
         # Sorting on the rounded figure lets an earlier 4.01s stall keep the
         # last slot against a later 4.04s one.
         "_lag": lag,
@@ -2020,7 +2025,8 @@ async def watch_event_loop_lag() -> None:
     """
     while True:
         started = time.monotonic()
-        running_then = _work_in_flight()
+        work_last_seen = _work_in_flight()
+        work_seen_at = datetime.now(_IST)
         await asyncio.sleep(_LOOP_LAG_SAMPLE_SECONDS)
         lag = time.monotonic() - started - _LOOP_LAG_SAMPLE_SECONDS
         now = time.monotonic()
@@ -2029,7 +2035,7 @@ async def watch_event_loop_lag() -> None:
         while _loop_lag_samples and _loop_lag_samples[0][0] < cutoff:
             _loop_lag_samples.pop(0)
         if lag >= _LOOP_STALL_SECONDS:
-            _note_loop_stall(lag, running_then)
+            _note_loop_stall(lag, work_last_seen, work_seen_at)
             logger.warning(
                 "Other work held the agent for %.1fs; a parent's photo waits "
                 "that long before a camera is even asked", lag,
