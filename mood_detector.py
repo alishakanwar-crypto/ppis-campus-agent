@@ -499,8 +499,11 @@ class MoodDetector:
 
                 cam_label = f"{location} (DVR {dvr_idx + 1} Ch {channel})"
 
-                # Detect tracked persons in frame
-                detections = self._detect_tracked_person(frame)
+                # Face matching and emotion inference are seconds of solid
+                # work; on the event loop they hold every parent's snapshot
+                # request behind them, so they run on a worker thread.
+                detections = await asyncio.to_thread(
+                    self._detect_tracked_person, frame)
                 for det in detections:
                     person_label = det["person_label"]
 
@@ -511,7 +514,8 @@ class MoodDetector:
                         continue
 
                     # Analyze emotion for this frame
-                    emotion_data = self._analyze_emotion(frame)
+                    emotion_data = await asyncio.to_thread(
+                        self._analyze_emotion, frame)
 
                     # Accumulate into frame buffer
                     if person_label not in self._frame_buffer:
