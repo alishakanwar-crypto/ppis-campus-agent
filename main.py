@@ -159,6 +159,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ppis-agent")
 
+# The line that tells the next process where this run's log begins, so it
+# reads only what the run that died said.
+logger.info(last_run.RUN_START_MARKER)
+
 if _PREVIOUS_RUN.get("last_error") or _PREVIOUS_RUN.get("exit_code"):
     logger.warning(
         "Previous run ended at %s with exit code %s: %s",

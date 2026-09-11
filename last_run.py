@@ -16,18 +16,40 @@ from pathlib import Path
 _HERE = Path(__file__).parent
 AGENT_LOG = _HERE / "campus_agent.log"
 WRAPPER_LOG = _HERE / "wrapper_campus.log"
+# The wrapper caps its log at 500 lines and moves the rest here, which can
+# happen between the exit it recorded and the process that reads it.
+WRAPPER_LOG_OLD = _HERE / "wrapper_campus.log.old"
 
 # Enough of the tail to hold a traceback and the lines around it, and small
 # enough to read on a machine that is already busy starting up.
 _TAIL_BYTES = 64 * 1024
 _MAX_REASON_CHARS = 600
 
-_EXIT_CODE = re.compile(r"Agent stopped \(exit code: (-?\d+)\)")
+# The wrapper writes its own clock in front of the exit it saw, and that clock
+# is the campus PC's, which runs on IST.
+_EXIT_LINE = re.compile(
+    r"^\[(?P<when>[^\]]{,40})\].*Agent stopped \(exit code: (?P<code>-?\d+)\)"
+)
 _TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+# A failure is a line the logger itself wrote at that level, not any line
+# that happens to quote one: the startup warning quotes the previous error,
+# and matching it anywhere would keep one error alive for ever.
+_FAILURE_LINE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)? \[(?:ERROR|CRITICAL)\]"
+)
+# Written by the agent as its first line, so the tail can be cut to the run
+# that died instead of reaching back into runs before it.
+RUN_START_MARKER = "AGENT RUN START"
 # Anything that looks like a path on the campus PC, so a public health page
 # never carries the layout of that machine.
 _PATH = re.compile(r"[A-Za-z]:\\[^\s\"']+|/(?:home|Users)/[^\s\"']+")
-_SECRETISH = re.compile(r"(?i)(secret|password|token)\s*[=:]\s*\S+")
+_SECRETISH = re.compile(
+    r"(?i)(secret|password|passwd|pwd|token|api[_-]?key|key|auth|"
+    r"authorization|bearer)\s*[=:]\s*\S+"
+)
+# A long run of token-shaped characters is a credential far more often than
+# it is anything worth reading, so it goes too.
+_LONG_TOKEN = re.compile(r"\b[A-Za-z0-9+/_-]{24,}={0,2}\b")
 
 
 def _tail(path: Path) -> list[str]:
@@ -45,7 +67,20 @@ def _tail(path: Path) -> list[str]:
 def _scrub(text: str) -> str:
     text = _PATH.sub("<path>", text)
     text = _SECRETISH.sub(r"\1=<hidden>", text)
+    text = _LONG_TOKEN.sub("<hidden>", text)
     return text.strip()[:_MAX_REASON_CHARS]
+
+
+def _previous_run_lines(lines: list[str]) -> list[str]:
+    """Only what the run that just died said.
+
+    This process has not logged yet, so everything after the last start
+    marker belongs to its predecessor.
+    """
+    for index in range(len(lines) - 1, -1, -1):
+        if RUN_START_MARKER in lines[index]:
+            return lines[index + 1:]
+    return lines
 
 
 def _last_failure(lines: list[str]) -> str:
@@ -54,29 +89,40 @@ def _last_failure(lines: list[str]) -> str:
         line = lines[index]
         if (
             "Traceback (most recent call last)" in line
-            or "[CRITICAL]" in line
-            or "[ERROR]" in line
+            or _FAILURE_LINE.match(line)
         ):
             return _scrub(" | ".join(lines[index:index + 6]))
     return ""
+
+
+def _wrapper_exit() -> tuple[str, str]:
+    """When the wrapper saw the last process return, and with what code."""
+    for path in (WRAPPER_LOG, WRAPPER_LOG_OLD):
+        for line in reversed(_tail(path)):
+            found = _EXIT_LINE.match(line)
+            if found:
+                return found.group("when").strip(), found.group("code")
+    return "", ""
 
 
 def previous_run_summary() -> dict:
     """When the last run stopped, how it exited and what it said last."""
     summary = {"ended_at": "", "exit_code": "", "last_error": ""}
     try:
-        agent_lines = _tail(AGENT_LOG)
-        for line in reversed(agent_lines):
-            found = _TIMESTAMP.match(line)
-            if found:
-                summary["ended_at"] = found.group(1)
-                break
+        agent_lines = _previous_run_lines(_tail(AGENT_LOG))
         summary["last_error"] = _last_failure(agent_lines)
-        for line in reversed(_tail(WRAPPER_LOG)):
-            found = _EXIT_CODE.search(line)
-            if found:
-                summary["exit_code"] = found.group(1)
-                break
+        ended_at, exit_code = _wrapper_exit()
+        summary["exit_code"] = exit_code
+        if ended_at:
+            # The wrapper's clock is the moment the process actually went,
+            # which a silent crash never writes into the agent's own log.
+            summary["ended_at"] = ended_at
+        else:
+            for line in reversed(agent_lines):
+                found = _TIMESTAMP.match(line)
+                if found:
+                    summary["ended_at"] = found.group(1)
+                    break
     except Exception:  # noqa: BLE001
         # Startup diagnostics must never be the thing that stops the agent.
         return summary
