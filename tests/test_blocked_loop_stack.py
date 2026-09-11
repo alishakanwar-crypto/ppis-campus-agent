@@ -8,14 +8,16 @@ import main
 
 class BlockedLoopStackTests(unittest.TestCase):
     def setUp(self):
-        main._loop_stalls.clear()
-        main._loop_block_stack = ""
-        main._loop_block_seen_at = 0.0
+        self._forget_what_was_caught()
 
     def tearDown(self):
+        self._forget_what_was_caught()
+
+    def _forget_what_was_caught(self):
         main._loop_stalls.clear()
         main._loop_block_stack = ""
         main._loop_block_seen_at = 0.0
+        main._loop_block_frozen_at_pulse = 0.0
 
     def test_the_stack_is_caught_while_the_loop_is_still_held(self):
         """The blocking code has returned by the time a stall is noticed."""
@@ -34,6 +36,36 @@ class BlockedLoopStackTests(unittest.TestCase):
             "test_the_stack_is_caught_while_the_loop_is_still_held",
             main._loop_block_stack,
         )
+
+    def test_a_frozen_watcher_says_so_without_naming_a_cause(self):
+        """A late wake proves only that this thread did not run."""
+        main._loop_pulse = time.monotonic() - 60
+
+        main._catch_the_blocked_loop(
+            threading.get_ident(), True, time.monotonic()
+        )
+
+        self.assertIn("could not be read", main._loop_block_stack)
+
+    def test_code_that_resumed_does_not_replace_a_frozen_reading(self):
+        """After a freeze in this stall, the blocker has already let go."""
+        now = time.monotonic()
+        main._loop_pulse = now - 60
+        main._catch_the_blocked_loop(threading.get_ident(), True, now)
+
+        main._catch_the_blocked_loop(threading.get_ident(), False, now)
+
+        self.assertIn("could not be read", main._loop_block_stack)
+
+    def test_a_stack_read_during_the_stall_beats_the_weaker_reading(self):
+        now = time.monotonic()
+        main._loop_pulse = now - 60
+        main._catch_the_blocked_loop(threading.get_ident(), False, now)
+        caught = main._loop_block_stack
+
+        main._catch_the_blocked_loop(threading.get_ident(), True, now)
+
+        self.assertEqual(main._loop_block_stack, caught)
 
     def test_a_stall_names_the_code_that_held_the_loop(self):
         main._loop_block_stack = "main.py:10 sweep_cameras"
