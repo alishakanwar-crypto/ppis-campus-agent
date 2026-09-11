@@ -7,21 +7,31 @@ import last_run
 
 
 class PreviousRunSummaryTests(unittest.TestCase):
-    def _summary(self, agent_text="", wrapper_text="", wrapper_old_text=""):
+    def _summary(
+        self,
+        agent_text="",
+        wrapper_text="",
+        wrapper_old_text="",
+        boundary=None,
+    ):
         with TemporaryDirectory() as folder:
             agent_log = Path(folder) / "campus_agent.log"
             wrapper_log = Path(folder) / "wrapper_campus.log"
             wrapper_old = Path(folder) / "wrapper_campus.log.old"
+            boundary_file = Path(folder) / "run_boundary.txt"
             if agent_text:
                 agent_log.write_text(agent_text, encoding="utf-8")
             if wrapper_text:
                 wrapper_log.write_text(wrapper_text, encoding="utf-8")
             if wrapper_old_text:
                 wrapper_old.write_text(wrapper_old_text, encoding="utf-8")
+            if boundary is not None:
+                boundary_file.write_text(str(boundary), encoding="utf-8")
             with (
                 patch.object(last_run, "AGENT_LOG", agent_log),
                 patch.object(last_run, "WRAPPER_LOG", wrapper_log),
                 patch.object(last_run, "WRAPPER_LOG_OLD", wrapper_old),
+                patch.object(last_run, "RUN_BOUNDARY", boundary_file),
             ):
                 return last_run.previous_run_summary()
 
@@ -99,6 +109,58 @@ class PreviousRunSummaryTests(unittest.TestCase):
             )
         )
         self.assertEqual(summary["last_error"], "")
+
+    def test_a_quoted_traceback_in_our_own_warning_is_not_a_new_failure(self):
+        summary = self._summary(
+            agent_text=(
+                "2026-09-11 09:00:00,000 [INFO] ppis-agent: AGENT RUN START\n"
+                "2026-09-11 09:00:01,000 [WARNING] ppis-agent: Previous run "
+                "ended at 08:00 with exit code 1: Traceback (most recent "
+                "call last) | ValueError: boom\n"
+            )
+        )
+        self.assertEqual(summary["last_error"], "")
+
+    def test_a_run_that_died_before_logging_keeps_the_older_error_out(self):
+        older = (
+            "2026-09-11 08:00:00,000 [INFO] ppis-agent: AGENT RUN START\n"
+            "2026-09-11 08:00:10,000 [ERROR] ppis-agent: camera gone\n"
+        )
+        summary = self._summary(
+            agent_text=older,
+            wrapper_text=(
+                "[11/09/2026 08:30:44] Agent stopped (exit code: 42). "
+                "Restarting in 10 seconds...\n"
+            ),
+            boundary=len(older.encode("utf-8")),
+        )
+        self.assertEqual(summary["exit_code"], "42")
+        self.assertEqual(summary["last_error"], "")
+
+    def test_a_boundary_past_a_rotated_log_is_ignored(self):
+        summary = self._summary(
+            agent_text=(
+                "2026-09-11 09:00:00,000 [INFO] ppis-agent: AGENT RUN START\n"
+                "2026-09-11 09:00:10,000 [ERROR] ppis-agent: camera gone\n"
+            ),
+            boundary=900000,
+        )
+        self.assertIn("camera gone", summary["last_error"])
+
+    def test_a_run_records_where_its_own_log_begins(self):
+        with TemporaryDirectory() as folder:
+            agent_log = Path(folder) / "campus_agent.log"
+            boundary_file = Path(folder) / "run_boundary.txt"
+            agent_log.write_text("an earlier run\n", encoding="utf-8")
+            with (
+                patch.object(last_run, "AGENT_LOG", agent_log),
+                patch.object(last_run, "RUN_BOUNDARY", boundary_file),
+            ):
+                last_run.mark_run_start()
+                self.assertEqual(
+                    boundary_file.read_text(encoding="utf-8"),
+                    str(agent_log.stat().st_size),
+                )
 
     def test_campus_paths_and_secrets_are_not_carried_to_the_cloud(self):
         summary = self._summary(
