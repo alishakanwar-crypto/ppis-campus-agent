@@ -92,6 +92,8 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import agent_auth
+
 # --- dlib/numpy ABI compatibility check ---
 # dlib compiled against numpy 1.x rejects numpy 2.x arrays with
 # "Unsupported image type, must be 8bit gray or RGB image."
@@ -167,13 +169,25 @@ SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 SNAPSHOT_DIR.mkdir(exist_ok=True)
 
 
+_config_refused = False
+
+
 async def fetch_config_from_cloud() -> dict | None:
     """Fetch full config from the cloud-hosted SQLite database.
     Returns None if cloud is unreachable."""
     url = f"{CLOUD_API_BASE}/api/agent-config/full"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, headers=agent_auth.secret_headers())
+            global _config_refused
+            _config_refused = resp.status_code in (401, 403)
+            if _config_refused:
+                logger.error(
+                    "Cloud refused our key for config (%s); running on the "
+                    "cached config.json, so recorder and camera changes will "
+                    "not reach this PC.",
+                    resp.status_code,
+                )
             if resp.status_code == 200:
                 data = resp.json()
                 logger.info(
@@ -202,7 +216,7 @@ def load_config_local() -> dict:
             )
     return {
         "cloud_bot_url": "wss://ppis-whatsapp-bot.fly.dev/ws/agent",
-        "agent_secret": os.environ.get("AGENT_SECRET", ""),
+        "agent_secret": agent_auth.agent_secret(),
         "dvrs": [],
         "camera_mapping": {},
         "snapshot_dir": "snapshots",
@@ -252,7 +266,7 @@ async def sync_faces_from_cloud() -> int:
 
     Returns the number of faces synced.
     """
-    agent_secret = os.environ.get("AGENT_SECRET", "")
+    agent_secret = agent_auth.agent_secret()
     headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
     try:
         import gc
@@ -415,7 +429,7 @@ async def load_config() -> dict:
         # Merge cloud data into a usable config dict
         cfg = {
             "cloud_bot_url": cloud_cfg.get("cloud_bot_url", "wss://ppis-whatsapp-bot.fly.dev/ws/agent"),
-            "agent_secret": cloud_cfg.get("agent_secret", os.environ.get("AGENT_SECRET", "")),
+            "agent_secret": cloud_cfg.get("agent_secret") or agent_auth.agent_secret(),
             "dvrs": cloud_cfg.get("dvrs", []),
             "camera_mapping": cloud_cfg.get("camera_mapping", {}),
             "local_port": int(cloud_cfg.get("settings", {}).get("local_port", 8897)),
@@ -3911,7 +3925,7 @@ async def websocket_client():
     Receives snapshot requests and sends back images."""
     global ws_connection
     url = config.get("cloud_bot_url", "wss://ppis-whatsapp-bot.fly.dev/ws/agent")
-    secret = config.get("agent_secret", os.environ.get("AGENT_SECRET", ""))
+    secret = config.get("agent_secret") or agent_auth.agent_secret()
 
     ws_backoff = 5
     while True:
@@ -3942,6 +3956,7 @@ async def websocket_client():
                     "code_commit": _running_commit(),
                     "started_at_ist": _process_started_at_ist(),
                     "auto_update": auto_update_state(),
+                    "config_key_refused": _config_refused,
                 }))
 
                 async for message in ws:
@@ -4557,7 +4572,7 @@ async def _auto_start_mood_and_sighting():
             logger.warning("Mood/Sighting auto-start skipped: no DVRs or camera mapping")
             return
 
-        agent_secret = config.get("agent_secret", os.environ.get("AGENT_SECRET", ""))
+        agent_secret = config.get("agent_secret") or agent_auth.agent_secret()
         mood_detector.agent_secret = agent_secret
         sighting_tracker.agent_secret = agent_secret
 
@@ -4973,7 +4988,7 @@ async def save_dvr_config(request: Request):
     # Sync to cloud DB
     cloud_synced = False
     try:
-        agent_secret = os.environ.get("AGENT_SECRET", "")
+        agent_secret = agent_auth.agent_secret()
         headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
@@ -5287,7 +5302,7 @@ async def save_mapping(request: Request):
     # Sync to cloud DB
     cloud_synced = False
     try:
-        agent_secret = os.environ.get("AGENT_SECRET", "")
+        agent_secret = agent_auth.agent_secret()
         headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
@@ -5338,7 +5353,7 @@ async def register_face(
     # Sync to cloud DB
     cloud_synced = False
     try:
-        agent_secret = os.environ.get("AGENT_SECRET", "")
+        agent_secret = agent_auth.agent_secret()
         headers = {"X-Agent-Secret": agent_secret} if agent_secret else {}
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
@@ -5764,7 +5779,7 @@ async def sync_attendance_to_cloud():
         }
 
     api_url = os.environ.get("CLOUD_BOT_URL", "https://ppis-whatsapp-bot.fly.dev")
-    agent_secret = os.environ.get("AGENT_SECRET", "")
+    agent_secret = agent_auth.agent_secret()
     headers = {"Content-Type": "application/json"}
     if agent_secret:
         headers["X-Agent-Secret"] = agent_secret

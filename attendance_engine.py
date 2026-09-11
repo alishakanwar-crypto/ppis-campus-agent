@@ -76,6 +76,7 @@ def _check_insightface_available():
     except Exception:
         return False
 
+import agent_auth
 import database as db
 import face_db
 
@@ -1965,7 +1966,7 @@ class AttendanceEngine:
         face snapshot image header.
         """
         api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
-        agent_secret = os.environ.get("AGENT_SECRET", "")
+        agent_secret = agent_auth.agent_secret()
         headers = {"Content-Type": "application/json"}
         if agent_secret:
             headers["X-Agent-Secret"] = agent_secret
@@ -2157,7 +2158,7 @@ class AttendanceEngine:
             return ""
 
         api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
-        agent_secret = os.environ.get("AGENT_SECRET", "")
+        agent_secret = agent_auth.agent_secret()
         headers = {"Content-Type": "application/json"}
         if agent_secret:
             headers["X-Agent-Secret"] = agent_secret
@@ -2273,7 +2274,7 @@ class AttendanceEngine:
         self, record: dict, parent_phones: str
     ):
         api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
-        agent_secret = os.environ.get("AGENT_SECRET", "")
+        agent_secret = agent_auth.agent_secret()
         headers = {"Content-Type": "application/json"}
         if agent_secret:
             headers["X-Agent-Secret"] = agent_secret
@@ -2394,7 +2395,7 @@ class AttendanceEngine:
         if not self._admin_phones:
             return
         api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
-        agent_secret = os.environ.get("AGENT_SECRET", "")
+        agent_secret = agent_auth.agent_secret()
         headers = {}
         if agent_secret:
             headers["X-Agent-Secret"] = agent_secret
@@ -2507,7 +2508,7 @@ class AttendanceEngine:
             }
             api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
             headers = {}
-            agent_secret = os.environ.get("AGENT_SECRET", "")
+            agent_secret = agent_auth.agent_secret()
             if agent_secret:
                 headers["X-Agent-Secret"] = agent_secret
             async with httpx.AsyncClient(timeout=15) as client:
