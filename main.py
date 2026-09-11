@@ -127,6 +127,7 @@ _ensure_dlib_compat()
 
 from attendance_engine import engine as attendance_engine
 import face_db
+import last_run
 import recorder_auth
 from mood_detector import MoodDetector
 from teacher_sighting import TeacherSightingTracker
@@ -142,6 +143,10 @@ except ImportError:
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _LOG_FILE = Path(__file__).parent / "campus_agent.log"
 
+# Read before this process writes a line of its own, so the tail belongs to
+# the run that died rather than to this one.
+_PREVIOUS_RUN = last_run.previous_run_summary()
+
 logging.basicConfig(
     level=logging.INFO,
     format=_LOG_FORMAT,
@@ -153,6 +158,14 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("ppis-agent")
+
+if _PREVIOUS_RUN.get("last_error") or _PREVIOUS_RUN.get("exit_code"):
+    logger.warning(
+        "Previous run ended at %s with exit code %s: %s",
+        _PREVIOUS_RUN.get("ended_at") or "unknown",
+        _PREVIOUS_RUN.get("exit_code") or "unknown",
+        _PREVIOUS_RUN.get("last_error") or "nothing said",
+    )
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -3978,6 +3991,7 @@ async def websocket_client():
                     "code_commit": _running_commit(),
                     "started_at_ist": _process_started_at_ist(),
                     "auto_update": auto_update_state(),
+                    "previous_run": _PREVIOUS_RUN,
                 }))
 
                 async for message in ws:
