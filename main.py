@@ -3823,9 +3823,36 @@ def _note_ws_rebuilt() -> None:
     _ws_disconnected_since = 0.0
 
 
+def _link_liveness(ws: object) -> tuple[bool | None, str]:
+    """Whether a socket is open, and how that was decided.
+
+    The websockets library moved this three times: `.open` on the old client,
+    `.closed` in between, and `.state` now. A library newer than the pinned
+    one therefore has no `.open`, and reading it as False would make the
+    watchdog tear down a perfectly good link every minute and finally exit
+    the agent, which is exactly what an unseen agent looks like from the
+    cloud. So ask in the order the library offers, and say which answer was
+    used instead of assuming the worst.
+    """
+    if ws is None:
+        return False, "no socket"
+    state = getattr(ws, "state", None)
+    if state is not None and hasattr(state, "name"):
+        return state.name == "OPEN", f"state={state.name}"
+    if hasattr(ws, "open"):
+        return bool(ws.open), "open"
+    closed = getattr(ws, "closed", None)
+    if closed is not None:
+        return not closed, "closed"
+    # A socket we hold but cannot read: treated as up, because tearing down a
+    # working link costs parents their photos and the cloud's own view of us
+    # still forces a rebuild when it really is gone.
+    return None, "unreadable"
+
+
 def _ws_looks_connected() -> bool:
-    ws = ws_connection
-    return ws is not None and getattr(ws, "open", False)
+    live, _basis = _link_liveness(ws_connection)
+    return live is not False
 
 
 def ws_link_health() -> dict:
@@ -3835,8 +3862,10 @@ def ws_link_health() -> dict:
         if _ws_last_activity
         else None
     )
+    live, basis = _link_liveness(ws_connection)
     return {
-        "connected": _ws_looks_connected(),
+        "connected": live is not False,
+        "liveness_basis": basis,
         "silent_seconds": silent_for,
         "recycles": _ws_recycles,
         "offline_seconds": (
@@ -3844,6 +3873,7 @@ def ws_link_health() -> dict:
             if _ws_offline_since
             else 0.0
         ),
+        "library_version": getattr(websockets, "__version__", ""),
     }
 
 
@@ -3992,6 +4022,7 @@ async def websocket_client():
                     "started_at_ist": _process_started_at_ist(),
                     "auto_update": auto_update_state(),
                     "previous_run": _PREVIOUS_RUN,
+                    "ws_link": ws_link_health(),
                 }))
 
                 async for message in ws:
@@ -4017,6 +4048,7 @@ async def websocket_client():
                                 "camera_health": camera_snapshot_health(),
                                 "agent_lag": event_loop_lag_health(),
                                 "auto_update": auto_update_state(),
+                                "ws_link": ws_link_health(),
                             }))
 
                         elif msg_type == "test_connection":
@@ -4990,7 +5022,7 @@ async def get_config():
         "camera_mapping": config.get("camera_mapping", {}),
         "cloud_bot_url": config.get("cloud_bot_url", ""),
         "config_source": "cloud" if config.get("_from_cloud") else "local",
-        "ws_connected": ws_connection is not None and ws_connection.open if ws_connection else False,
+        "ws_connected": _ws_looks_connected(),
         "ws_link": ws_link_health(),
     }
 
