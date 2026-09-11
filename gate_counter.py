@@ -71,6 +71,7 @@ import cv2
 import httpx
 import numpy as np
 
+import agent_auth
 import recorder_auth
 from gate_intelligence import GateIntelligenceConfig, GateIntelligenceMonitor
 from process_priority import set_windows_process_priority
@@ -2326,7 +2327,7 @@ def _save_cpplus_replay_state(state: dict[str, dict]) -> None:
 
 
 def _agent_secret_headers() -> dict[str, str]:
-    secret = os.environ.get("AGENT_SECRET", "")
+    secret = agent_auth.agent_secret()
     if not secret:
         try:
             config = json.loads(
