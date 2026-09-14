@@ -60,6 +60,7 @@ def _check_insightface_available():
         return False
 
 import database as db
+import face_native
 
 logger = logging.getLogger("ppis-agent.face_db")
 
@@ -105,7 +106,7 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
                     f.write(image_bytes)
                     tmp_path = f.name
-                img_array = face_recognition.load_image_file(tmp_path)
+                img_array = face_native.load_image_file(tmp_path)
             finally:
                 if tmp_path:
                     Path(tmp_path).unlink(missing_ok=True)
@@ -113,7 +114,7 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
         logger.error(f"Failed to load image: {e}")
         return None
     logger.info(f"Image ready: shape={img_array.shape}, dtype={img_array.dtype}")
-    face_locations = face_recognition.face_locations(img_array, model="hog")
+    face_locations = face_native.face_locations(img_array, model="hog")
     logger.info(f"face_locations found: {len(face_locations)}")
 
     if not face_locations:
@@ -128,7 +129,7 @@ def encode_face_from_image(image_bytes: bytes) -> tuple[np.ndarray, bytes] | Non
             reverse=True,
         )
 
-    encodings = face_recognition.face_encodings(img_array, [face_locations[0]])
+    encodings = face_native.face_encodings(img_array, [face_locations[0]])
     if not encodings:
         logger.warning("Could not compute face encoding")
         return None
@@ -202,7 +203,7 @@ def encode_face_insightface(image_bytes: bytes) -> tuple[np.ndarray, bytes] | No
         logger.error(f"Failed to load image for InsightFace: {e}")
         return None
 
-    faces = app.get(img_bgr)
+    faces = face_native.insight_get(app, img_bgr)
     if not faces:
         logger.warning("InsightFace: No face detected in image")
         return None

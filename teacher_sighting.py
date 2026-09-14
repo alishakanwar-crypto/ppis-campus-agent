@@ -39,6 +39,7 @@ except ImportError:
     face_recognition = None
 
 import face_db
+import face_native
 
 logger = logging.getLogger("ppis-agent.sighting")
 
@@ -278,7 +279,7 @@ class TeacherSightingTracker:
         try:
             # number_of_times_to_upsample=2 helps detect smaller/distant faces
             # on DVR cameras where subjects are far from the camera
-            face_locations = face_recognition.face_locations(
+            face_locations = face_native.face_locations(
                 img_array, model="hog", number_of_times_to_upsample=2)
         except Exception:
             return img_array, [], []
@@ -287,7 +288,7 @@ class TeacherSightingTracker:
             return img_array, [], []
 
         try:
-            face_encodings = face_recognition.face_encodings(img_array, face_locations)
+            face_encodings = face_native.face_encodings(img_array, face_locations)
         except Exception:
             return img_array, face_locations, []
 
