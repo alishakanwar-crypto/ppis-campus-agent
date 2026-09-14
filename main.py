@@ -94,6 +94,15 @@ from fastapi.staticfiles import StaticFiles
 
 import agent_auth
 
+import last_run
+
+# Read what the run that died said, and record where this run's own log
+# begins, both before the checks and imports below that can end the process:
+# a run that exits before its first log line must still be told apart from
+# the run before it.
+_PREVIOUS_RUN = last_run.previous_run_summary()
+last_run.mark_run_start()
+
 # --- dlib/numpy ABI compatibility check ---
 # dlib compiled against numpy 1.x rejects numpy 2.x arrays with
 # "Unsupported image type, must be 8bit gray or RGB image."
@@ -129,7 +138,6 @@ _ensure_dlib_compat()
 
 from attendance_engine import engine as attendance_engine
 import face_db
-import last_run
 import recorder_auth
 from mood_detector import MoodDetector
 from teacher_sighting import TeacherSightingTracker
@@ -144,10 +152,6 @@ except ImportError:
 
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _LOG_FILE = Path(__file__).parent / "campus_agent.log"
-
-# Read before this process writes a line of its own, so the tail belongs to
-# the run that died rather than to this one.
-_PREVIOUS_RUN = last_run.previous_run_summary()
 
 logging.basicConfig(
     level=logging.INFO,

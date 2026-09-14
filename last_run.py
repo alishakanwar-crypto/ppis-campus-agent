@@ -19,6 +19,10 @@ WRAPPER_LOG = _HERE / "wrapper_campus.log"
 # The wrapper caps its log at 500 lines and moves the rest here, which can
 # happen between the exit it recorded and the process that reads it.
 WRAPPER_LOG_OLD = _HERE / "wrapper_campus.log.old"
+# Where this process found the agent log when it started, written before
+# anything that can end the process, so a run that dies before it logs a
+# single line still leaves a boundary behind it.
+RUN_BOUNDARY = _HERE / "run_boundary.txt"
 
 # Enough of the tail to hold a traceback and the lines around it, and small
 # enough to read on a machine that is already busy starting up.
@@ -37,6 +41,9 @@ _TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 _FAILURE_LINE = re.compile(
     r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)? \[(?:ERROR|CRITICAL)\]"
 )
+# A real traceback begins its own line. The startup warning that quotes one
+# carries it after the log prefix, and must not be read as a new failure.
+_TRACEBACK_LINE = re.compile(r"^\s*Traceback \(most recent call last\)")
 # Written by the agent as its first line, so the tail can be cut to the run
 # that died instead of reaching back into runs before it.
 RUN_START_MARKER = "AGENT RUN START"
@@ -71,6 +78,53 @@ def _scrub(text: str) -> str:
     return text.strip()[:_MAX_REASON_CHARS]
 
 
+def _boundary_offset() -> int | None:
+    """The byte at which the run that just died began writing."""
+    try:
+        return int(RUN_BOUNDARY.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _lines_from(path: Path, offset: int) -> list[str] | None:
+    """The log from that byte on, or None if the file has moved since."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            if offset < 0 or offset > size:
+                return None
+            handle.seek(max(offset, size - _TAIL_BYTES))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    return text.splitlines()
+
+
+def mark_run_start() -> None:
+    """Record where this run's own log begins, for whoever replaces it.
+
+    This runs before the imports and checks that can end the process, since a
+    run that exits before its first log line still has to be told apart from
+    the run before it.
+    """
+    try:
+        size = AGENT_LOG.stat().st_size if AGENT_LOG.exists() else 0
+        RUN_BOUNDARY.write_text(str(size), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _agent_lines() -> list[str]:
+    """What the run that just died wrote, and nothing from before it."""
+    offset = _boundary_offset()
+    if offset is not None:
+        lines = _lines_from(AGENT_LOG, offset)
+        if lines is not None:
+            return lines
+    return _previous_run_lines(_tail(AGENT_LOG))
+
+
 def _previous_run_lines(lines: list[str]) -> list[str]:
     """Only what the run that just died said.
 
@@ -87,10 +141,7 @@ def _last_failure(lines: list[str]) -> str:
     """The last thing the previous run said that could explain its end."""
     for index in range(len(lines) - 1, -1, -1):
         line = lines[index]
-        if (
-            "Traceback (most recent call last)" in line
-            or _FAILURE_LINE.match(line)
-        ):
+        if _TRACEBACK_LINE.match(line) or _FAILURE_LINE.match(line):
             return _scrub(" | ".join(lines[index:index + 6]))
     return ""
 
@@ -109,7 +160,7 @@ def previous_run_summary() -> dict:
     """When the last run stopped, how it exited and what it said last."""
     summary = {"ended_at": "", "exit_code": "", "last_error": ""}
     try:
-        agent_lines = _previous_run_lines(_tail(AGENT_LOG))
+        agent_lines = _agent_lines()
         summary["last_error"] = _last_failure(agent_lines)
         ended_at, exit_code = _wrapper_exit()
         summary["exit_code"] = exit_code
