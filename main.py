@@ -993,6 +993,17 @@ _auto_update_state: dict[str, str] = {
 }
 
 
+def _fetched_update_commit() -> str:
+    """The merged commit already on this disk we are not running, '' if none."""
+    remote = _git("rev-parse", "--short", "refs/remotes/origin/main")
+    local = _git("rev-parse", "--short", "HEAD")
+    if remote:
+        _auto_update_state["origin_commit"] = remote
+    if not remote or not local or remote == local:
+        return ""
+    return remote
+
+
 def _pending_update_commit() -> str:
     """The commit on origin/main we are not running yet, '' when current."""
     try:
@@ -1024,14 +1035,13 @@ def _pending_update_commit() -> str:
             "Cannot reach GitHub to check for merged fixes: %s",
             _auto_update_state["last_error"],
         )
-        return ""
+        # An earlier fetch may already have brought the merged code onto this
+        # disk, and the campus line drops often enough that refusing to look
+        # kept the agent on old code for hours with the fix sitting in
+        # origin/main. The error still stands in health.
+        return _fetched_update_commit()
     _auto_update_state["last_error"] = ""
-    remote = _git("rev-parse", "--short", "origin/main")
-    local = _git("rev-parse", "--short", "HEAD")
-    _auto_update_state["origin_commit"] = remote
-    if not remote or not local or remote == local:
-        return ""
-    return remote
+    return _fetched_update_commit()
 
 
 _LOCKED_FILE_PATTERN = re.compile(r"unable to unlink old '([^']+)'")
@@ -1095,6 +1105,11 @@ def _pull_merged_code(commit: str) -> str:
         ("reset", "--hard", "refs/remotes/origin/main", "--"),
     )
     for args in steps:
+        # The fetch here is the second one for the same commit, and the campus
+        # line drops mid-fetch often enough that treating that as fatal kept a
+        # fix already sitting in origin/main from ever being taken. Only the
+        # reset has to succeed; the HEAD check below is the real proof.
+        optional = args[0] == "fetch"
         for attempt in (0, 1):
             try:
                 done = subprocess.run(
@@ -1106,12 +1121,24 @@ def _pull_merged_code(commit: str) -> str:
                     check=False,
                 )
             except Exception as exc:
+                if optional:
+                    logger.warning(
+                        "git fetch crashed before taking %s: %s",
+                        commit, _exception_text(exc),
+                    )
+                    break
                 return f"git {args[0]} failed: {_exception_text(exc)}"
             if done.returncode == 0:
                 break
             said = (done.stderr or done.stdout).strip()
             if attempt == 0 and _release_locked_paths(said):
                 continue
+            if optional:
+                logger.warning(
+                    "git fetch failed before taking %s, using what is already "
+                    "on this disk: %s", commit, said[:200],
+                )
+                break
             return f"git {args[0]} failed: {said[:200] or done.returncode}"
     after = _git("rev-parse", "--short", "HEAD")
     if not after or after == before:
