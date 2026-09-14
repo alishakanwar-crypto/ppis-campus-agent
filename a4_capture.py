@@ -29,6 +29,8 @@ try:
 except ImportError:
     Image = None
 
+import face_native
+
 try:
     import face_recognition
 except ImportError:
@@ -335,7 +337,7 @@ async def capture_and_register(
             continue
 
         # Face detection
-        face_locations = face_recognition.face_locations(
+        face_locations = face_native.face_locations(
             img_array, number_of_times_to_upsample=2, model="hog"
         )
 
@@ -345,7 +347,7 @@ async def capture_and_register(
             continue  # Skip frames with multiple faces
 
         if len(face_locations) == 1:
-            encodings = face_recognition.face_encodings(img_array, face_locations)
+            encodings = face_native.face_encodings(img_array, face_locations)
             if encodings:
                 # Measure face quality by size (larger = better)
                 top, right, bottom, left = face_locations[0]
