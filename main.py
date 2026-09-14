@@ -4773,7 +4773,12 @@ async def _health_watchdog():
         await asyncio.sleep(60)
         try:
             # --- Check 1: Classwise monitoring alive ---
-            if attendance_engine._health.get("auto_start_enabled", True):
+            # Not while parents-only mode is holding face work back: restarting
+            # the scan here would walk straight back into the crash loop the
+            # mode exists to break.
+            if attendance_engine._health.get(
+                "auto_start_enabled", True
+            ) and not _BACKGROUND_FACE_WORK_PAUSED:
                 if not attendance_engine.classwise_running and not attendance_engine.running:
                     dvrs = config.get("dvrs", [])
                     camera_mapping = config.get("camera_mapping", {})
@@ -4801,7 +4806,7 @@ async def _health_watchdog():
 
             # --- Check 3: Periodic face sync from cloud (every 5 min) ---
             face_sync_counter += 1
-            if face_sync_counter >= 5:
+            if face_sync_counter >= 5 and not _BACKGROUND_FACE_WORK_PAUSED:
                 face_sync_counter = 0
                 synced = await sync_faces_from_cloud()
                 if synced > 0:
@@ -4989,12 +4994,18 @@ async def lifespan(app: FastAPI):
     cleanup_junk_face_entries()
 
     # Sync face registrations from cloud DB (downloads images, computes encodings)
-    logger.info("Starting face sync from cloud...")
-    try:
-        await sync_faces_from_cloud()
-        logger.info("Face sync completed successfully")
-    except Exception as e:
-        logger.error(f"Face sync crashed during startup (non-fatal): {e}", exc_info=True)
+    if _BACKGROUND_FACE_WORK_PAUSED:
+        logger.warning(
+            "Face sync skipped: it encodes faces in native code, and this run "
+            "serves parents only after a native crash"
+        )
+    else:
+        logger.info("Starting face sync from cloud...")
+        try:
+            await sync_faces_from_cloud()
+            logger.info("Face sync completed successfully")
+        except Exception as e:
+            logger.error(f"Face sync crashed during startup (non-fatal): {e}", exc_info=True)
     # Pre-load registered faces into attendance engine
     logger.info("Loading face encodings into attendance engine...")
     try:
