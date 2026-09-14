@@ -95,6 +95,7 @@ from fastapi.staticfiles import StaticFiles
 import agent_auth
 
 import last_run
+import native_crash
 
 # Read what the run that died said, and record where this run's own log
 # begins, both before the checks and imports below that can end the process:
@@ -102,6 +103,15 @@ import last_run
 # the run before it.
 _PREVIOUS_RUN = last_run.previous_run_summary()
 last_run.mark_run_start()
+
+# A run that follows a native crash serves parents only, so a crash loop
+# cannot keep the campus without an agent.
+_NATIVE_CRASH_STREAK = native_crash.note_previous_exit(
+    _PREVIOUS_RUN.get("exit_code", "")
+)
+_BACKGROUND_FACE_WORK_PAUSED = native_crash.background_face_work_paused(
+    _NATIVE_CRASH_STREAK
+)
 
 # --- dlib/numpy ABI compatibility check ---
 # dlib compiled against numpy 1.x rejects numpy 2.x arrays with
@@ -175,6 +185,13 @@ if _PREVIOUS_RUN.get("last_error") or _PREVIOUS_RUN.get("exit_code"):
         _PREVIOUS_RUN.get("ended_at") or "unknown",
         _PREVIOUS_RUN.get("exit_code") or "unknown",
         _PREVIOUS_RUN.get("last_error") or "nothing said",
+    )
+
+if _BACKGROUND_FACE_WORK_PAUSED:
+    logger.warning(
+        "Windows killed the last %d runs outright; starting without the "
+        "background face work so parent snapshots keep being served",
+        _NATIVE_CRASH_STREAK,
     )
 
 # ---------------------------------------------------------------------------
@@ -4045,6 +4062,8 @@ async def websocket_client():
                     "auto_update": auto_update_state(),
                     "config_key_refused": _config_refused,
                     "previous_run": _PREVIOUS_RUN,
+                    "face_work_paused": _BACKGROUND_FACE_WORK_PAUSED,
+                    "native_crash_streak": _NATIVE_CRASH_STREAK,
                     "ws_link": ws_link_health(),
                 }))
 
@@ -4623,6 +4642,12 @@ async def _auto_start_classwise():
     """
     try:
         await asyncio.sleep(10)  # Let other startup tasks finish
+        if _BACKGROUND_FACE_WORK_PAUSED:
+            logger.warning(
+                "Auto-start skipped: holding the classwise scan back after "
+                "a native crash"
+            )
+            return
         if attendance_engine.classwise_running or attendance_engine.running:
             logger.info("Monitoring already active — skipping auto-start")
             return
@@ -4651,10 +4676,34 @@ async def _auto_start_classwise():
         logger.error(f"AUTO-START FAILED: {e}", exc_info=True)
 
 
+async def _clear_crash_streak_when_stable():
+    """Let the background face work return after a run that held together."""
+    try:
+        await asyncio.sleep(native_crash.STABLE_AFTER_SECONDS)
+        native_crash.mark_stable()
+        if _BACKGROUND_FACE_WORK_PAUSED:
+            logger.info(
+                "This run has held for %d minutes; background face work "
+                "resumes on the next start",
+                native_crash.STABLE_AFTER_SECONDS // 60,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not clear the crash count: %s", e)
+
+
 async def _auto_start_mood_and_sighting():
     """Auto-start mood detection and teacher sighting tracker after delay."""
     try:
         await asyncio.sleep(15)  # Let face sync and classwise start first
+
+        if _BACKGROUND_FACE_WORK_PAUSED:
+            logger.warning(
+                "Mood/Sighting auto-start skipped: holding face work back "
+                "after a native crash"
+            )
+            return
 
         dvrs = config.get("dvrs", [])
         camera_mapping = config.get("camera_mapping", {})
@@ -4954,6 +5003,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Face reload crashed during startup (non-fatal): {e}", exc_info=True)
 
+    # Once this run has lasted, the next one need hold nothing back.
+    asyncio.create_task(_clear_crash_streak_when_stable())
     # Auto-start classwise monitoring after brief delay (24/7 always-on)
     asyncio.create_task(_auto_start_classwise())
     # Auto-start mood detection and teacher sighting after delay

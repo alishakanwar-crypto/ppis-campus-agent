@@ -79,6 +79,7 @@ def _check_insightface_available():
 import agent_auth
 import database as db
 import face_db
+import face_native
 
 logger = logging.getLogger("ppis-agent.attendance")
 
@@ -942,7 +943,8 @@ class AttendanceEngine:
         try:
             import dlib as _dlib
             _detector = _dlib.get_frontal_face_detector()
-            dlib_dets = _detector(img_array, 2)
+            with face_native.NATIVE_LOCK:
+                dlib_dets = _detector(img_array, 2)
             # Convert dlib rectangles to face_recognition format (top, right, bottom, left)
             face_locations = [
                 (d.top(), d.right(), d.bottom(), d.left()) for d in dlib_dets
@@ -955,7 +957,8 @@ class AttendanceEngine:
                 else:
                     gray = np.mean(img_array, axis=2).astype(np.uint8)
                 gray = np.ascontiguousarray(gray)
-                dlib_dets = _detector(gray, 2)
+                with face_native.NATIVE_LOCK:
+                    dlib_dets = _detector(gray, 2)
                 face_locations = [
                     (d.top(), d.right(), d.bottom(), d.left()) for d in dlib_dets
                 ]
@@ -974,7 +977,7 @@ class AttendanceEngine:
         self.add_debug_log("face_detected",
                            f"{len(face_locations)} face(s) detected from {camera_source} [legacy fallback]")
 
-        face_encodings = face_recognition.face_encodings(img_array, face_locations)
+        face_encodings = face_native.face_encodings(img_array, face_locations)
 
         # Release the large image array to free memory
         del img_array
@@ -1200,7 +1203,7 @@ class AttendanceEngine:
             self.add_debug_log("error", f"Failed to load image for InsightFace: {e}")
             return []
 
-        detected = self._insightface_app.get(img_bgr)
+        detected = face_native.insight_get(self._insightface_app, img_bgr)
         if not detected:
             if not self.classwise_running:
                 self.add_debug_log("no_face_detected",
@@ -1375,7 +1378,7 @@ class AttendanceEngine:
             x2, y2 = min(w, x2), min(h, y2)
             # face_recognition uses (top, right, bottom, left) format
             face_loc = [(y1, x2, y2, x1)]
-            encodings = face_recognition.face_encodings(safe_img, face_loc)
+            encodings = face_native.face_encodings(safe_img, face_loc)
             if not encodings:
                 return None
             return self._match_face(encodings[0], legacy_faces)

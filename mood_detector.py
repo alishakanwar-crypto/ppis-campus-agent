@@ -39,6 +39,7 @@ except ImportError:
     face_recognition = None
 
 import face_db
+import face_native
 
 logger = logging.getLogger("ppis-agent.mood")
 
@@ -282,7 +283,7 @@ class MoodDetector:
             return []
 
         try:
-            face_locations = face_recognition.face_locations(img_array, model="hog")
+            face_locations = face_native.face_locations(img_array, model="hog")
         except Exception:
             return []
 
@@ -290,7 +291,7 @@ class MoodDetector:
             return []
 
         try:
-            face_encodings = face_recognition.face_encodings(img_array, face_locations)
+            face_encodings = face_native.face_encodings(img_array, face_locations)
         except Exception:
             return []
 
