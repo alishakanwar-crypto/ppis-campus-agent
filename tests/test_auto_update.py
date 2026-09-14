@@ -55,13 +55,26 @@ class PendingUpdateTests(unittest.TestCase):
             main.subprocess,
             "run",
             return_value=_Fetch(128, "fatal: could not read Username"),
-        ), patch.object(main, "_git") as git:
+        ), patch.object(main, "_git", side_effect=["abc1234", "abc1234"]):
             self.assertEqual(main._pending_update_commit(), "")
 
-        git.assert_not_called()
         state = main.auto_update_state()
         self.assertIn("could not read Username", state["last_error"])
         self.assertTrue(state["checked_at_ist"].endswith("IST"))
+
+    def test_a_dropped_fetch_still_takes_code_already_on_this_disk(self):
+        """The campus line drops mid-fetch, and a fix already sitting in
+        origin/main from an earlier fetch must not wait for a clean one."""
+        with patch.object(
+            main.subprocess,
+            "run",
+            return_value=_Fetch(128, "Recv failure: Connection was reset"),
+        ), patch.object(main, "_git", side_effect=["def5678", "abc1234"]):
+            self.assertEqual(main._pending_update_commit(), "def5678")
+
+        state = main.auto_update_state()
+        self.assertIn("Connection was reset", state["last_error"])
+        self.assertEqual(state["origin_commit"], "def5678")
 
     def test_a_crashed_fetch_is_reported_too(self):
         with patch.object(
@@ -101,6 +114,24 @@ class PullMergedCodeTests(unittest.TestCase):
                     "refs/remotes/origin/main", "--",
                 ],
             ],
+        )
+
+    def test_a_dropped_fetch_does_not_stop_the_reset(self):
+        with patch.object(
+            main.subprocess,
+            "run",
+            side_effect=[
+                _Fetch(128, "Recv failure: Connection was reset"),
+                _Fetch(),
+            ],
+        ) as run, patch.object(
+            main, "_git", side_effect=["old1234", "new1234"]
+        ):
+            self.assertEqual(main._pull_merged_code("new1234"), "")
+
+        self.assertEqual(
+            run.call_args_list[-1].args[0],
+            ["git", "reset", "--hard", "refs/remotes/origin/main", "--"],
         )
 
     def test_a_checkout_that_did_not_move_is_reported_as_a_failure(self):
