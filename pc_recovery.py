@@ -162,6 +162,39 @@ def _install_system_watchdog() -> bool:
     return bool(after.get("exists")) and not after.get("needs_logon")
 
 
+def _install_system_nightly() -> bool:
+    """Register the 03:00 IST nightly refresh as SYSTEM, so it runs with
+    nobody logged on.
+
+    nightly_restart.bat already knows when it is SYSTEM and then starts the
+    campus agent alone, because TrueFace's Chrome and the gate counter's native
+    window cannot live in session 0. A nightly refresh bound to a logon simply
+    does not happen on a night when nobody logged in, and the PC then sits on
+    stale code until somebody notices in the morning.
+    """
+    runner = Path(__file__).parent / "nightly_restart.bat"
+    if not runner.exists():
+        return False
+    _run([
+        "schtasks", "/create",
+        "/tn", NIGHTLY_TASK,
+        "/tr", f'cmd.exe /c "{runner}"',
+        "/sc", "daily", "/st", "03:00",
+        "/ru", "SYSTEM", "/rl", "highest", "/f",
+    ])
+    after = _task_state(NIGHTLY_TASK)
+    return bool(after.get("exists")) and not after.get("needs_logon")
+
+
+# The tasks that must never wait for a logon, and how to register each one.
+# The boot task and the ordinary watchdog stay logon-bound on purpose: they
+# start TrueFace and the gate counter, which need a real desktop.
+_LOGON_FREE_INSTALLERS = {
+    SYSTEM_WATCHDOG_TASK: _install_system_watchdog,
+    NIGHTLY_TASK: _install_system_nightly,
+}
+
+
 def _enable(name: str) -> bool:
     """Switch a task back on, and believe only the task's own state after."""
     _run(["schtasks", "/change", "/tn", name, "/enable"])
@@ -213,8 +246,10 @@ def _ran_well(state: dict) -> bool:
 def repair_tasks() -> dict:
     """Read every recovery task, repairing what can be repaired unattended.
 
-    A task that is merely switched off is switched back on, and a logon-free
-    watchdog that is missing or bound to a logon is registered again as SYSTEM.
+    A task that is merely switched off is switched back on, and the two tasks
+    that must not wait for a person - the logon-free watchdog and the nightly
+    refresh - are registered again as SYSTEM when they are missing or bound to
+    a logon.
     """
     report: dict[str, dict] = {}
     for name in TASKS:
@@ -223,22 +258,25 @@ def repair_tasks() -> dict:
         except Exception as exc:
             logger.debug("PC RECOVERY: %s unreadable: %s", name, exc)
             state = {"exists": None, "error": "unreadable"}
-        needs_install = name == SYSTEM_WATCHDOG_TASK and (
+        installer = _LOGON_FREE_INSTALLERS.get(name)
+        needs_install = installer is not None and (
             state.get("exists") is False or state.get("needs_logon")
         )
         if needs_install:
             logger.warning(
-                "PC RECOVERY: no logon-free watchdog; installing it so a "
-                "night-time failure cannot cost a morning of photos"
+                "PC RECOVERY: %s would wait for a logon; registering it as "
+                "SYSTEM so a night-time failure cannot cost a morning of "
+                "photos",
+                name,
             )
-            if _install_system_watchdog():
+            if installer():
                 state = _task_state(name)
                 state["repaired"] = True
             else:
                 logger.warning(
-                    "PC RECOVERY: could not register %s; run "
+                    "PC RECOVERY: could not register %s as SYSTEM; run "
                     "install_autostart.bat as administrator",
-                    SYSTEM_WATCHDOG_TASK,
+                    name,
                 )
         if state.get("exists") and not state.get("enabled", True):
             logger.warning("PC RECOVERY: %s was disabled; re-enabling it", name)
@@ -269,6 +307,12 @@ def pc_recovery_health() -> dict:
         and not system_watchdog.get("needs_logon")
     )
     proven = _ran_well(system_watchdog)
+    nightly = tasks.get(NIGHTLY_TASK, {})
+    nightly_unattended = bool(
+        nightly.get("exists")
+        and nightly.get("enabled")
+        and not nightly.get("needs_logon")
+    )
     health = {
         "boot_at_ist": boot_at_ist(),
         "read_at_ist": _ist(time.time()),
@@ -291,6 +335,9 @@ def pc_recovery_health() -> dict:
         "logon_free_watchdog_last_result": str(
             system_watchdog.get("last_result", "")
         ),
+        # The 03:00 IST refresh is what puts the PC on merged code overnight.
+        # Bound to a logon it is skipped on any night nobody logged in.
+        "nightly_refresh_without_logon": nightly_unattended,
     }
     if not unattended:
         logger.warning(
@@ -307,6 +354,12 @@ def pc_recovery_health() -> dict:
             "it does",
             SYSTEM_WATCHDOG_TASK,
             system_watchdog.get("last_result", "") or "none",
+        )
+    if not nightly_unattended:
+        logger.warning(
+            "PC RECOVERY: the 03:00 IST nightly refresh (%s) would not run "
+            "with nobody logged on; the PC can then sit on stale code",
+            NIGHTLY_TASK,
         )
     if logon_bound:
         logger.info(
