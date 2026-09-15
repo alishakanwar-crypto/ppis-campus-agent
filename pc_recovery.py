@@ -14,19 +14,24 @@ nobody. Nothing here may keep the agent from starting, and no path or account
 name from the campus PC is reported.
 """
 
+import locale
 import logging
 import os
 import re
 import subprocess
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import psutil
 
 logger = logging.getLogger(__name__)
 
-IST = ZoneInfo("Asia/Kolkata")
+# A fixed offset, not a named zone: main.py imports this module before the
+# agent starts, and on a Windows PC without the IANA database a named zone
+# raises at import and then nothing can start the agent at all. IST keeps no
+# daylight saving, so the offset is the whole of it.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # The tasks install_autostart.bat registers. The names are the contract.
 BOOT_TASK = "PPIS Campus Agent"
@@ -54,6 +59,13 @@ _RUNS_WITHOUT_LOGON = {"serviceaccount", "password", "s4u"}
 _LOGON_TYPE = re.compile(r"<LogonType>\s*([A-Za-z0-9]+)\s*</LogonType>")
 _ENABLED = re.compile(r"<Settings>.*?<Enabled>\s*(true|false)\s*</Enabled>", re.S)
 
+# Task Scheduler's way of saying a task has never run: result 267011 and the
+# 30 November 1999 placeholder it prints instead of a time.
+_NEVER_RUN_RESULT = "267011"
+_NEVER_RUN_STAMP = re.compile(r"\b(?:30[-/.]11|11[-/.]30)[-/.]1999\b")
+# 0 is a finished run, 267009 a run still going: both are the task working.
+_RAN_WELL = {"0", "0x0", "267009"}
+
 
 def _ist(stamp: float) -> str:
     return datetime.fromtimestamp(stamp, IST).strftime("%d-%m-%Y %H:%M:%S IST")
@@ -68,12 +80,29 @@ def boot_at_ist() -> str:
         return ""
 
 
+def _decode(raw: bytes) -> str:
+    """schtasks /xml answers in UTF-16; the console pages answer in the OEM
+    codepage. Decoding UTF-16 as a byte codepage leaves a NUL between every
+    letter, and then <LogonType> is never found and a logon-bound task reads
+    as one that needs no logon - the one lie this module must not tell."""
+    if not raw:
+        return ""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff") or raw[1:2] == b"\x00":
+        try:
+            return raw.decode("utf-16", errors="replace")
+        except (UnicodeDecodeError, LookupError):
+            pass
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(locale.getpreferredencoding(False), errors="replace")
+
+
 def _run(args: list[str]) -> str:
     try:
         done = subprocess.run(
             args,
             capture_output=True,
-            text=True,
             timeout=_QUERY_TIMEOUT_SECONDS,
             creationflags=_NO_WINDOW,
         )
@@ -82,12 +111,11 @@ def _run(args: list[str]) -> str:
         return ""
     if done.returncode != 0:
         return ""
-    return done.stdout or ""
+    return _decode(done.stdout or b"")
 
 
 def _task_xml(name: str) -> str:
-    # schtasks writes the XML as UTF-16 text; python decodes it for us, but a
-    # missing task is an error exit and comes back as an empty string.
+    # A missing task is an error exit and comes back as an empty string.
     return _run(["schtasks", "/query", "/tn", name, "/xml", "ONE"])
 
 
@@ -159,6 +187,29 @@ def _task_state(name: str) -> dict:
     return state
 
 
+def _never_ran(state: dict) -> bool:
+    """Whether Task Scheduler says this task has not run even once.
+
+    A task can exist, be enabled and need no logon and still never fire - the
+    SYSTEM watchdog runs wscript in Windows' session 0, where a runner that
+    the desktop accepts can fail silently. Until it has actually run, saying
+    this PC recovers on its own is a guess, and a guess here costs a morning.
+    """
+    result = str(state.get("last_result", "")).strip()
+    if result == _NEVER_RUN_RESULT:
+        return True
+    stamp = str(state.get("last_run", "")).strip()
+    if not stamp or stamp.upper().startswith("N/A"):
+        return True
+    return bool(_NEVER_RUN_STAMP.search(stamp))
+
+
+def _ran_well(state: dict) -> bool:
+    if _never_ran(state):
+        return False
+    return str(state.get("last_result", "")).strip() in _RAN_WELL
+
+
 def repair_tasks() -> dict:
     """Read every recovery task, repairing what can be repaired unattended.
 
@@ -217,8 +268,10 @@ def pc_recovery_health() -> dict:
         and system_watchdog.get("enabled")
         and not system_watchdog.get("needs_logon")
     )
+    proven = _ran_well(system_watchdog)
     health = {
         "boot_at_ist": boot_at_ist(),
+        "read_at_ist": _ist(time.time()),
         "tasks": tasks,
         "tasks_missing": missing,
         "tasks_unreadable": unreadable,
@@ -228,6 +281,16 @@ def pc_recovery_health() -> dict:
         # logged on, only a task that needs no logon can put the campus agent
         # back, and without it a night-time failure costs the whole morning.
         "recovers_without_logon": unattended,
+        # Registered is not the same as working. This says the logon-free
+        # watchdog has actually run and ended well at least once, which is the
+        # only evidence that a night-time failure would really be recovered.
+        "logon_free_watchdog_proven": unattended and proven,
+        "logon_free_watchdog_last_run": str(
+            system_watchdog.get("last_run", "")
+        ),
+        "logon_free_watchdog_last_result": str(
+            system_watchdog.get("last_result", "")
+        ),
     }
     if not unattended:
         logger.warning(
@@ -236,6 +299,14 @@ def pc_recovery_health() -> dict:
             "agent until somebody logs in. Run install_autostart.bat as "
             "administrator.",
             SYSTEM_WATCHDOG_TASK,
+        )
+    if unattended and not proven:
+        logger.warning(
+            "PC RECOVERY: %s is registered and needs no logon but has not "
+            "run yet (last result %s); unattended recovery is unproven until "
+            "it does",
+            SYSTEM_WATCHDOG_TASK,
+            system_watchdog.get("last_result", "") or "none",
         )
     if logon_bound:
         logger.info(
