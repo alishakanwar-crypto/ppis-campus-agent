@@ -16,8 +16,18 @@ class LaunchScriptTests(unittest.TestCase):
 
     def test_restart_retries_trueface_when_missing(self):
         script = _read("restart_all.bat")
-        self.assertIn(":verify_trueface", script)
+        self.assertIn(":retry_trueface", script)
         self.assertIn("run_trueface.bat", script)
+
+    def test_restart_claims_success_only_after_waiting_for_each_agent(self):
+        # A fixed sleep let the script print "all 3 started" while the poller
+        # was still coming up, so a morning went by with no attendance.
+        script = _read("restart_all.bat")
+        for name in ("main.py", "trueface_poller", "gate_counter"):
+            self.assertIn(f'call :wait_for "{name}"', script)
+        retry = script.index("goto check_agents")
+        claim = script.index("[OK] All 3 agents started successfully")
+        self.assertLess(claim, retry)
 
     def test_restart_reruns_itself_from_temp_before_pulling(self):
         script = _read("restart_all.bat")
@@ -38,6 +48,16 @@ class LaunchScriptTests(unittest.TestCase):
         stale_kill = script.index("poller is wedged")
         restart = script.index('if "%NEED_TRUEFACE%"=="1" (')
         self.assertLess(stale_kill, restart)
+
+    def test_watchdog_agent_only_mode_leaves_the_desktop_agents_alone(self):
+        script = _read("watchdog.bat")
+        self.assertIn('if /i "%~1"=="agent-only" set AGENT_ONLY=1', script)
+        # Every TrueFace and gate counter check sits behind the normal mode.
+        for guarded in (
+            'if "%AGENT_ONLY%"=="0" (\n    powershell',
+            'if "%AGENT_ONLY%"=="0" if "%NEED_TRUEFACE%"=="0" (',
+        ):
+            self.assertIn(guarded, script)
 
     def test_autostart_task_starts_every_process(self):
         script = _read("install_autostart.bat")
@@ -65,6 +85,15 @@ class LaunchScriptTests(unittest.TestCase):
         pull = script.index("git reset --hard origin/main")
         self.assertLess(rerun, pull)
         self.assertIn('call "!AGENT_DIR!watchdog.bat"', script)
+
+    def test_nightly_restart_starts_only_the_agent_as_system(self):
+        # TrueFace needs a Chrome window and the gate counter needs native
+        # CP Plus: neither can start in session 0, so under SYSTEM only the
+        # campus agent is started and parents keep their photos.
+        script = _read("nightly_restart.bat")
+        self.assertIn("S-1-5-18", script)
+        self.assertIn("WATCH_MODE=agent-only", script)
+        self.assertIn('call "!AGENT_DIR!watchdog.bat" !WATCH_MODE!', script)
 
     def test_wrapper_takes_over_when_the_mutex_holder_has_gone(self):
         # Exiting on a refused mutex left the campus with no agent at all for

@@ -160,11 +160,29 @@ if !ERRORLEVEL! EQU 0 (
 )
 del "%XMLFILE2%" >nul 2>&1
 
+REM ── Task 3: SYSTEM watchdog for the campus agent alone ────────
+REM The watchdog above runs on an interactive token, so it does nothing while
+REM the PC sits at the login screen — a night-time reboot or crash then left
+REM the campus with no agent until somebody logged on and restarted by hand.
+REM This copy runs as SYSTEM, needs no logon, and starts only the campus
+REM agent, because TrueFace needs a Chrome window and the gate counter needs
+REM native CP Plus, neither of which works outside a logged-on desktop.
+
+echo [4/7] Creating logon-free watchdog for parent photos...
+schtasks /delete /tn "PPIS Campus Agent Watchdog (System)" /f >nul 2>&1
+schtasks /create /tn "PPIS Campus Agent Watchdog (System)" /tr "wscript.exe \"%AGENT_DIR%run_watchdog_agent_only_hidden.vbs\"" /sc minute /mo 5 /ru SYSTEM /rl highest /f >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo       Logon-free watchdog created - runs as SYSTEM every 5 minutes
+) else (
+    echo       WARNING: Could not create the logon-free watchdog
+)
+
 REM ── Remove the legacy startup-folder launcher ──────────────────
 
-echo [4/6] Creating nightly refresh task (03:00 IST)...
+echo [5/7] Creating nightly refresh task (03:00 IST)...
 schtasks /delete /tn "PPIS Nightly Restart" /f >nul 2>&1
-schtasks /create /tn "PPIS Nightly Restart" /tr "cmd.exe /c \"%AGENT_DIR%nightly_restart.bat\"" /sc daily /st 03:00 /rl highest /f >nul 2>&1
+REM Runs as SYSTEM so the refresh happens whether or not anyone is logged on.
+schtasks /create /tn "PPIS Nightly Restart" /tr "cmd.exe /c \"%AGENT_DIR%nightly_restart.bat\"" /sc daily /st 03:00 /ru SYSTEM /rl highest /f >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
     echo       Nightly refresh task created
 ) else (
@@ -181,7 +199,7 @@ echo       Legacy launchers removed
 
 REM ── Verify tasks ───────────────────────────────────────────────
 
-echo [5/6] Verifying installation...
+echo [6/7] Verifying installation...
 echo.
 
 schtasks /query /tn "PPIS Campus Agent" >nul 2>&1
@@ -198,6 +216,13 @@ if !ERRORLEVEL! EQU 0 (
     echo       [!!] Watchdog task:   NOT INSTALLED
 )
 
+schtasks /query /tn "PPIS Campus Agent Watchdog (System)" >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo       [OK] Logon-free watchdog: INSTALLED
+) else (
+    echo       [!!] Logon-free watchdog: NOT INSTALLED
+)
+
 echo       [OK] Startup folder:  DISABLED (single scheduled launcher)
 
 REM Print the real triggers so a botched task definition is visible here.
@@ -206,7 +231,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "foreach ($t in 'PPIS
 REM ── Start the agent NOW ───────────────────────────────────────
 
 echo.
-echo [6/6] Starting the agents now...
+echo [7/7] Starting the agents now...
 REM The watchdog starts every missing process, not just the campus agent, so
 REM boot/logon brings up TrueFace and the gate counter too.
 start "" wscript.exe "%AGENT_DIR%run_watchdog_hidden.vbs"
@@ -222,6 +247,7 @@ echo   Status:    service_status.bat
 echo   Stop:      taskkill /F /IM python.exe
 echo   Uninstall: schtasks /delete /tn "PPIS Campus Agent" /f
 echo              schtasks /delete /tn "PPIS Campus Agent Watchdog" /f
+echo              schtasks /delete /tn "PPIS Campus Agent Watchdog (System)" /f
 echo              del "%STARTUP_DIR%\PPIS Agent.vbs" (already removed)
 echo.
 
