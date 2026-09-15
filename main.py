@@ -96,6 +96,7 @@ import agent_auth
 
 import last_run
 import native_crash
+import pc_recovery
 
 # Read what the run that died said, and record where this run's own log
 # begins, both before the checks and imports below that can end the process:
@@ -3921,6 +3922,23 @@ def _ws_looks_connected() -> bool:
     return live is not False
 
 
+# What Task Scheduler says about this PC's ability to restart its agents,
+# read once at startup because the answer only changes when somebody installs.
+_PC_RECOVERY: dict = {}
+
+
+def _read_pc_recovery() -> None:
+    global _PC_RECOVERY
+    try:
+        _PC_RECOVERY = pc_recovery.pc_recovery_health()
+    except Exception:
+        logger.exception("Could not read this PC's recovery tasks")
+
+
+def pc_recovery_health() -> dict:
+    return dict(_PC_RECOVERY)
+
+
 def ws_link_health() -> dict:
     """What the agent believes about its link to the cloud."""
     silent_for = (
@@ -4092,6 +4110,7 @@ async def websocket_client():
                     "face_work_paused": _BACKGROUND_FACE_WORK_PAUSED,
                     "native_crash_streak": _NATIVE_CRASH_STREAK,
                     "ws_link": ws_link_health(),
+                    "pc_recovery": pc_recovery_health(),
                 }))
 
                 async for message in ws:
@@ -4118,6 +4137,7 @@ async def websocket_client():
                                 "agent_lag": event_loop_lag_health(),
                                 "auto_update": auto_update_state(),
                                 "ws_link": ws_link_health(),
+                                "pc_recovery": pc_recovery_health(),
                             }))
 
                         elif msg_type == "test_connection":
@@ -5072,6 +5092,13 @@ async def lifespan(app: FastAPI):
         args=(threading.get_ident(),),
         daemon=True,
         name="blocked-loop-watch",
+    ).start()
+    # Read whether this PC can restart its own agents. Task Scheduler queries
+    # are slow, so they happen off the loop that serves parents.
+    threading.Thread(
+        target=_read_pc_recovery,
+        daemon=True,
+        name="pc-recovery-read",
     ).start()
     # Measure every camera nightly, so a parent's request is never the probe.
     _load_capture_doors()

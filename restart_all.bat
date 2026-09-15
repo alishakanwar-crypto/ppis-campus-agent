@@ -95,18 +95,21 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8897 ^| findstr LISTENING') 
 )
 timeout /t 3 /nobreak >nul
 
+REM Each agent is waited for by name, not by a fixed sleep: TrueFace opens
+REM Chrome and can take longer than any delay we would dare put here, which
+REM is how a restart printed "all 3 started" with no poller running at all.
 echo   Starting Campus Agent...
 wscript.exe run_hidden.vbs
-timeout /t 20 /nobreak >nul
+call :wait_for "main.py" "Campus Agent" 20
 
 echo   Starting TrueFace Poller...
 wscript.exe run_trueface_hidden.vbs
-timeout /t 10 /nobreak >nul
-call :verify_trueface
+call :wait_for "trueface_poller" "TrueFace Poller" 20
+if !WAITED! NEQ 0 call :retry_trueface
 
 echo   Starting Gate Counter...
 wscript.exe run_gate_counter_hidden.vbs
-timeout /t 10 /nobreak >nul
+call :wait_for "gate_counter" "Gate Counter" 20
 
 REM --- Verify ---
 echo.
@@ -134,6 +137,8 @@ if !STALE! GTR 0 (
 )
 REM Judge by which agents are running, not by the total: an agent is free to
 REM spawn helper processes of its own.
+set "RETRIED=0"
+:check_agents
 set "MISSING="
 REM Only python processes count: every other process list includes this very
 REM command line, whose own text names all three agents, so an unfiltered
@@ -147,10 +152,21 @@ for /f %%a in ('powershell.exe -NoProfile -Command "$c = (Get-CimInstance Win32_
 )
 if "!MISSING!"=="" (
     echo   [OK] All 3 agents started successfully!
-) else (
-    echo   [WARNING] Not running:!MISSING!
-    echo   Check the logs for the missing agent.
+    goto verified
 )
+REM Start whichever agent is missing once more and look again: only then may
+REM this script say anything about what is running.
+if "!RETRIED!"=="0" (
+    set "RETRIED=1"
+    echo   Not running:!MISSING! - starting again...
+    echo !MISSING! | find "Campus Agent" >nul && wscript.exe run_hidden.vbs
+    echo !MISSING! | find "TrueFace Poller" >nul && call :retry_trueface
+    echo !MISSING! | find "Gate Counter" >nul && wscript.exe run_gate_counter_hidden.vbs
+    timeout /t 20 /nobreak >nul
+    goto check_agents
+)
+echo   [WARNING] Not running:!MISSING!
+echo   Check the logs for the missing agent.
 :verified
 echo.
 echo ========================================================
@@ -165,12 +181,30 @@ set "PYCOUNT=0"
 for /f %%a in ('powershell.exe -NoProfile -Command "@(Get-Process python,py,pythonw -ErrorAction SilentlyContinue).Count"') do set PYCOUNT=%%a
 exit /b 0
 
-REM --- Retry the TrueFace poller once, visibly, if it did not come up ---
-:verify_trueface
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'trueface_poller' }; if ($p) { exit 0 } else { exit 1 }" >nul 2>&1
-if !ERRORLEVEL! EQU 0 exit /b 0
+REM --- Wait until a named agent is actually running ---
+REM %1 command-line text, %2 name to print, %3 seconds to wait.
+:wait_for
+set "WAITED=1"
+set "WAIT_LEFT=%~3"
+:wait_loop
+powershell.exe -NoProfile -Command "$c = (Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe' -or $_.Name -eq 'py.exe' } | Select-Object -ExpandProperty CommandLine) -join ' '; if ($c -match [regex]::Escape('%~1')) { exit 0 } else { exit 1 }" >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    set "WAITED=0"
+    echo     %~2 is running.
+    exit /b 0
+)
+set /a WAIT_LEFT-=2
+if !WAIT_LEFT! LEQ 0 (
+    echo     %~2 has not come up yet.
+    exit /b 0
+)
+timeout /t 2 /nobreak >nul
+goto wait_loop
+
+REM --- Start the TrueFace poller again, visibly, and free its lock first ---
+:retry_trueface
 echo   TrueFace poller did not start; retrying and showing the error...
 if exist ".locks\trueface.lock" del ".locks\trueface.lock" >nul 2>&1
 start "TrueFace Poller" /min cmd /c "run_trueface.bat"
-timeout /t 15 /nobreak >nul
+call :wait_for "trueface_poller" "TrueFace Poller" 30
 exit /b 0

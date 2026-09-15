@@ -46,8 +46,17 @@ echo [%DATE% %TIME%] NIGHTLY: pulling latest code... >> "%LOGFILE%"
 git fetch origin >> "%LOGFILE%" 2>&1
 git reset --hard origin/main >> "%LOGFILE%" 2>&1
 
+REM Under SYSTEM (nobody logged on) only the campus agent can be started:
+REM TrueFace needs a Chrome window and the gate counter needs native CP Plus,
+REM and both would fail in session 0 leaving half-started wrappers behind.
+REM The ordinary watchdog brings those two back within five minutes of logon.
+set "WATCH_MODE="
+whoami /user 2>nul | find /i "S-1-5-18" >nul && set "WATCH_MODE=agent-only"
+if defined WATCH_MODE (
+    echo [%DATE% %TIME%] NIGHTLY: running as SYSTEM; starting the campus agent only >> "%LOGFILE%"
+)
 echo [%DATE% %TIME%] NIGHTLY: starting agents via watchdog... >> "%LOGFILE%"
-call "!AGENT_DIR!watchdog.bat"
+call "!AGENT_DIR!watchdog.bat" !WATCH_MODE!
 
 echo [%DATE% %TIME%] NIGHTLY: done >> "%LOGFILE%"
 endlocal

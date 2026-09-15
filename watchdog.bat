@@ -14,6 +14,15 @@ set NEED_AGENT=0
 set NEED_TRUEFACE=0
 set NEED_GATE_COUNTER=0
 
+REM "agent-only" watches nothing but the campus agent, so a copy of this
+REM watchdog can run as SYSTEM with nobody logged on and still keep parents'
+REM photos alive. TrueFace drives a Chrome window and the gate counter reads
+REM native CP Plus, neither of which works outside a logged-on desktop, so
+REM they are left to the ordinary watchdog.
+set AGENT_ONLY=0
+if /i "%~1"=="agent-only" set AGENT_ONLY=1
+if "%AGENT_ONLY%"=="1" set LOGFILE=%~dp0watchdog_system.log
+
 REM Check if campus agent (main.py) is running. If PowerShell/CIM fails,
 REM the nonzero status deliberately fails open and requests a start.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('python.exe','py.exe','pythonw.exe') }; if ($p | Where-Object { $_.CommandLine -match 'main.py' }) { exit 0 } else { exit 1 }" >nul 2>&1
@@ -24,22 +33,22 @@ if %ERRORLEVEL% NEQ 0 (
 REM Check if TrueFace poller (trueface_poller.py) is running. If the
 REM process query fails, request a start; the Python mutex remains
 REM authoritative if an old process is still shutting down.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('python.exe','py.exe','pythonw.exe') }; if ($p | Where-Object { $_.CommandLine -match 'trueface_poller' }) { exit 0 } else { exit 1 }" >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    set NEED_TRUEFACE=1
+if "%AGENT_ONLY%"=="0" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('python.exe','py.exe','pythonw.exe') }; if ($p | Where-Object { $_.CommandLine -match 'trueface_poller' }) { exit 0 } else { exit 1 }" >nul 2>&1
+    if !ERRORLEVEL! NEQ 0 set NEED_TRUEFACE=1
 )
 
 REM Check if the gate counter is running. If the query fails, fail open and
 REM request a start so native CP Plus counts self-heal.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('python.exe','py.exe','pythonw.exe') }; if ($p | Where-Object { $_.CommandLine -match 'gate_counter\.py' }) { exit 0 } else { exit 1 }" >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    set NEED_GATE_COUNTER=1
+if "%AGENT_ONLY%"=="0" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('python.exe','py.exe','pythonw.exe') }; if ($p | Where-Object { $_.CommandLine -match 'gate_counter\.py' }) { exit 0 } else { exit 1 }" >nul 2>&1
+    if !ERRORLEVEL! NEQ 0 set NEED_GATE_COUNTER=1
 )
 
 REM A running poller can still be wedged (hung Chrome startup, dead login).
 REM trueface_poller.py marks the log every 5 minutes, so a log with no new
 REM line for 15 minutes means wedged: kill it and let the restart below run.
-if "%NEED_TRUEFACE%"=="0" (
+if "%AGENT_ONLY%"=="0" if "%NEED_TRUEFACE%"=="0" (
     powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$f='%~dp0trueface_poller.log'; if (-not (Test-Path $f)) { exit 0 }; if ((Get-Item $f).LastWriteTime -lt (Get-Date).AddMinutes(-15)) { exit 1 }; exit 0" >nul 2>&1
     if !ERRORLEVEL! EQU 1 (
         echo [%DATE% %TIME%] WATCHDOG: TrueFace log stale for 15 min; poller is wedged, killing it... >> "%LOGFILE%"
