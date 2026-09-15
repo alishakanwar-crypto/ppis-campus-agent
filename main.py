@@ -3922,17 +3922,26 @@ def _ws_looks_connected() -> bool:
     return live is not False
 
 
-# What Task Scheduler says about this PC's ability to restart its agents,
-# read once at startup because the answer only changes when somebody installs.
+# What Task Scheduler says about this PC's ability to restart its agents.
 _PC_RECOVERY: dict = {}
 
+# Re-read now and then, not once: whether the logon-free watchdog is
+# registered only changes when somebody installs, but whether it has actually
+# run changes every five minutes, and that is the part worth knowing. An
+# hourly schtasks query costs nothing next to a morning of missed photos.
+_PC_RECOVERY_EVERY_SECONDS = 3600
 
-def _read_pc_recovery() -> None:
+
+def _read_pc_recovery(repeat: bool = False) -> None:
     global _PC_RECOVERY
-    try:
-        _PC_RECOVERY = pc_recovery.pc_recovery_health()
-    except Exception:
-        logger.exception("Could not read this PC's recovery tasks")
+    while True:
+        try:
+            _PC_RECOVERY = pc_recovery.pc_recovery_health()
+        except Exception:
+            logger.exception("Could not read this PC's recovery tasks")
+        if not repeat:
+            return
+        time.sleep(_PC_RECOVERY_EVERY_SECONDS)
 
 
 def pc_recovery_health() -> dict:
@@ -5097,6 +5106,7 @@ async def lifespan(app: FastAPI):
     # are slow, so they happen off the loop that serves parents.
     threading.Thread(
         target=_read_pc_recovery,
+        kwargs={"repeat": True},
         daemon=True,
         name="pc-recovery-read",
     ).start()

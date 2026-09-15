@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -57,6 +58,13 @@ _RUNS_WITHOUT_LOGON = {"serviceaccount", "password", "s4u"}
 
 _LOGON_TYPE = re.compile(r"<LogonType>\s*([A-Za-z0-9]+)\s*</LogonType>")
 _ENABLED = re.compile(r"<Settings>.*?<Enabled>\s*(true|false)\s*</Enabled>", re.S)
+
+# Task Scheduler's way of saying a task has never run: result 267011 and the
+# 30 November 1999 placeholder it prints instead of a time.
+_NEVER_RUN_RESULT = "267011"
+_NEVER_RUN_STAMP = re.compile(r"\b(?:30[-/.]11|11[-/.]30)[-/.]1999\b")
+# 0 is a finished run, 267009 a run still going: both are the task working.
+_RAN_WELL = {"0", "0x0", "267009"}
 
 
 def _ist(stamp: float) -> str:
@@ -179,6 +187,29 @@ def _task_state(name: str) -> dict:
     return state
 
 
+def _never_ran(state: dict) -> bool:
+    """Whether Task Scheduler says this task has not run even once.
+
+    A task can exist, be enabled and need no logon and still never fire - the
+    SYSTEM watchdog runs wscript in Windows' session 0, where a runner that
+    the desktop accepts can fail silently. Until it has actually run, saying
+    this PC recovers on its own is a guess, and a guess here costs a morning.
+    """
+    result = str(state.get("last_result", "")).strip()
+    if result == _NEVER_RUN_RESULT:
+        return True
+    stamp = str(state.get("last_run", "")).strip()
+    if not stamp or stamp.upper().startswith("N/A"):
+        return True
+    return bool(_NEVER_RUN_STAMP.search(stamp))
+
+
+def _ran_well(state: dict) -> bool:
+    if _never_ran(state):
+        return False
+    return str(state.get("last_result", "")).strip() in _RAN_WELL
+
+
 def repair_tasks() -> dict:
     """Read every recovery task, repairing what can be repaired unattended.
 
@@ -237,8 +268,10 @@ def pc_recovery_health() -> dict:
         and system_watchdog.get("enabled")
         and not system_watchdog.get("needs_logon")
     )
+    proven = _ran_well(system_watchdog)
     health = {
         "boot_at_ist": boot_at_ist(),
+        "read_at_ist": _ist(time.time()),
         "tasks": tasks,
         "tasks_missing": missing,
         "tasks_unreadable": unreadable,
@@ -248,6 +281,16 @@ def pc_recovery_health() -> dict:
         # logged on, only a task that needs no logon can put the campus agent
         # back, and without it a night-time failure costs the whole morning.
         "recovers_without_logon": unattended,
+        # Registered is not the same as working. This says the logon-free
+        # watchdog has actually run and ended well at least once, which is the
+        # only evidence that a night-time failure would really be recovered.
+        "logon_free_watchdog_proven": unattended and proven,
+        "logon_free_watchdog_last_run": str(
+            system_watchdog.get("last_run", "")
+        ),
+        "logon_free_watchdog_last_result": str(
+            system_watchdog.get("last_result", "")
+        ),
     }
     if not unattended:
         logger.warning(
@@ -256,6 +299,14 @@ def pc_recovery_health() -> dict:
             "agent until somebody logs in. Run install_autostart.bat as "
             "administrator.",
             SYSTEM_WATCHDOG_TASK,
+        )
+    if unattended and not proven:
+        logger.warning(
+            "PC RECOVERY: %s is registered and needs no logon but has not "
+            "run yet (last result %s); unattended recovery is unproven until "
+            "it does",
+            SYSTEM_WATCHDOG_TASK,
+            system_watchdog.get("last_result", "") or "none",
         )
     if logon_bound:
         logger.info(

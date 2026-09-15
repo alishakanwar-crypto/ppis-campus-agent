@@ -22,6 +22,13 @@ _LIST = (
     "Next Run Time: 15-09-2026 07:20:00\n"
 )
 
+# What schtasks prints for a task that has never run once.
+_NEVER_RUN_LIST = (
+    "Last Run Time: 30-11-1999 00:00:00\n"
+    "Last Result: 267011\n"
+    "Next Run Time: 15-09-2026 10:45:00\n"
+)
+
 
 class _Schtasks:
     """Stands in for schtasks, answering per task name."""
@@ -31,7 +38,9 @@ class _Schtasks:
         xml_by_task: dict,
         enabled_calls: list | None = None,
         can_create: bool = True,
+        list_by_task: dict | None = None,
     ):
+        self.list_by_task = list_by_task or {}
         self.xml_by_task = xml_by_task
         self.enabled_calls = enabled_calls if enabled_calls is not None else []
         self.can_create = can_create
@@ -53,7 +62,7 @@ class _Schtasks:
             return ""
         if "/xml" in args:
             return xml
-        return _LIST
+        return self.list_by_task.get(name, _LIST)
 
 
 def test_a_logon_bound_watchdog_is_registered_again_as_system(monkeypatch):
@@ -129,6 +138,84 @@ def test_a_logon_bound_watchdog_we_cannot_replace_is_not_promised(monkeypatch):
 
     assert pc_recovery.SYSTEM_WATCHDOG_TASK in health["tasks_need_logon"]
     assert health["recovers_without_logon"] is False
+
+
+def test_a_watchdog_that_has_never_run_is_not_called_proven(monkeypatch):
+    # Registered, enabled, needs no logon - and has still never fired, which
+    # is what a SYSTEM task whose runner cannot work in session 0 looks like.
+    tasks = {name: _xml() for name in pc_recovery.TASKS}
+    tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")
+    monkeypatch.setattr(
+        pc_recovery,
+        "_run",
+        _Schtasks(
+            tasks,
+            list_by_task={
+                pc_recovery.SYSTEM_WATCHDOG_TASK: _NEVER_RUN_LIST
+            },
+        ),
+    )
+
+    health = pc_recovery.pc_recovery_health()
+
+    assert health["recovers_without_logon"] is True
+    assert health["logon_free_watchdog_proven"] is False
+    assert health["logon_free_watchdog_last_result"] == "267011"
+
+
+def test_a_watchdog_that_has_run_well_is_proven(monkeypatch):
+    tasks = {name: _xml() for name in pc_recovery.TASKS}
+    tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")
+    monkeypatch.setattr(pc_recovery, "_run", _Schtasks(tasks))
+
+    health = pc_recovery.pc_recovery_health()
+
+    assert health["logon_free_watchdog_proven"] is True
+    assert health["logon_free_watchdog_last_run"] == "15-09-2026 01:55:00"
+    assert health["read_at_ist"].endswith("IST")
+
+
+def test_a_watchdog_whose_run_failed_is_not_proven(monkeypatch):
+    tasks = {name: _xml() for name in pc_recovery.TASKS}
+    tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")
+    failed = (
+        "Last Run Time: 15-09-2026 02:05:00\n"
+        "Last Result: 1\n"
+        "Next Run Time: 15-09-2026 02:10:00\n"
+    )
+    monkeypatch.setattr(
+        pc_recovery,
+        "_run",
+        _Schtasks(
+            tasks, list_by_task={pc_recovery.SYSTEM_WATCHDOG_TASK: failed}
+        ),
+    )
+
+    health = pc_recovery.pc_recovery_health()
+
+    assert health["logon_free_watchdog_proven"] is False
+    assert health["logon_free_watchdog_last_result"] == "1"
+
+
+def test_a_run_still_going_counts_as_the_watchdog_working(monkeypatch):
+    tasks = {name: _xml() for name in pc_recovery.TASKS}
+    tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")
+    running = (
+        "Last Run Time: 15-09-2026 02:05:00\n"
+        "Last Result: 267009\n"
+        "Next Run Time: 15-09-2026 02:10:00\n"
+    )
+    monkeypatch.setattr(
+        pc_recovery,
+        "_run",
+        _Schtasks(
+            tasks, list_by_task={pc_recovery.SYSTEM_WATCHDOG_TASK: running}
+        ),
+    )
+
+    assert pc_recovery.pc_recovery_health()[
+        "logon_free_watchdog_proven"
+    ] is True
 
 
 def test_a_disabled_task_is_switched_back_on(monkeypatch):
