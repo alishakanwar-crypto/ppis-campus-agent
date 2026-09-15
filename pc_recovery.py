@@ -14,19 +14,23 @@ nobody. Nothing here may keep the agent from starting, and no path or account
 name from the campus PC is reported.
 """
 
+import locale
 import logging
 import os
 import re
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import psutil
 
 logger = logging.getLogger(__name__)
 
-IST = ZoneInfo("Asia/Kolkata")
+# A fixed offset, not a named zone: main.py imports this module before the
+# agent starts, and on a Windows PC without the IANA database a named zone
+# raises at import and then nothing can start the agent at all. IST keeps no
+# daylight saving, so the offset is the whole of it.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # The tasks install_autostart.bat registers. The names are the contract.
 BOOT_TASK = "PPIS Campus Agent"
@@ -68,12 +72,29 @@ def boot_at_ist() -> str:
         return ""
 
 
+def _decode(raw: bytes) -> str:
+    """schtasks /xml answers in UTF-16; the console pages answer in the OEM
+    codepage. Decoding UTF-16 as a byte codepage leaves a NUL between every
+    letter, and then <LogonType> is never found and a logon-bound task reads
+    as one that needs no logon - the one lie this module must not tell."""
+    if not raw:
+        return ""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff") or raw[1:2] == b"\x00":
+        try:
+            return raw.decode("utf-16", errors="replace")
+        except (UnicodeDecodeError, LookupError):
+            pass
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(locale.getpreferredencoding(False), errors="replace")
+
+
 def _run(args: list[str]) -> str:
     try:
         done = subprocess.run(
             args,
             capture_output=True,
-            text=True,
             timeout=_QUERY_TIMEOUT_SECONDS,
             creationflags=_NO_WINDOW,
         )
@@ -82,12 +103,11 @@ def _run(args: list[str]) -> str:
         return ""
     if done.returncode != 0:
         return ""
-    return done.stdout or ""
+    return _decode(done.stdout or b"")
 
 
 def _task_xml(name: str) -> str:
-    # schtasks writes the XML as UTF-16 text; python decodes it for us, but a
-    # missing task is an error exit and comes back as an empty string.
+    # A missing task is an error exit and comes back as an empty string.
     return _run(["schtasks", "/query", "/tn", name, "/xml", "ONE"])
 
 

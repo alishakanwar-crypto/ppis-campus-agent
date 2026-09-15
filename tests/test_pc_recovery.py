@@ -166,7 +166,7 @@ def test_an_unreadable_task_list_never_raises(monkeypatch):
 
 
 class _Completed:
-    def __init__(self, returncode: int, stdout: str):
+    def __init__(self, returncode: int, stdout: bytes):
         self.returncode = returncode
         self.stdout = stdout
 
@@ -193,18 +193,44 @@ def test_a_refused_query_reads_as_no_answer(monkeypatch):
     monkeypatch.setattr(
         subprocess,
         "run",
-        lambda args, **kw: _Completed(1, "ERROR: The system cannot find the..."),
+        lambda args, **kw: _Completed(1, b"ERROR: The system cannot find the..."),
     )
 
     assert pc_recovery._run(["schtasks", "/query"]) == ""
 
 
-def test_the_query_runs_without_flashing_a_console(monkeypatch):
+def test_a_plain_answer_is_read_as_written(monkeypatch):
     monkeypatch.setattr(
-        subprocess, "run", lambda args, **kw: _Completed(0, "out")
+        subprocess, "run", lambda args, **kw: _Completed(0, b"out")
     )
 
     assert pc_recovery._run(["schtasks", "/query"]) == "out"
+
+
+def test_task_xml_in_utf_16_is_read_as_utf_16(monkeypatch):
+    # schtasks /xml answers in UTF-16. Read as a byte codepage it keeps a NUL
+    # between every letter, <LogonType> is never matched, and a logon-bound
+    # watchdog would be reported as one that needs no logon.
+    xml = _xml(logon="InteractiveToken").encode("utf-16")
+    monkeypatch.setattr(
+        subprocess, "run", lambda args, **kw: _Completed(0, xml)
+    )
+
+    state = pc_recovery._task_state("PPIS Campus Agent")
+
+    assert state["exists"] is True
+    assert state["needs_logon"] is True
+    assert state["enabled"] is True
+
+
+def test_a_console_page_answer_is_still_read(monkeypatch):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda args, **kw: _Completed(0, "Last Result: 0\n".encode("cp1252")),
+    )
+
+    assert "Last Result" in pc_recovery._run(["schtasks", "/query"])
 
 
 def test_the_boot_time_is_reported_in_ist(monkeypatch):
