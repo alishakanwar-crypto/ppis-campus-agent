@@ -1,5 +1,7 @@
 """The campus PC must be able to restart its own agents without a person."""
 
+import subprocess
+
 import pc_recovery
 
 
@@ -161,3 +163,61 @@ def test_an_unreadable_task_list_never_raises(monkeypatch):
     unread = health["tasks"][pc_recovery.SYSTEM_WATCHDOG_TASK]
     assert unread["error"] == "unreadable"
     assert pc_recovery.SYSTEM_WATCHDOG_TASK in health["tasks_unreadable"]
+
+
+class _Completed:
+    def __init__(self, returncode: int, stdout: str):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def test_a_query_that_hangs_is_abandoned_not_waited_on(monkeypatch):
+    # The agent is starting and parents are waiting behind nothing: a task
+    # query that never answers must cost the startup nothing at all.
+    seen: dict = {}
+
+    def hang(args, **kwargs):
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", hang)
+
+    assert pc_recovery._run(["schtasks", "/query"]) == ""
+    assert seen["timeout"] == pc_recovery._QUERY_TIMEOUT_SECONDS
+    assert seen["capture_output"] is True
+
+
+def test_a_refused_query_reads_as_no_answer(monkeypatch):
+    # schtasks exits nonzero for a task that is not there and prints the
+    # refusal on stdout; reading that as XML would invent a task.
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda args, **kw: _Completed(1, "ERROR: The system cannot find the..."),
+    )
+
+    assert pc_recovery._run(["schtasks", "/query"]) == ""
+
+
+def test_the_query_runs_without_flashing_a_console(monkeypatch):
+    monkeypatch.setattr(
+        subprocess, "run", lambda args, **kw: _Completed(0, "out")
+    )
+
+    assert pc_recovery._run(["schtasks", "/query"]) == "out"
+
+
+def test_the_boot_time_is_reported_in_ist(monkeypatch):
+    # 15-09-2026 01:57:12 IST, the reboot that cost a morning of photos.
+    monkeypatch.setattr(pc_recovery.psutil, "boot_time", lambda: 1789417632.0)
+
+    assert pc_recovery.boot_at_ist() == "15-09-2026 01:57:12 IST"
+
+
+def test_an_unreadable_boot_time_is_left_blank(monkeypatch):
+    def explode():
+        raise OSError("no boot time here")
+
+    monkeypatch.setattr(pc_recovery.psutil, "boot_time", explode)
+
+    assert pc_recovery.boot_at_ist() == ""

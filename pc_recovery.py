@@ -15,11 +15,14 @@ name from the campus PC is reported.
 """
 
 import logging
+import os
 import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import psutil
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,13 @@ TASKS = (BOOT_TASK, WATCHDOG_TASK, SYSTEM_WATCHDOG_TASK, NIGHTLY_TASK)
 # parents are waiting, so a query that hangs is abandoned rather than waited on.
 _QUERY_TIMEOUT_SECONDS = 20
 
+# Keep schtasks off the screen: the agent runs hidden and a console window
+# flashing over a teacher's desktop every start is not acceptable.
+if os.name == "nt":
+    _NO_WINDOW = subprocess.CREATE_NO_WINDOW
+else:
+    _NO_WINDOW = 0
+
 # Only these logon types run without anybody logged on.
 _RUNS_WITHOUT_LOGON = {"serviceaccount", "password", "s4u"}
 
@@ -52,8 +62,6 @@ def _ist(stamp: float) -> str:
 def boot_at_ist() -> str:
     """When Windows last started, so a night-time reboot can be seen."""
     try:
-        import psutil
-
         return _ist(psutil.boot_time())
     except Exception as exc:
         logger.debug("PC RECOVERY: boot time unreadable: %s", exc)
@@ -67,7 +75,7 @@ def _run(args: list[str]) -> str:
             capture_output=True,
             text=True,
             timeout=_QUERY_TIMEOUT_SECONDS,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=_NO_WINDOW,
         )
     except Exception as exc:
         logger.debug("PC RECOVERY: %s failed: %s", args[0], exc)
