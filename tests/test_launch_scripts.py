@@ -82,7 +82,7 @@ class LaunchScriptTests(unittest.TestCase):
         script = _read("nightly_restart.bat")
         self.assertNotIn("\npause", script)
         rerun = script.index('call "!SELF_COPY!" --from-temp')
-        pull = script.index("git reset --hard origin/main")
+        pull = script.index("reset --hard origin/main")
         self.assertLess(rerun, pull)
         self.assertIn('call "!AGENT_DIR!watchdog.bat"', script)
 
@@ -94,6 +94,38 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertIn("S-1-5-18", script)
         self.assertIn("WATCH_MODE=agent-only", script)
         self.assertIn('call "!AGENT_DIR!watchdog.bat" !WATCH_MODE!', script)
+
+    def test_nightly_refresh_owns_the_checkout_it_updates(self):
+        # As SYSTEM the checkout belongs to somebody else, and git then calls
+        # it an unsafe repository, so the refresh would restart the agent on
+        # last night's code without either command being seen to fail.
+        script = _read("nightly_restart.bat")
+        self.assertIn("set \"OWNED=-c safe.directory=!REPO!\"", script)
+        for command in ("fetch origin", "reset --hard origin/main"):
+            self.assertIn(f"git !OWNED! {command}", script)
+
+    def test_a_failed_nightly_refresh_ends_the_task_non_zero(self):
+        script = _read("nightly_restart.bat")
+        self.assertEqual(script.count('if errorlevel 1 set "REFRESHED="'), 2)
+        # The agents are started before the script gives up, so a failed
+        # refresh never leaves the campus without an agent overnight.
+        start = script.index('call "!AGENT_DIR!watchdog.bat" !WATCH_MODE!')
+        give_up = script.index("if not defined REFRESHED (\n    endlocal")
+        self.assertLess(start, give_up)
+        self.assertIn("exit /b 1", script[give_up:])
+
+    def test_the_wrapper_owns_the_checkout_it_updates(self):
+        # The SYSTEM watchdog starts this wrapper with nobody logged on.
+        script = _read("run_forever.bat")
+        self.assertIn("set \"OWNED=-c safe.directory=!REPO!\"", script)
+        self.assertNotIn("\ngit fetch", script)
+        for command in (
+            "fetch origin",
+            "checkout main",
+            "reset --hard origin/main",
+            "rev-parse --short HEAD",
+        ):
+            self.assertIn(f"git !OWNED! {command}", script)
 
     def test_wrapper_takes_over_when_the_mutex_holder_has_gone(self):
         # Exiting on a refused mutex left the campus with no agent at all for

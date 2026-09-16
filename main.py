@@ -914,6 +914,14 @@ _live_capture_report: contextvars.ContextVar[dict | None] = contextvars.ContextV
 
 _PROCESS_STARTED_AT = datetime.now(timezone(timedelta(hours=5, minutes=30)))
 
+_AGENT_DIR = Path(__file__).resolve().parent
+# Started by the SYSTEM watchdog or the nightly refresh, this process runs as
+# SYSTEM while the checkout belongs to the campus user, and git then refuses
+# every command in it as an unsafe repository — which reads exactly like being
+# up to date, so the agent would sit on old code with nobody logged on. The
+# path is trusted for these commands only, not written into any git config.
+_GIT = ("git", "-c", f"safe.directory={_AGENT_DIR.as_posix()}")
+
 
 def _running_commit() -> str:
     """Short git commit this process was started from, '' when unknown.
@@ -923,8 +931,8 @@ def _running_commit() -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(Path(__file__).resolve().parent),
+            [*_GIT, "rev-parse", "--short", "HEAD"],
+            cwd=str(_AGENT_DIR),
             capture_output=True,
             text=True,
             timeout=10,
@@ -966,8 +974,8 @@ def _git(*args: str) -> str:
     """Run a read-only git command in the agent's checkout, '' on failure."""
     try:
         result = subprocess.run(
-            ["git", *args],
-            cwd=str(Path(__file__).resolve().parent),
+            [*_GIT, *args],
+            cwd=str(_AGENT_DIR),
             capture_output=True,
             text=True,
             timeout=60,
@@ -1009,8 +1017,8 @@ def _pending_update_commit() -> str:
     """The commit on origin/main we are not running yet, '' when current."""
     try:
         fetched = subprocess.run(
-            ["git", "fetch", "origin", "main"],
-            cwd=str(Path(__file__).resolve().parent),
+            [*_GIT, "fetch", "origin", "main"],
+            cwd=str(_AGENT_DIR),
             capture_output=True,
             text=True,
             timeout=120,
@@ -1070,8 +1078,8 @@ def _release_locked_paths(said: str) -> list[str]:
         return []
     try:
         done = subprocess.run(
-            ["git", "update-index", "--skip-worktree", "--", *paths],
-            cwd=str(Path(__file__).resolve().parent),
+            [*_GIT, "update-index", "--skip-worktree", "--", *paths],
+            cwd=str(_AGENT_DIR),
             capture_output=True,
             text=True,
             timeout=60,
@@ -1114,8 +1122,8 @@ def _pull_merged_code(commit: str) -> str:
         for attempt in (0, 1):
             try:
                 done = subprocess.run(
-                    ["git", *args],
-                    cwd=str(Path(__file__).resolve().parent),
+                    [*_GIT, *args],
+                    cwd=str(_AGENT_DIR),
                     capture_output=True,
                     text=True,
                     timeout=180,

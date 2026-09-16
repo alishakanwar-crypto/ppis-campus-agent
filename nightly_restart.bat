@@ -42,9 +42,22 @@ taskkill /F /IM chromedriver.exe >nul 2>&1
 
 timeout /t 5 /nobreak >nul
 
+REM Git refuses to work in a checkout owned by another account, and under
+REM SYSTEM this checkout belongs to the campus user, so both commands below
+REM would fail as an "unsafe repository" and the refresh would restart the
+REM agent on last night's code. safe.directory is passed for this one path
+REM only, rather than turning the ownership check off for the machine.
+set "REPO=%AGENT_DIR%"
+if "!REPO:~-1!"=="\" set "REPO=!REPO:~0,-1!"
+set "OWNED=-c safe.directory=!REPO!"
+
+set "REFRESHED=1"
 echo [%DATE% %TIME%] NIGHTLY: pulling latest code... >> "%LOGFILE%"
-git fetch origin >> "%LOGFILE%" 2>&1
-git reset --hard origin/main >> "%LOGFILE%" 2>&1
+git !OWNED! fetch origin >> "%LOGFILE%" 2>&1
+if errorlevel 1 set "REFRESHED="
+git !OWNED! reset --hard origin/main >> "%LOGFILE%" 2>&1
+if errorlevel 1 set "REFRESHED="
+if not defined REFRESHED echo [%DATE% %TIME%] NIGHTLY: could not take merged code; starting the agent on the code already here >> "%LOGFILE%"
 
 REM Under SYSTEM (nobody logged on) only the campus agent can be started:
 REM TrueFace needs a Chrome window and the gate counter needs native CP Plus,
@@ -59,5 +72,13 @@ echo [%DATE% %TIME%] NIGHTLY: starting agents via watchdog... >> "%LOGFILE%"
 call "!AGENT_DIR!watchdog.bat" !WATCH_MODE!
 
 echo [%DATE% %TIME%] NIGHTLY: done >> "%LOGFILE%"
+
+REM The agents are started either way — a failed refresh must never leave the
+REM campus without an agent — but the task ends non-zero so the night shows up
+REM in health as a result instead of a silent success on stale code.
+if not defined REFRESHED (
+    endlocal
+    exit /b 1
+)
 endlocal
 exit /b 0
