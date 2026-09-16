@@ -72,8 +72,12 @@ def test_a_logon_bound_watchdog_is_registered_again_as_system(monkeypatch):
 
     health = pc_recovery.pc_recovery_health()
 
-    assert fake.created == [pc_recovery.SYSTEM_WATCHDOG_TASK]
+    assert fake.created == [
+        pc_recovery.SYSTEM_WATCHDOG_TASK,
+        pc_recovery.NIGHTLY_TASK,
+    ]
     assert health["recovers_without_logon"] is True
+    assert health["nightly_refresh_without_logon"] is True
     assert pc_recovery.SYSTEM_WATCHDOG_TASK not in health["tasks_need_logon"]
     assert health["boot_at_ist"] == "15-09-2026 01:59:00 IST"
     watchdog = health["tasks"][pc_recovery.WATCHDOG_TASK]
@@ -138,6 +142,39 @@ def test_a_logon_bound_watchdog_we_cannot_replace_is_not_promised(monkeypatch):
 
     assert pc_recovery.SYSTEM_WATCHDOG_TASK in health["tasks_need_logon"]
     assert health["recovers_without_logon"] is False
+
+
+def test_a_logon_bound_nightly_refresh_is_registered_again_as_system(
+    monkeypatch,
+):
+    # The 03:00 IST refresh is what puts the PC on merged code overnight; tied
+    # to a logon it is skipped on any night nobody logged in.
+    tasks = {name: _xml() for name in pc_recovery.TASKS}
+    tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")
+    fake = _Schtasks(tasks)
+    monkeypatch.setattr(pc_recovery, "_run", fake)
+
+    health = pc_recovery.pc_recovery_health()
+
+    assert fake.created == [pc_recovery.NIGHTLY_TASK]
+    assert health["nightly_refresh_without_logon"] is True
+    assert pc_recovery.NIGHTLY_TASK not in health["tasks_need_logon"]
+    assert health["tasks"][pc_recovery.NIGHTLY_TASK]["repaired"] is True
+
+
+def test_a_nightly_refresh_we_cannot_replace_is_not_promised(monkeypatch):
+    tasks = {name: _xml() for name in pc_recovery.TASKS}
+    tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")
+    monkeypatch.setattr(
+        pc_recovery, "_run", _Schtasks(tasks, can_create=False)
+    )
+
+    health = pc_recovery.pc_recovery_health()
+
+    assert health["nightly_refresh_without_logon"] is False
+    assert pc_recovery.NIGHTLY_TASK in health["tasks_need_logon"]
+    # The agent's own recovery is untouched by the nightly task's state.
+    assert health["recovers_without_logon"] is True
 
 
 def test_a_watchdog_that_has_never_run_is_not_called_proven(monkeypatch):
