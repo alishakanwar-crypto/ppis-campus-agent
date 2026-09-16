@@ -65,6 +65,10 @@ _NEVER_RUN_RESULT = "267011"
 _NEVER_RUN_STAMP = re.compile(r"\b(?:30[-/.]11|11[-/.]30)[-/.]1999\b")
 # 0 is a finished run, 267009 a run still going: both are the task working.
 _RAN_WELL = {"0", "0x0", "267009"}
+# The nightly refresh runs once and starts the agents before it reports how
+# the refresh itself went, so "still going" says nothing about the code on
+# this disk and only a finished 0 is a night that took the merged code.
+_FINISHED_WELL = {"0", "0x0"}
 
 
 def _ist(stamp: float) -> str:
@@ -243,6 +247,12 @@ def _ran_well(state: dict) -> bool:
     return str(state.get("last_result", "")).strip() in _RAN_WELL
 
 
+def _finished_well(state: dict) -> bool:
+    if _never_ran(state):
+        return False
+    return str(state.get("last_result", "")).strip() in _FINISHED_WELL
+
+
 def repair_tasks() -> dict:
     """Read every recovery task, repairing what can be repaired unattended.
 
@@ -341,7 +351,7 @@ def pc_recovery_health() -> dict:
         # nightly_restart.bat ends non-zero when it could not take merged
         # code, so a night that restarted the agent on last night's code is
         # told apart from one that actually refreshed it.
-        "nightly_refresh_ok": nightly_unattended and _ran_well(nightly),
+        "nightly_refresh_ok": nightly_unattended and _finished_well(nightly),
         "nightly_refresh_last_run": str(nightly.get("last_run", "")),
         "nightly_refresh_last_result": str(nightly.get("last_result", "")),
     }
@@ -368,6 +378,7 @@ def pc_recovery_health() -> dict:
             NIGHTLY_TASK,
         )
     elif not _never_ran(nightly) and not _ran_well(nightly):
+        # A run still going is neither a good night nor a bad one yet.
         logger.warning(
             "PC RECOVERY: the 03:00 IST nightly refresh ended with %s; the "
             "agents were started but could not be put on merged code",

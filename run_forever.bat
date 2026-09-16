@@ -39,10 +39,12 @@ set "DUPLICATE_EXIT_CODE=75"
 REM Started by the SYSTEM watchdog there is nobody logged on, and git refuses
 REM a checkout owned by the campus user, so every command below would fail as
 REM an "unsafe repository" and the agent would stay on old code. safe.directory
-REM is passed for this one path only, not set for the machine.
+REM is passed for this one path only, not set for the machine, and quoted so a
+REM campus path with a space in it reaches git whole instead of being split
+REM into a broken setting and a stray command.
 set "REPO=%~dp0"
 if "!REPO:~-1!"=="\" set "REPO=!REPO:~0,-1!"
-set "OWNED=-c safe.directory=!REPO!"
+set OWNED=-c "safe.directory=!REPO!"
 
 :loop
 call :cap_log

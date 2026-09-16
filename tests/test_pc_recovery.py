@@ -202,6 +202,32 @@ def test_a_nightly_refresh_that_took_the_code_is_called_ok(monkeypatch):
     assert health["nightly_refresh_last_result"] == "0"
 
 
+def test_a_nightly_refresh_still_running_is_not_yet_called_ok(monkeypatch):
+    # The refresh starts the agents before it reports whether git worked, so
+    # the new agent can read the task while it is still going. 267009 there
+    # says nothing about the code on this disk and must not read as a good
+    # night, or a stale morning would look clean for the next hour.
+    tasks = {name: _xml() for name in pc_recovery.TASKS}
+    tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")
+    tasks[pc_recovery.NIGHTLY_TASK] = _xml(logon="ServiceAccount")
+    running = (
+        "Last Run Time: 16-09-2026 03:00:01\n"
+        "Last Result: 267009\n"
+        "Next Run Time: 17-09-2026 03:00:00\n"
+    )
+    monkeypatch.setattr(
+        pc_recovery,
+        "_run",
+        _Schtasks(tasks, list_by_task={pc_recovery.NIGHTLY_TASK: running}),
+    )
+
+    health = pc_recovery.pc_recovery_health()
+
+    assert health["nightly_refresh_without_logon"] is True
+    assert health["nightly_refresh_ok"] is False
+    assert health["nightly_refresh_last_result"] == "267009"
+
+
 def test_a_nightly_refresh_that_never_ran_is_not_called_ok(monkeypatch):
     tasks = {name: _xml() for name in pc_recovery.TASKS}
     tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")

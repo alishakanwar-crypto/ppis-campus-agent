@@ -46,10 +46,12 @@ REM Git refuses to work in a checkout owned by another account, and under
 REM SYSTEM this checkout belongs to the campus user, so both commands below
 REM would fail as an "unsafe repository" and the refresh would restart the
 REM agent on last night's code. safe.directory is passed for this one path
-REM only, rather than turning the ownership check off for the machine.
+REM only, rather than turning the ownership check off for the machine. The
+REM setting is quoted because the campus path can hold a space, and unquoted
+REM cmd would hand git half a path and run the rest of it as a command.
 set "REPO=%AGENT_DIR%"
 if "!REPO:~-1!"=="\" set "REPO=!REPO:~0,-1!"
-set "OWNED=-c safe.directory=!REPO!"
+set OWNED=-c "safe.directory=!REPO!"
 
 set "REFRESHED=1"
 echo [%DATE% %TIME%] NIGHTLY: pulling latest code... >> "%LOGFILE%"
