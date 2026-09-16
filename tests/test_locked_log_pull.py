@@ -10,6 +10,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import main
 
 
+def _subcommand(args) -> tuple[str, ...]:
+    """The git command without the safe.directory prefix every call carries."""
+    return tuple(args[len(main._GIT):])
+
+
 class _Run:
     def __init__(self, returncode=0, stderr=""):
         self.returncode = returncode
@@ -28,8 +33,8 @@ class LockedLogPullTests(unittest.TestCase):
         calls: list[tuple[str, ...]] = []
 
         def run(args, **kwargs):
-            calls.append(tuple(args[1:]))
-            if args[1] == "reset" and ("update-index",) not in [
+            calls.append(_subcommand(args))
+            if _subcommand(args)[0] == "reset" and ("update-index",) not in [
                 (call[0],) for call in calls[:-1]
             ]:
                 return _Run(1, LOCKED)
@@ -49,7 +54,7 @@ class LockedLogPullTests(unittest.TestCase):
 
     def test_a_reset_that_keeps_failing_is_still_reported(self):
         def run(args, **kwargs):
-            if args[1] == "reset":
+            if _subcommand(args)[0] == "reset":
                 return _Run(1, LOCKED)
             return _Run()
 
@@ -64,8 +69,8 @@ class LockedLogPullTests(unittest.TestCase):
         calls: list[tuple[str, ...]] = []
 
         def run(args, **kwargs):
-            calls.append(tuple(args[1:]))
-            if args[1] == "reset":
+            calls.append(_subcommand(args))
+            if _subcommand(args)[0] == "reset":
                 return _Run(
                     1,
                     "error: unable to unlink old 'main.py': Invalid argument",
@@ -85,8 +90,8 @@ class LockedLogPullTests(unittest.TestCase):
         calls: list[tuple[str, ...]] = []
 
         def run(args, **kwargs):
-            calls.append(tuple(args[1:]))
-            if args[1] == "reset":
+            calls.append(_subcommand(args))
+            if _subcommand(args)[0] == "reset":
                 return _Run(1, "fatal: ambiguous argument")
             return _Run()
 

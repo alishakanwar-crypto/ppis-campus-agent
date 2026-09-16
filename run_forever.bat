@@ -36,19 +36,27 @@ set PPIS_WRAPPER=1
 REM Must match DUPLICATE_INSTANCE_EXIT_CODE in campus_instance.py.
 set "DUPLICATE_EXIT_CODE=75"
 
+REM Started by the SYSTEM watchdog there is nobody logged on, and git refuses
+REM a checkout owned by the campus user, so every command below would fail as
+REM an "unsafe repository" and the agent would stay on old code. safe.directory
+REM is passed for this one path only, not set for the machine.
+set "REPO=%~dp0"
+if "!REPO:~-1!"=="\" set "REPO=!REPO:~0,-1!"
+set "OWNED=-c safe.directory=!REPO!"
+
 :loop
 call :cap_log
 echo [%DATE% %TIME%] Pulling latest code... >> "%LOGFILE%"
 REM Fetch latest code, but never reset to an unverified stale remote ref.
-git fetch origin >nul 2>&1
+git !OWNED! fetch origin >nul 2>&1
 if errorlevel 1 (
     echo [%DATE% %TIME%] GIT: Fetch failed; keeping existing working tree. >> "%LOGFILE%"
 ) else (
-    git checkout main >nul 2>&1
+    git !OWNED! checkout main >nul 2>&1
     if errorlevel 1 (
         echo [%DATE% %TIME%] GIT: Checkout main failed; keeping existing working tree. >> "%LOGFILE%"
     ) else (
-        git reset --hard origin/main >nul 2>&1
+        git !OWNED! reset --hard origin/main >nul 2>&1
         if errorlevel 1 echo [%DATE% %TIME%] GIT: Reset origin/main failed; keeping existing working tree. >> "%LOGFILE%"
     )
 )
@@ -62,7 +70,7 @@ forfiles /p "%~dp0snapshots" /d -1 /m *.* /c "cmd /c del /Q @path" 2>nul
 forfiles /p "%~dp0attendance_snapshots" /d -1 /m *.* /c "cmd /c del /Q @path" 2>nul
 
 set "REVISION=unknown"
-for /f "delims=" %%H in ('git rev-parse --short HEAD 2^>nul') do set "REVISION=%%H"
+for /f "delims=" %%H in ('git !OWNED! rev-parse --short HEAD 2^>nul') do set "REVISION=%%H"
 echo [%DATE% %TIME%] Starting revision !REVISION! >> "%LOGFILE%"
 py -3.12 -B main.py
 set "EXIT_CODE=%ERRORLEVEL%"

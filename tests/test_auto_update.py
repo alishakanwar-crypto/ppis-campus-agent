@@ -45,7 +45,26 @@ class PendingUpdateTests(unittest.TestCase):
         ) as run, patch.object(main, "_git", side_effect=["a", "a"]):
             main._pending_update_commit()
         self.assertEqual(
-            run.call_args.args[0], ["git", "fetch", "origin", "main"]
+            run.call_args.args[0], [*main._GIT, "fetch", "origin", "main"]
+        )
+
+    def test_every_git_command_trusts_this_checkout(self):
+        # Started by the SYSTEM watchdog the process is not the checkout's
+        # owner, and git then refuses every command as an unsafe repository,
+        # which reads exactly like being up to date on a night nobody logged
+        # in. The path is trusted per command, never written to a git config.
+        self.assertEqual(main._GIT[0], "git")
+        self.assertEqual(main._GIT[1], "-c")
+        self.assertEqual(
+            main._GIT[2],
+            f"safe.directory={main._AGENT_DIR.as_posix()}",
+        )
+        with patch.object(
+            main.subprocess, "run", return_value=_Fetch()
+        ) as run:
+            main._git("rev-parse", "HEAD")
+        self.assertEqual(
+            run.call_args.args[0], [*main._GIT, "rev-parse", "HEAD"]
         )
 
     def test_an_unreachable_github_is_reported_not_swallowed(self):
@@ -108,9 +127,12 @@ class PullMergedCodeTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in run.call_args_list],
             [
-                ["git", "fetch", "origin", "+main:refs/remotes/origin/main"],
                 [
-                    "git", "reset", "--hard",
+                    *main._GIT, "fetch", "origin",
+                    "+main:refs/remotes/origin/main",
+                ],
+                [
+                    *main._GIT, "reset", "--hard",
                     "refs/remotes/origin/main", "--",
                 ],
             ],
@@ -131,7 +153,7 @@ class PullMergedCodeTests(unittest.TestCase):
 
         self.assertEqual(
             run.call_args_list[-1].args[0],
-            ["git", "reset", "--hard", "refs/remotes/origin/main", "--"],
+            [*main._GIT, "reset", "--hard", "refs/remotes/origin/main", "--"],
         )
 
     def test_a_checkout_that_did_not_move_is_reported_as_a_failure(self):

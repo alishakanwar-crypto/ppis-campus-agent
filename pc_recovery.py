@@ -338,6 +338,12 @@ def pc_recovery_health() -> dict:
         # The 03:00 IST refresh is what puts the PC on merged code overnight.
         # Bound to a logon it is skipped on any night nobody logged in.
         "nightly_refresh_without_logon": nightly_unattended,
+        # nightly_restart.bat ends non-zero when it could not take merged
+        # code, so a night that restarted the agent on last night's code is
+        # told apart from one that actually refreshed it.
+        "nightly_refresh_ok": nightly_unattended and _ran_well(nightly),
+        "nightly_refresh_last_run": str(nightly.get("last_run", "")),
+        "nightly_refresh_last_result": str(nightly.get("last_result", "")),
     }
     if not unattended:
         logger.warning(
@@ -360,6 +366,12 @@ def pc_recovery_health() -> dict:
             "PC RECOVERY: the 03:00 IST nightly refresh (%s) would not run "
             "with nobody logged on; the PC can then sit on stale code",
             NIGHTLY_TASK,
+        )
+    elif not _never_ran(nightly) and not _ran_well(nightly):
+        logger.warning(
+            "PC RECOVERY: the 03:00 IST nightly refresh ended with %s; the "
+            "agents were started but could not be put on merged code",
+            nightly.get("last_result", "") or "no result",
         )
     if logon_bound:
         logger.info(

@@ -162,6 +162,64 @@ def test_a_logon_bound_nightly_refresh_is_registered_again_as_system(
     assert health["tasks"][pc_recovery.NIGHTLY_TASK]["repaired"] is True
 
 
+def test_a_nightly_refresh_that_could_not_take_code_is_not_called_ok(
+    monkeypatch,
+):
+    # nightly_restart.bat ends non-zero when git could not put the PC on the
+    # merged code. The task still ran, and the agents were still started, but
+    # the morning is being served on last night's code and must say so.
+    tasks = {name: _xml() for name in pc_recovery.TASKS}
+    tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")
+    tasks[pc_recovery.NIGHTLY_TASK] = _xml(logon="ServiceAccount")
+    failed = (
+        "Last Run Time: 16-09-2026 03:00:01\n"
+        "Last Result: 1\n"
+        "Next Run Time: 17-09-2026 03:00:00\n"
+    )
+    monkeypatch.setattr(
+        pc_recovery,
+        "_run",
+        _Schtasks(tasks, list_by_task={pc_recovery.NIGHTLY_TASK: failed}),
+    )
+
+    health = pc_recovery.pc_recovery_health()
+
+    assert health["nightly_refresh_without_logon"] is True
+    assert health["nightly_refresh_ok"] is False
+    assert health["nightly_refresh_last_result"] == "1"
+    assert health["nightly_refresh_last_run"] == "16-09-2026 03:00:01"
+
+
+def test_a_nightly_refresh_that_took_the_code_is_called_ok(monkeypatch):
+    tasks = {name: _xml() for name in pc_recovery.TASKS}
+    tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")
+    tasks[pc_recovery.NIGHTLY_TASK] = _xml(logon="ServiceAccount")
+    monkeypatch.setattr(pc_recovery, "_run", _Schtasks(tasks))
+
+    health = pc_recovery.pc_recovery_health()
+
+    assert health["nightly_refresh_ok"] is True
+    assert health["nightly_refresh_last_result"] == "0"
+
+
+def test_a_nightly_refresh_that_never_ran_is_not_called_ok(monkeypatch):
+    tasks = {name: _xml() for name in pc_recovery.TASKS}
+    tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")
+    tasks[pc_recovery.NIGHTLY_TASK] = _xml(logon="ServiceAccount")
+    monkeypatch.setattr(
+        pc_recovery,
+        "_run",
+        _Schtasks(
+            tasks, list_by_task={pc_recovery.NIGHTLY_TASK: _NEVER_RUN_LIST}
+        ),
+    )
+
+    health = pc_recovery.pc_recovery_health()
+
+    assert health["nightly_refresh_without_logon"] is True
+    assert health["nightly_refresh_ok"] is False
+
+
 def test_a_nightly_refresh_we_cannot_replace_is_not_promised(monkeypatch):
     tasks = {name: _xml() for name in pc_recovery.TASKS}
     tasks[pc_recovery.SYSTEM_WATCHDOG_TASK] = _xml(logon="ServiceAccount")
