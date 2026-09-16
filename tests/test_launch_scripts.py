@@ -100,7 +100,8 @@ class LaunchScriptTests(unittest.TestCase):
         # it an unsafe repository, so the refresh would restart the agent on
         # last night's code without either command being seen to fail.
         script = _read("nightly_restart.bat")
-        self.assertIn("set \"OWNED=-c safe.directory=!REPO!\"", script)
+        # Quoted: a campus path with a space in it must reach git whole.
+        self.assertIn('set OWNED=-c "safe.directory=!REPO!"', script)
         for command in ("fetch origin", "reset --hard origin/main"):
             self.assertIn(f"git !OWNED! {command}", script)
 
@@ -117,7 +118,7 @@ class LaunchScriptTests(unittest.TestCase):
     def test_the_wrapper_owns_the_checkout_it_updates(self):
         # The SYSTEM watchdog starts this wrapper with nobody logged on.
         script = _read("run_forever.bat")
-        self.assertIn("set \"OWNED=-c safe.directory=!REPO!\"", script)
+        self.assertIn('set OWNED=-c "safe.directory=!REPO!"', script)
         self.assertNotIn("\ngit fetch", script)
         for command in (
             "fetch origin",
