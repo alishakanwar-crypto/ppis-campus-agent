@@ -3890,8 +3890,21 @@ def _note_ws_activity() -> None:
     _ws_last_activity = time.monotonic()
     _ws_disconnected_since = 0.0
     _ws_offline_since = 0.0
-    # Leave the proof outside this process: a wedged loop cannot restart
-    # itself, and only the watchdog is left to notice.
+
+
+def _note_cloud_frame() -> None:
+    """The cloud just spoke to us, so it is routing to this process.
+
+    Only a frame the cloud sent proves that: a handshake proves nothing,
+    because an agent the cloud has replaced still completes handshakes all
+    night while the pings go to somebody else. The cloud pings every 15s, so
+    a link it can see is stamped four times a minute, and one it cannot goes
+    stale within the watchdog's 12 minutes.
+
+    The proof is left outside this process because a wedged loop cannot
+    restart itself, and only the watchdog is then left to notice.
+    """
+    _note_ws_activity()
     link_alive.note_link_alive()
 
 
@@ -4135,7 +4148,7 @@ async def websocket_client():
                 }))
 
                 async for message in ws:
-                    _note_ws_activity()
+                    _note_cloud_frame()
                     try:
                         data = json.loads(message)
                         msg_type = data.get("type", "")
