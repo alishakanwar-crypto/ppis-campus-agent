@@ -96,13 +96,24 @@ class OutageClockTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_restart_is_not_slower_than_a_school_lesson(self):
         self.assertLessEqual(main._WS_HARD_RESTART_SECONDS, 600.0)
 
-    def test_a_live_link_leaves_proof_the_watchdog_can_read(self):
+    def test_a_frame_from_the_cloud_leaves_proof_the_watchdog_can_read(self):
         # A process too wedged to exit itself is only recoverable from
         # outside, and the watchdog has nothing else to judge it by.
         with patch.object(main.link_alive, "note_link_alive") as stamp:
-            main._note_ws_activity()
+            main._note_cloud_frame()
 
         stamp.assert_called_once()
+        self.assertGreater(main._ws_last_activity, 0.0)
+
+    def test_a_handshake_alone_is_no_proof_the_cloud_can_see_us(self):
+        # An agent the cloud has replaced still opens sockets all night
+        # while the pings go elsewhere; stamping on connect would keep that
+        # dead run looking alive to the watchdog for ever.
+        with patch.object(main.link_alive, "note_link_alive") as stamp:
+            main._note_ws_activity()
+            main._note_ws_rebuilt()
+
+        stamp.assert_not_called()
 
 
 if __name__ == "__main__":
