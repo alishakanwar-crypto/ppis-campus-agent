@@ -45,6 +45,25 @@ if "%AGENT_ONLY%"=="0" (
     if !ERRORLEVEL! NEQ 0 set NEED_GATE_COUNTER=1
 )
 
+REM A running campus agent can still be unseen by the cloud (a half-open
+REM socket, a link no rebuild cures, an event loop stuck inside native face
+REM work). Parents get nothing in that state, yet the process check above is
+REM satisfied — that is how the campus sat unseen from 03:00 to 07:13 with
+REM every task reporting success. The agent stamps .locks\cloud_link.alive
+REM whenever the link really carries traffic, so a stamp older than 12
+REM minutes means no cloud link: kill the agent and let it be started again.
+REM A freshly started agent is judged from its own start time, so it is given
+REM the same 12 minutes to connect before anybody touches it.
+if "%NEED_AGENT%"=="0" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$f='%~dp0.locks\cloud_link.alive'; $seen=$null; if (Test-Path $f) { $seen=(Get-Item $f).LastWriteTime }; $p=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('python.exe','py.exe','pythonw.exe') -and $_.CommandLine -match 'main\.py' }); if ($p.Count -eq 0) { exit 0 }; $started=@($p | ForEach-Object { $_.CreationDate } | Where-Object { $_ } | Sort-Object -Descending)[0]; if ($started -and (-not $seen -or $started -gt $seen)) { $seen=$started }; if (-not $seen) { exit 0 }; if ($seen -lt (Get-Date).AddMinutes(-12)) { exit 1 }; exit 0" >nul 2>&1
+    if !ERRORLEVEL! EQU 1 (
+        echo [%DATE% %TIME%] WATCHDOG: No cloud link for 12 min; the agent is unseen, killing it... >> "%LOGFILE%"
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -in @('python.exe','py.exe','pythonw.exe') -and $_.CommandLine -match 'main\.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+        timeout /t 3 /nobreak >nul
+        set NEED_AGENT=1
+    )
+)
+
 REM A running poller can still be wedged (hung Chrome startup, dead login).
 REM trueface_poller.py marks the log every 5 minutes, so a log with no new
 REM line for 15 minutes means wedged: kill it and let the restart below run.

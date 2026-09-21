@@ -95,6 +95,7 @@ from fastapi.staticfiles import StaticFiles
 import agent_auth
 
 import last_run
+import link_alive
 import native_crash
 import pc_recovery
 
@@ -3889,6 +3890,9 @@ def _note_ws_activity() -> None:
     _ws_last_activity = time.monotonic()
     _ws_disconnected_since = 0.0
     _ws_offline_since = 0.0
+    # Leave the proof outside this process: a wedged loop cannot restart
+    # itself, and only the watchdog is left to notice.
+    link_alive.note_link_alive()
 
 
 def _note_ws_rebuilt() -> None:

@@ -96,6 +96,14 @@ class OutageClockTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_restart_is_not_slower_than_a_school_lesson(self):
         self.assertLessEqual(main._WS_HARD_RESTART_SECONDS, 600.0)
 
+    def test_a_live_link_leaves_proof_the_watchdog_can_read(self):
+        # A process too wedged to exit itself is only recoverable from
+        # outside, and the watchdog has nothing else to judge it by.
+        with patch.object(main.link_alive, "note_link_alive") as stamp:
+            main._note_ws_activity()
+
+        stamp.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
