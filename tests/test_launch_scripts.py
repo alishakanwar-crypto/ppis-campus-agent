@@ -141,8 +141,31 @@ class LaunchScriptTests(unittest.TestCase):
     def test_watchdog_detects_launcher_hosted_processes(self):
         script = _read("watchdog.bat")
         self.assertEqual(
-            script.count("$_.Name -in @('python.exe','py.exe','pythonw.exe')"), 3
+            script.count("$_.Name -in @('python.exe','py.exe','pythonw.exe')"), 5
         )
+
+    def test_watchdog_kills_an_agent_the_cloud_cannot_see(self):
+        # A process that is alive but unseen by the cloud serves nobody, and
+        # the process check alone calls it healthy: that is a whole morning
+        # of "show my child" failing while every task reports success.
+        script = _read("watchdog.bat")
+        self.assertIn(".locks\\cloud_link.alive", script)
+        self.assertIn("AddMinutes(-12)", script)
+        unseen = script.index("the agent is unseen")
+        restart = script.index('if "%NEED_AGENT%"=="1" (')
+        self.assertLess(unseen, restart)
+        # The check runs with nobody logged on too, where it matters most.
+        block = script.split('if "%NEED_AGENT%"=="0" (', 1)[1]
+        self.assertNotIn('"%AGENT_ONLY%"', block.split("\n)", 1)[0])
+        self.assertIn("set NEED_AGENT=1", block)
+
+    def test_watchdog_gives_a_fresh_agent_time_before_judging_its_link(self):
+        # Without the process start time, a stamp left by an agent that died
+        # hours ago would have the new one killed every five minutes.
+        script = _read("watchdog.bat")
+        block = script.split('if "%NEED_AGENT%"=="0" (', 1)[1].split("\n)", 1)[0]
+        self.assertIn("$_.CreationDate", block)
+        self.assertIn("$started -gt $seen", block)
 
 
 if __name__ == "__main__":
