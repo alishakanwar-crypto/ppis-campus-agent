@@ -2301,6 +2301,20 @@ _RTSP_TEAR_MIN_BAND_FRACTION = max(
 _RTSP_TEAR_MIN_SIDE_DETAIL = max(
     0.0, float(os.environ.get("RTSP_TEAR_MIN_SIDE_DETAIL", "0.5"))
 )
+# Missing picture data can also arrive as nothing at all rather than a smear:
+# zeroed luma and colour decode to one flat green (0, 135, 0), which carries
+# no side-to-side detail and so looked like a black bar to the smear rule
+# above. A band that tall with two channels dark and one lit is not a room,
+# so it is judged on that signature instead of on its detail.
+_FILL_MIN_BAND_FRACTION = max(
+    0.02, float(os.environ.get("FILL_MIN_BAND_FRACTION", "0.08"))
+)
+_FILL_MAX_DARK_CHANNEL = max(
+    0.0, float(os.environ.get("FILL_MAX_DARK_CHANNEL", "25"))
+)
+_FILL_MIN_LIT_CHANNEL = max(
+    1.0, float(os.environ.get("FILL_MIN_LIT_CHANNEL", "90"))
+)
 
 
 def _frame_carries_detail(frame) -> bool:
@@ -2321,6 +2335,13 @@ def _frame_is_torn(frame) -> bool:
     the lower part of the frame that barely differ from the row above them
     while still carrying detail across, which is what tells a smear apart
     from a black bar or a blank wall.
+
+    Data that never arrives at all is flat instead of smeared: brightness
+    reads as nothing while colour reads as something, which decodes to a
+    bright green with its other two channels at zero. No room lights a
+    camera that way, so a tall band of it counts as torn as well, whatever
+    detail it carries. A tinted or dim room keeps all three channels lit and
+    a black bar lights none, so neither is taken from a parent.
     """
     try:
         height = int(frame.shape[0])
@@ -2347,10 +2368,39 @@ def _frame_is_torn(frame) -> bool:
                 ).mean()
                 if float(sideways) >= _RTSP_TEAR_MIN_SIDE_DETAIL:
                     return True
+                if run >= max(8, int(height * _FILL_MIN_BAND_FRACTION)):
+                    channels = band.reshape(-1, band.shape[-1]).mean(axis=0)
+                    if (
+                        float(channels.min()) <= _FILL_MAX_DARK_CHANNEL
+                        and float(channels.max()) >= _FILL_MIN_LIT_CHANNEL
+                    ):
+                        return True
             run = 0
         return False
     except Exception:
         return False
+
+
+def _jpeg_is_torn(data: bytes) -> bool:
+    """True when a whole-looking JPEG's lower part carries no picture.
+
+    A recorder can answer with a picture that opens, decodes and ends on its
+    end marker while its lower rows hold no data at all, and the parent then
+    receives a classroom with a flat green block under it. The bytes are
+    judged here the same way a video frame is, at a quarter size so a 3 MP
+    photo costs milliseconds rather than a parent's patience.
+    """
+    if Image is None or not data:
+        return False
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.draft("RGB", (max(1, img.width // 4), max(1, img.height // 4)))
+            frame = numpy.asarray(img.convert("RGB"))
+    except Exception:
+        # Unreadable bytes are somebody else's refusal to make; a picture must
+        # never be dropped over a check that could not run.
+        return False
+    return _frame_is_torn(frame)
 
 
 def _read_detailed_frame(cap, ip: str, channel: int):
@@ -2948,6 +2998,14 @@ async def _capture_snapshot_once(
                     "%s ch%d: %s served only part of a picture (%d bytes), "
                     "trying the next door",
                     ip, channel, urls[variant], len(response.content),
+                )
+                continue
+            if _jpeg_is_torn(response.content):
+                # Whole bytes, and still no classroom under the top strip.
+                logger.warning(
+                    "%s ch%d: %s served a picture with no data in its lower "
+                    "part, trying the next door",
+                    ip, channel, urls[variant],
                 )
                 continue
             pixels = _jpeg_pixels(response.content)
@@ -4593,7 +4651,7 @@ async def _handle_snapshot_request(ws, classroom: str, request_id: str):
                 max_bytes=_LIVE_SNAPSHOT_MAX_BYTES,
                 quality_start=_LIVE_SNAPSHOT_JPEG_QUALITY,
             )
-            if not _jpeg_is_complete(compressed):
+            if not _jpeg_is_complete(compressed) or _jpeg_is_torn(compressed):
                 logger.warning(
                     "Refusing to send a half-decoded photo of %s (%s, %d "
                     "bytes)", classroom, filename, len(compressed),
