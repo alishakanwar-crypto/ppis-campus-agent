@@ -1,6 +1,8 @@
+import io
 import unittest
 
 import numpy
+from PIL import Image
 
 import main
 
@@ -43,6 +45,23 @@ def torn_and_letterboxed(height=HEIGHT, width=WIDTH):
     smear = int(height * 0.55)
     frame[smear:int(height * 0.7)] = frame[smear - 1]
     return frame
+
+
+def green_filled(fill_fraction=0.6, height=HEIGHT, width=WIDTH):
+    """A reception on top, and the green of data that never arrived below.
+
+    Zeroed luma and colour decode to (0, 135, 0), which is what a parent was
+    sent when she asked for the reception on the night of 21-09-2026.
+    """
+    frame = room(height, width)
+    frame[height - int(height * fill_fraction):] = (0, 135, 0)
+    return frame
+
+
+def as_jpeg(frame, quality=85):
+    buffer = io.BytesIO()
+    Image.fromarray(frame).save(buffer, "JPEG", quality=quality)
+    return buffer.getvalue()
 
 
 class TornStreamFrameTests(unittest.TestCase):
@@ -94,6 +113,40 @@ class TornStreamFrameTests(unittest.TestCase):
         self.assertIsNone(
             main._read_detailed_frame(cap, "192.168.0.12", 17)
         )
+
+
+class GreenFilledPhotoTests(unittest.TestCase):
+    """A photo can also arrive whole with nothing in its lower part."""
+
+    def test_a_green_filled_frame_is_recognised(self):
+        self.assertTrue(main._frame_is_torn(green_filled()))
+
+    def test_a_green_filled_jpeg_is_refused(self):
+        """These bytes open, decode and end properly, and are still no photo."""
+        data = as_jpeg(green_filled())
+
+        self.assertTrue(main._jpeg_is_complete(data))
+        self.assertTrue(main._jpeg_is_torn(data))
+
+    def test_a_whole_photo_is_still_sent(self):
+        self.assertFalse(main._jpeg_is_torn(as_jpeg(room())))
+
+    def test_a_black_barred_photo_is_still_sent(self):
+        """Padding is flat too, and rejecting it would cost real photos."""
+        self.assertFalse(main._jpeg_is_torn(as_jpeg(letterboxed())))
+
+    def test_a_dark_night_photo_is_still_sent(self):
+        generator = numpy.random.default_rng(3)
+        night = generator.integers(
+            18, 52, size=(HEIGHT, WIDTH, 3), dtype=numpy.uint8
+        )
+
+        self.assertFalse(main._jpeg_is_torn(as_jpeg(night)))
+
+    def test_unreadable_bytes_are_left_alone(self):
+        """A check that cannot run must never be the reason a photo is lost."""
+        self.assertFalse(main._jpeg_is_torn(b"not a picture"))
+        self.assertFalse(main._jpeg_is_torn(b""))
 
 
 if __name__ == "__main__":
