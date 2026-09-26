@@ -189,6 +189,12 @@ ENTRY_VALIDATION_CAMERAS = {
 # Set to True for testing, False for production
 FORCE_RENOTIFY_TEST = False
 
+# Student attendance from classroom cameras is switched off. Teacher and staff
+# attendance comes from the TrueFace device and is unaffected; classroom
+# cameras keep serving parent snapshots.
+STUDENT_CAMERA_ATTENDANCE = os.environ.get(
+    "STUDENT_CAMERA_ATTENDANCE", "0") == "1"
+
 # ---------------------------------------------------------------------------
 # STUDENT CATEGORY DEFINITIONS
 # ---------------------------------------------------------------------------
@@ -1753,6 +1759,9 @@ class AttendanceEngine:
         if is_teacher:
             return None
 
+        if not STUDENT_CAMERA_ATTENDANCE:
+            return None
+
         # --- CHECK 1: Confidence range check ---
         effective_threshold = (self.teacher_confidence_threshold
                                if is_teacher else self.confidence_threshold)
@@ -1968,13 +1977,20 @@ class AttendanceEngine:
         goes directly to the teacher's own WhatsApp number with a
         face snapshot image header.
         """
+        is_teacher = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
+        if not is_teacher and not STUDENT_CAMERA_ATTENDANCE:
+            self.add_debug_log(
+                "student_attendance_off",
+                f"Student attendance notification withheld for {name}",
+                person_id=person_id)
+            return
+
         api_url = self.whatsapp_api_url or "https://ppis-whatsapp-bot.fly.dev"
         agent_secret = agent_auth.agent_secret()
         headers = {"Content-Type": "application/json"}
         if agent_secret:
             headers["X-Agent-Secret"] = agent_secret
 
-        is_teacher = person_id.startswith(("TEACHER_", "PRINCIPAL_"))
         display_name = name.title() if name == name.upper() else name
         if is_teacher:
             notif_name = display_name  # Template has "Dear {{1}}, you have been"
@@ -2863,15 +2879,13 @@ class AttendanceEngine:
 
     async def classwise_monitoring_loop(self, dvrs: list[dict],
                                          camera_mapping: dict):
-        """Multi-camera classroom-wise attendance monitoring.
+        """Multi-camera monitoring loop.
 
-        Round-robin scans ALL classroom cameras. For each camera:
-        1. Extract grade from camera name
-        2. Load only faces of students in that grade
-        3. Run face recognition
-        4. Mark attendance (daily dedup - one entry per student per day)
-
-        Entry gate cameras check ALL registered faces.
+        Student recognition from classroom cameras runs only when
+        STUDENT_CAMERA_ATTENDANCE is set; otherwise the student phase is
+        skipped entirely and no student attendance is marked or notified.
+        Teacher recognition, meal snapshots and camera health reporting are
+        unaffected, as is parent snapshot serving.
         """
         try:
             self.classwise_running = True
@@ -2907,7 +2921,8 @@ class AttendanceEngine:
             teacher_phase_cams = teacher_priority_cams + teacher_principal_cams
             # Phase 2 student cameras: Classroom cameras ONLY (no gate/reception)
             student_phase_cams_gate = []  # No gate cameras for students
-            student_phase_cams_classroom = all_classroom_cams
+            student_phase_cams_classroom = (
+                all_classroom_cams if STUDENT_CAMERA_ATTENDANCE else [])
 
             active_cam_count = len(set(
                 (c["dvr_index"], c["channel"]) for c in
@@ -2936,7 +2951,9 @@ class AttendanceEngine:
                 f"Mode: {mode} | "
                 f"Teacher DVR recognition (no attendance marking): "
                 f"{len(teacher_phase_cams)} cams | "
-                f"Student classroom cams: {len(student_phase_cams_classroom)} | "
+                f"Student classroom cams: "
+                f"{len(student_phase_cams_classroom)}"
+                f"{'' if STUDENT_CAMERA_ATTENDANCE else ' (OFF)'} | "
                 f"Other (skipped): {len(all_other_cams)} | "
                 f"{len(self.known_faces)} total faces loaded, "
                 f"{len(self._grade_face_cache)} grades with faces | "
@@ -3057,6 +3074,9 @@ class AttendanceEngine:
                     # Test mode: both phases always active
                     in_teacher_phase = True
                     in_student_phase = True
+
+                if not STUDENT_CAMERA_ATTENDANCE:
+                    in_student_phase = False
 
                 if not in_teacher_phase and not in_student_phase:
                     # Check if a meal window is active — run meal snapshot
