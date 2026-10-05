@@ -1,4 +1,5 @@
 import importlib
+import os
 import shutil
 import sys
 import tempfile
@@ -96,9 +97,45 @@ class DiskSpaceTests(unittest.TestCase):
         folder = disk_space._HERE / "cpplus_recordings"
         folder.mkdir()
         (folder / "cpplus_a__b.mp4").write_bytes(b"v" * (3 * 1024 * 1024))
-        health = disk_space.disk_health()
+        previous = disk_space.GATE_RECORDING_DIR
+        disk_space.GATE_RECORDING_DIR = str(folder)
+        try:
+            health = disk_space.disk_health()
+        finally:
+            disk_space.GATE_RECORDING_DIR = previous
         self.assertGreaterEqual(health["recordings_mb"], 3.0)
         self.assertEqual(health["snapshots_mb"], 0.0)
+
+    def test_a_relative_override_is_read_from_the_working_directory(self):
+        # gate_counter resolves a relative override against the working
+        # directory, so the drive report has to look in the same place.
+        working = Path(self._folder.name) / "working"
+        (working / "video").mkdir(parents=True)
+        (working / "video" / "cpplus_a__b.mp4").write_bytes(
+            b"v" * (4 * 1024 * 1024)
+        )
+        previous_cwd = Path.cwd()
+        previous_env = os.environ.get("CPPLUS_LOCAL_RECORDING_DIR")
+        os.environ["CPPLUS_LOCAL_RECORDING_DIR"] = "video"
+        os.chdir(working)
+        try:
+            importlib.reload(disk_space)
+            disk_space._HERE = Path(self._folder.name) / "agent"
+            disk_space._HERE.mkdir()
+            self.assertEqual(
+                Path(disk_space.GATE_RECORDING_DIR).resolve(),
+                (working / "video").resolve(),
+            )
+            self.assertGreaterEqual(
+                disk_space.disk_health()["recordings_mb"], 4.0
+            )
+        finally:
+            os.chdir(previous_cwd)
+            if previous_env is None:
+                os.environ.pop("CPPLUS_LOCAL_RECORDING_DIR", None)
+            else:
+                os.environ["CPPLUS_LOCAL_RECORDING_DIR"] = previous_env
+            importlib.reload(disk_space)
 
     def test_a_relocated_recording_folder_is_still_measured(self):
         elsewhere = Path(self._folder.name) / "elsewhere"
