@@ -33,6 +33,12 @@ KEEP_LOG_BYTES = 5 * 1024 * 1024
 # Below this the agent is in danger of dying the way exit code 112 dies.
 LOW_FREE_MB = 2 * 1024
 
+# Where gate counting keeps its copy of the CP Plus video, read the same way
+# gate_counter reads it so an overridden location is still measured.
+GATE_RECORDING_DIR = os.environ.get(
+    "CPPLUS_LOCAL_RECORDING_DIR", "cpplus_recordings",
+)
+
 
 def _free_and_total_mb() -> tuple[float | None, float | None]:
     try:
@@ -56,19 +62,42 @@ def trim_oversized_logs() -> list[str]:
             continue
         if size <= KEEP_LOG_BYTES * 2:
             continue
+        kept_from = size - KEEP_LOG_BYTES
         try:
             with path.open("rb") as handle:
-                handle.seek(size - KEEP_LOG_BYTES)
+                handle.seek(kept_from)
                 tail = handle.read()
             # Written in place: another process may be holding the file open,
             # and on Windows a rename would fail where a write succeeds.
             with path.open("r+b") as handle:
+                # The owning process keeps appending while this runs, so take
+                # whatever arrived since the tail was read before overwriting.
+                handle.seek(kept_from + len(tail))
+                tail += handle.read()
+                handle.seek(0)
                 handle.write(tail)
                 handle.truncate(len(tail))
             trimmed.append(f"{name} ({round(size / (1024 * 1024))} MB)")
         except OSError:
             continue
     return trimmed
+
+
+def _folder_mb(*folders: str | Path) -> float:
+    total = 0.0
+    for folder in folders:
+        base = Path(folder)
+        if not base.is_absolute():
+            base = _HERE / base
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            try:
+                if path.is_file():
+                    total += path.stat().st_size / (1024 * 1024)
+            except OSError:
+                continue
+    return total
 
 
 def disk_health() -> dict:
@@ -80,17 +109,10 @@ def disk_health() -> dict:
             logs_mb += path.stat().st_size / (1024 * 1024)
         except OSError:
             continue
-    snapshots_mb = 0.0
-    for folder in ("snapshots", "attendance_snapshots", "face_images"):
-        base = _HERE / folder
-        if not base.is_dir():
-            continue
-        for path in base.rglob("*"):
-            try:
-                if path.is_file():
-                    snapshots_mb += path.stat().st_size / (1024 * 1024)
-            except OSError:
-                continue
+    snapshots_mb = _folder_mb("snapshots", "attendance_snapshots", "face_images")
+    # Gate counting keeps its own copy of the CP Plus video it replays, which
+    # is the largest thing the agent writes when it is enabled.
+    recordings_mb = _folder_mb(GATE_RECORDING_DIR)
     return {
         "drive": str(_HERE.drive or os.sep),
         "free_mb": free_mb,
@@ -98,4 +120,5 @@ def disk_health() -> dict:
         "low": bool(free_mb is not None and free_mb < LOW_FREE_MB),
         "logs_mb": round(logs_mb, 1),
         "snapshots_mb": round(snapshots_mb, 1),
+        "recordings_mb": round(recordings_mb, 1),
     }

@@ -73,6 +73,45 @@ class DiskSpaceTests(unittest.TestCase):
         health = disk_space.disk_health()
         self.assertGreaterEqual(health["logs_mb"], 3.0)
 
+    def test_lines_written_during_a_trim_survive(self):
+        path = disk_space._HERE / "wrapper_campus.log"
+        path.write_bytes(b"o" * (disk_space.KEEP_LOG_BYTES * 2 + 16))
+        real_open = Path.open
+
+        def appending_open(self, mode="r", *args, **kwargs):
+            handle = real_open(self, mode, *args, **kwargs)
+            if mode == "r+b" and self == path:
+                with real_open(self, "ab") as other:
+                    other.write(b"exit code 112")
+            return handle
+
+        Path.open = appending_open
+        try:
+            disk_space.trim_oversized_logs()
+        finally:
+            Path.open = real_open
+        self.assertTrue(path.read_bytes().endswith(b"exit code 112"))
+
+    def test_gate_recordings_count_towards_the_drive(self):
+        folder = disk_space._HERE / "cpplus_recordings"
+        folder.mkdir()
+        (folder / "cpplus_a__b.mp4").write_bytes(b"v" * (3 * 1024 * 1024))
+        health = disk_space.disk_health()
+        self.assertGreaterEqual(health["recordings_mb"], 3.0)
+        self.assertEqual(health["snapshots_mb"], 0.0)
+
+    def test_a_relocated_recording_folder_is_still_measured(self):
+        elsewhere = Path(self._folder.name) / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "cpplus_a__b.mp4").write_bytes(b"v" * (2 * 1024 * 1024))
+        previous = disk_space.GATE_RECORDING_DIR
+        disk_space.GATE_RECORDING_DIR = str(elsewhere)
+        try:
+            health = disk_space.disk_health()
+        finally:
+            disk_space.GATE_RECORDING_DIR = previous
+        self.assertGreaterEqual(health["recordings_mb"], 2.0)
+
     def test_the_module_imports_without_a_campus_pc(self):
         importlib.reload(disk_space)
 
