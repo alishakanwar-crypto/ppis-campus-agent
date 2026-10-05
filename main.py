@@ -93,7 +93,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import agent_auth
-
+import disk_space
 import last_run
 import link_alive
 import native_crash
@@ -1193,6 +1193,36 @@ async def _work_clears(within: float) -> bool:
             return True
         await asyncio.sleep(1.0)
     return not _work_in_flight()
+
+
+# A filling drive is a slow fault; measuring it every few hours is enough,
+# and the first pass happens at startup.
+_DISK_WATCH_SECONDS = float(os.environ.get("DISK_WATCH_SECONDS", "21600"))
+
+
+async def _disk_watch_loop() -> None:
+    """Trim the logs nothing rotates, and say when the drive is running out.
+
+    A full drive kills this process with exit code 112 and no traceback, so
+    the space is measured here rather than discovered by a parent getting
+    nothing.
+    """
+    while True:
+        try:
+            trimmed = await asyncio.to_thread(disk_space.trim_oversized_logs)
+            if trimmed:
+                logger.info("Trimmed oversized logs: %s", ", ".join(trimmed))
+            health = await asyncio.to_thread(disk_space.disk_health)
+            if health.get("low"):
+                logger.error(
+                    "Only %s MB free on %s; the agent dies with exit code 112 "
+                    "when the drive fills (own logs %s MB, snapshots %s MB)",
+                    health.get("free_mb"), health.get("drive"),
+                    health.get("logs_mb"), health.get("snapshots_mb"),
+                )
+        except Exception as e:
+            logger.error(f"Disk watch failed (non-fatal): {e}")
+        await asyncio.sleep(_DISK_WATCH_SECONDS)
 
 
 async def _auto_update_loop() -> None:
@@ -3612,8 +3642,23 @@ async def test_dvr_connection(dvr: dict) -> dict:
                 return {"status": "error", "ip": ip, "error": f"HTTP {resp.status_code}"}
     except httpx.ConnectError:
         return {"status": "unreachable", "ip": ip, "error": "Cannot connect — DVR may be offline or IP is wrong"}
+    except httpx.TimeoutException:
+        return {
+            "status": "unreachable",
+            "ip": ip,
+            "error": (
+                "No answer at all within 10s — the recorder is powered off, "
+                "unplugged from the network, or its switch port is dead"
+            ),
+        }
     except Exception as e:
-        return {"status": "error", "ip": ip, "error": str(e)}
+        # httpx raises several exceptions whose str() is empty, and an empty
+        # reason reported to the cloud says nothing about what to check.
+        return {
+            "status": "error",
+            "ip": ip,
+            "error": str(e) or type(e).__name__,
+        }
 
 
 # Channel names read from each DVR, so a classroom whose second camera was
@@ -4203,6 +4248,7 @@ async def websocket_client():
                     "native_crash_streak": _NATIVE_CRASH_STREAK,
                     "ws_link": ws_link_health(),
                     "pc_recovery": pc_recovery_health(),
+                    "disk": disk_space.disk_health(),
                 }))
 
                 async for message in ws:
@@ -4230,6 +4276,7 @@ async def websocket_client():
                                 "auto_update": auto_update_state(),
                                 "ws_link": ws_link_health(),
                                 "pc_recovery": pc_recovery_health(),
+                                "disk": disk_space.disk_health(),
                             }))
 
                         elif msg_type == "test_connection":
@@ -5175,6 +5222,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_unlock_watch_loop())
     # Pick up merged fixes without anyone running a restart script.
     asyncio.create_task(_auto_update_loop())
+    # Keep the drive from filling, which kills this process without a word.
+    asyncio.create_task(_disk_watch_loop())
     # Measure delay caused by the agent's own work, so a slow morning is
     # attributed honestly instead of being blamed on the cameras.
     asyncio.create_task(watch_event_loop_lag())
