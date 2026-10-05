@@ -33,10 +33,15 @@ KEEP_LOG_BYTES = 5 * 1024 * 1024
 # Below this the agent is in danger of dying the way exit code 112 dies.
 LOW_FREE_MB = 2 * 1024
 
-# Where gate counting keeps its copy of the CP Plus video, read the same way
-# gate_counter reads it so an overridden location is still measured.
-GATE_RECORDING_DIR = os.environ.get(
-    "CPPLUS_LOCAL_RECORDING_DIR", "cpplus_recordings",
+# Where gate counting keeps its copy of the CP Plus video. Resolved exactly as
+# gate_counter resolves it -- a relative override against the working
+# directory, not against this file -- so the folder measured is the folder
+# written to even when the two processes were started from different places.
+_GATE_RECORDING_OVERRIDE = os.environ.get("CPPLUS_LOCAL_RECORDING_DIR")
+GATE_RECORDING_DIR = str(
+    Path(_GATE_RECORDING_OVERRIDE).resolve()
+    if _GATE_RECORDING_OVERRIDE
+    else _HERE / "cpplus_recordings"
 )
 
 
