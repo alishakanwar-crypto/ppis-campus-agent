@@ -1012,7 +1012,9 @@ def run_cpplus_worker(cam: dict):
                 continue
             attire_color = extract_dominant_color(frame, bbox)
             if person_direction == "IN":
-                person_crop = crop_person_hires_cpplus(cam, frame, bbox)
+                person_crop = crop_person_hires_cpplus(
+                    cam, frame, bbox, detector=detector
+                )
             else:
                 person_crop = crop_person_jpeg(frame, bbox)
             timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -2744,8 +2746,24 @@ def crop_person_jpeg(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> str:
     return base64.b64encode(buf).decode("ascii")
 
 
+def _crop_has_person(detector, crop: np.ndarray) -> bool:
+    """True if the PersonDetector still finds a person inside the crop."""
+    try:
+        return bool(
+            detector.detect(
+                crop, confidence_threshold=CPPLUS_CONFIDENCE_THRESHOLD
+            )
+        )
+    except Exception as e:  # noqa: BLE001 - never lose a crop to a check
+        logger.debug("CP Plus crop person check failed (%s); keeping crop", e)
+        return True
+
+
 def crop_person_hires_cpplus(
-    cam: dict, lo_frame: np.ndarray, bbox: tuple[int, int, int, int]
+    cam: dict,
+    lo_frame: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    detector=None,
 ) -> str:
     """Return a base64 JPEG person crop suitable for a face snapshot.
 
@@ -2755,6 +2773,12 @@ def crop_person_hires_cpplus(
     CP Plus HTTP snapshot.cgi returns the main-stream resolution), scale the
     sub-stream bbox up to it, and crop with head-room padding. Falls back to
     the low-res crop if the snapshot can't be captured.
+
+    The full-resolution snapshot is a fresh capture taken after the crossing,
+    so the person can already have walked out of the box — the crop would then
+    show nothing but ground. When a detector is given, the crop is kept only if
+    a person is still in it; otherwise the low-res crop from the frame the
+    crossing was detected in is used.
     """
     try:
         hi = capture_cpplus_frame(cam)
@@ -2779,6 +2803,12 @@ def crop_person_hires_cpplus(
         Y2 = min(hh, Y2 + pad_bot)
         crop = hi[Y1:Y2, X1:X2]
         if crop.size == 0:
+            return crop_person_jpeg(lo_frame, bbox)
+        if detector is not None and not _crop_has_person(detector, crop):
+            logger.info(
+                "CP Plus hi-res crop no longer holds a person; using the "
+                "detection frame crop"
+            )
             return crop_person_jpeg(lo_frame, bbox)
         _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return base64.b64encode(buf).decode("ascii")
