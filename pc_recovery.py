@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -40,7 +41,23 @@ NIGHTLY_TASK = "PPIS Nightly Restart"
 # The one task that runs with nobody logged on, and so the only one that can
 # keep parents' photos alive through a night-time reboot or crash.
 SYSTEM_WATCHDOG_TASK = "PPIS Campus Agent Watchdog (System)"
-TASKS = (BOOT_TASK, WATCHDOG_TASK, SYSTEM_WATCHDOG_TASK, NIGHTLY_TASK)
+# The task that owns the campus agent itself when nobody is logged on. An
+# agent started as a child of the watchdog belongs to the job object Task
+# Scheduler closes when that watchdog run ends, so it died seconds after
+# every unattended restart; here the task instance is the agent, and Task
+# Scheduler keeps it running.
+SYSTEM_AGENT_TASK = "PPIS Campus Agent (System)"
+TASKS = (
+    BOOT_TASK,
+    WATCHDOG_TASK,
+    SYSTEM_WATCHDOG_TASK,
+    SYSTEM_AGENT_TASK,
+    NIGHTLY_TASK,
+)
+
+# Where watchdog.bat writes the outcome of each unattended start.
+UNATTENDED_STARTS_FILE = Path(__file__).parent / ".locks" / "unattended_starts.log"
+_UNATTENDED_STARTS_REPORTED = 5
 
 # A task query on a busy PC is slow but never long: the agent is starting and
 # parents are waiting, so a query that hangs is abandoned rather than waited on.
@@ -166,6 +183,68 @@ def _install_system_watchdog() -> bool:
     return bool(after.get("exists")) and not after.get("needs_logon")
 
 
+def install_system_agent_task() -> bool:
+    """Register the campus agent's own SYSTEM task, so a restart holds.
+
+    It is registered from XML rather than the command line for one setting
+    the command line cannot express: schtasks defaults every task to a
+    72-hour execution limit, and an agent that is meant to run for months
+    would be hard-terminated by Task Scheduler at the end of it.
+    """
+    runner = Path(__file__).parent / "run_forever.bat"
+    if not runner.exists():
+        return False
+    xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT60S</Delay>
+    </BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c "{runner}"</Arguments>
+      <WorkingDirectory>{runner.parent}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+    try:
+        xml_path = Path(tempfile.gettempdir()) / "ppis_system_agent_task.xml"
+        xml_path.write_text(xml, encoding="utf-16")
+    except OSError as exc:
+        logger.debug("PC RECOVERY: could not write the agent task XML: %s", exc)
+        return False
+    _run([
+        "schtasks", "/create",
+        "/tn", SYSTEM_AGENT_TASK,
+        "/xml", str(xml_path),
+        "/f",
+    ])
+    after = _task_state(SYSTEM_AGENT_TASK)
+    return bool(after.get("exists")) and not after.get("needs_logon")
+
+
 def _install_system_nightly() -> bool:
     """Register the 03:00 IST nightly refresh as SYSTEM, so it runs with
     nobody logged on.
@@ -195,6 +274,7 @@ def _install_system_nightly() -> bool:
 # start TrueFace and the gate counter, which need a real desktop.
 _LOGON_FREE_INSTALLERS = {
     SYSTEM_WATCHDOG_TASK: _install_system_watchdog,
+    SYSTEM_AGENT_TASK: install_system_agent_task,
     NIGHTLY_TASK: _install_system_nightly,
 }
 
@@ -297,6 +377,23 @@ def repair_tasks() -> dict:
     return report
 
 
+def unattended_starts() -> list[str]:
+    """What came of the last few restarts nobody was there to see.
+
+    A watchdog that reports success every five minutes while parents get
+    nothing is worse than no watchdog, so each unattended start records
+    whether the agent was still running shortly afterwards.
+    """
+    try:
+        lines = UNATTENDED_STARTS_FILE.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return []
+    kept = [line.strip() for line in lines if line.strip()]
+    return kept[-_UNATTENDED_STARTS_REPORTED:]
+
+
 def pc_recovery_health() -> dict:
     """What the cloud needs to say whether this PC can recover on its own."""
     try:
@@ -317,6 +414,12 @@ def pc_recovery_health() -> dict:
         and not system_watchdog.get("needs_logon")
     )
     proven = _ran_well(system_watchdog)
+    system_agent = tasks.get(SYSTEM_AGENT_TASK, {})
+    agent_task_unattended = bool(
+        system_agent.get("exists")
+        and system_agent.get("enabled")
+        and not system_agent.get("needs_logon")
+    )
     nightly = tasks.get(NIGHTLY_TASK, {})
     nightly_unattended = bool(
         nightly.get("exists")
@@ -354,6 +457,10 @@ def pc_recovery_health() -> dict:
         "nightly_refresh_ok": nightly_unattended and _finished_well(nightly),
         "nightly_refresh_last_run": str(nightly.get("last_run", "")),
         "nightly_refresh_last_result": str(nightly.get("last_result", "")),
+        # A restart the watchdog triggers must outlive the watchdog run that
+        # triggered it, which is what this task is for.
+        "agent_task_survives_watchdog": agent_task_unattended,
+        "unattended_starts": unattended_starts(),
     }
     if not unattended:
         logger.warning(

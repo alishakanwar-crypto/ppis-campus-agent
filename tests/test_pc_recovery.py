@@ -74,6 +74,7 @@ def test_a_logon_bound_watchdog_is_registered_again_as_system(monkeypatch):
 
     assert fake.created == [
         pc_recovery.SYSTEM_WATCHDOG_TASK,
+        pc_recovery.SYSTEM_AGENT_TASK,
         pc_recovery.NIGHTLY_TASK,
     ]
     assert health["recovers_without_logon"] is True
@@ -110,7 +111,10 @@ def test_a_missing_system_watchdog_is_installed_by_the_agent(monkeypatch):
 
     health = pc_recovery.pc_recovery_health()
 
-    assert fake.created == [pc_recovery.SYSTEM_WATCHDOG_TASK]
+    assert fake.created == [
+        pc_recovery.SYSTEM_WATCHDOG_TASK,
+        pc_recovery.SYSTEM_AGENT_TASK,
+    ]
     assert health["tasks_missing"] == []
     assert health["tasks"][pc_recovery.SYSTEM_WATCHDOG_TASK]["repaired"] is True
     assert health["recovers_without_logon"] is True
@@ -128,7 +132,10 @@ def test_a_watchdog_we_cannot_install_is_named(monkeypatch):
 
     health = pc_recovery.pc_recovery_health()
 
-    assert health["tasks_missing"] == [pc_recovery.SYSTEM_WATCHDOG_TASK]
+    assert sorted(health["tasks_missing"]) == sorted([
+        pc_recovery.SYSTEM_WATCHDOG_TASK,
+        pc_recovery.SYSTEM_AGENT_TASK,
+    ])
     assert health["recovers_without_logon"] is False
 
 
@@ -156,7 +163,10 @@ def test_a_logon_bound_nightly_refresh_is_registered_again_as_system(
 
     health = pc_recovery.pc_recovery_health()
 
-    assert fake.created == [pc_recovery.NIGHTLY_TASK]
+    assert fake.created == [
+        pc_recovery.SYSTEM_AGENT_TASK,
+        pc_recovery.NIGHTLY_TASK,
+    ]
     assert health["nightly_refresh_without_logon"] is True
     assert pc_recovery.NIGHTLY_TASK not in health["tasks_need_logon"]
     assert health["tasks"][pc_recovery.NIGHTLY_TASK]["repaired"] is True
@@ -455,3 +465,59 @@ def test_an_unreadable_boot_time_is_left_blank(monkeypatch):
     monkeypatch.setattr(pc_recovery.psutil, "boot_time", explode)
 
     assert pc_recovery.boot_at_ist() == ""
+
+
+def test_the_agent_gets_a_task_of_its_own_so_a_restart_holds(monkeypatch):
+    # Started as a child of the watchdog, the agent died with the watchdog run
+    # that started it, so every unattended restart reported success and left
+    # parents with nothing until somebody restarted by hand.
+    present = {
+        pc_recovery.BOOT_TASK: _xml(),
+        pc_recovery.WATCHDOG_TASK: _xml(),
+        pc_recovery.SYSTEM_WATCHDOG_TASK: _xml(logon="ServiceAccount"),
+        pc_recovery.NIGHTLY_TASK: _xml(logon="ServiceAccount"),
+    }
+    fake = _Schtasks(present)
+    monkeypatch.setattr(pc_recovery, "_run", fake)
+
+    health = pc_recovery.pc_recovery_health()
+
+    assert fake.created == [pc_recovery.SYSTEM_AGENT_TASK]
+    assert health["agent_task_survives_watchdog"] is True
+
+
+def test_an_agent_task_bound_to_a_logon_is_not_promised(monkeypatch):
+    tasks = {name: _xml(logon="ServiceAccount") for name in pc_recovery.TASKS}
+    tasks[pc_recovery.SYSTEM_AGENT_TASK] = _xml()
+    monkeypatch.setattr(
+        pc_recovery, "_run", _Schtasks(tasks, can_create=False)
+    )
+
+    health = pc_recovery.pc_recovery_health()
+
+    assert health["agent_task_survives_watchdog"] is False
+
+
+def test_the_last_unattended_starts_are_reported(monkeypatch, tmp_path):
+    starts = tmp_path / "unattended_starts.log"
+    starts.write_text(
+        "\n".join(
+            f"2026-10-0{n} 03:05:0{n}|started by own task|running 20s later"
+            for n in range(1, 8)
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pc_recovery, "UNATTENDED_STARTS_FILE", starts)
+
+    reported = pc_recovery.unattended_starts()
+
+    assert len(reported) == pc_recovery._UNATTENDED_STARTS_REPORTED
+    assert reported[-1].endswith("running 20s later")
+
+
+def test_no_record_of_unattended_starts_is_not_an_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        pc_recovery, "UNATTENDED_STARTS_FILE", tmp_path / "never_written.log"
+    )
+
+    assert pc_recovery.unattended_starts() == []

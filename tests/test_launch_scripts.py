@@ -141,8 +141,41 @@ class LaunchScriptTests(unittest.TestCase):
     def test_watchdog_detects_launcher_hosted_processes(self):
         script = _read("watchdog.bat")
         self.assertEqual(
-            script.count("$_.Name -in @('python.exe','py.exe','pythonw.exe')"), 5
+            script.count("$_.Name -in @('python.exe','py.exe','pythonw.exe')"), 6
         )
+
+    def test_watchdog_starts_the_agent_through_its_own_task(self):
+        # Started as a child of the watchdog run, the agent was killed with
+        # that run's job object seconds later, so every unattended restart
+        # reported success and parents still got nothing until somebody ran
+        # restart_all by hand.
+        script = _read("watchdog.bat")
+        self.assertIn('schtasks /run /tn "PPIS Campus Agent (System)"', script)
+        start = script.split(":start_agent", 2)[2]
+        start = start.split("\n:agent_is_running", 1)[0]
+        self.assertLess(
+            start.index("schtasks /run"), start.index("run_hidden.vbs")
+        )
+        # The outcome is written down, so a watchdog that keeps reporting
+        # success while the agent dies can be seen from the cloud.
+        self.assertIn("call :note_start", start)
+        self.assertIn("unattended_starts.log", script)
+
+    def test_watchdog_falls_back_when_the_agent_task_is_missing(self):
+        script = _read("watchdog.bat")
+        start = script.split(":start_agent", 2)[2].split(
+            "\n:agent_is_running", 1
+        )[0]
+        self.assertIn('if "!START_ROUTE!"=="own task"', start)
+        self.assertEqual(start.count("run_hidden.vbs"), 2)
+
+    def test_the_agent_task_runs_without_a_time_limit(self):
+        # schtasks defaults to a 72-hour limit, which would hard-terminate an
+        # agent meant to run for months.
+        recovery = _read("pc_recovery.py")
+        self.assertIn("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>", recovery)
+        self.assertIn("<UserId>S-1-5-18</UserId>", recovery)
+        self.assertIn("<BootTrigger>", recovery)
 
     def test_watchdog_kills_an_agent_the_cloud_cannot_see(self):
         # A process that is alive but unseen by the cloud serves nobody, and
