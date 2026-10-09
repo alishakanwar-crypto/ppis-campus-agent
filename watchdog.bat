@@ -89,8 +89,7 @@ if "%NEED_AGENT%"=="1" (
     if !ERRORLEVEL! EQU 1 (
         echo [%DATE% %TIME%] WATCHDOG: Recent campus-agent wrapper is still starting; skipping this cycle. >> "%LOGFILE%"
     ) else (
-        start "" /B wscript.exe "%~dp0run_hidden.vbs"
-        echo [%DATE% %TIME%] WATCHDOG: Campus agent restart triggered >> "%LOGFILE%"
+        call :start_agent
     )
 )
 
@@ -128,6 +127,63 @@ if exist "%LOGFILE%" (
     )
 )
 
+exit /b 0
+
+:start_agent
+REM Start the campus agent so that it outlives this watchdog run.
+REM
+REM Started as a child of this script, the agent belongs to the job object
+REM Task Scheduler creates for the watchdog task, and that job is closed when
+REM the watchdog run finishes - which killed the agent seconds after every
+REM unattended restart. That is why a crash between the 03:00 refresh and the
+REM morning left parents with nothing until somebody ran restart_all by hand,
+REM while the SYSTEM watchdog reported success every five minutes.
+REM
+REM "PPIS Campus Agent (System)" is a task of its own whose instance IS the
+REM wrapper, so Task Scheduler keeps it alive after this run ends. The old
+REM route stays as the fallback for a PC where that task cannot be created,
+REM and the outcome is written down either way so an unattended start that
+REM does not hold can be seen from the cloud instead of guessed at.
+set "START_ROUTE="
+schtasks /run /tn "PPIS Campus Agent (System)" >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    set "START_ROUTE=own task"
+    echo [%DATE% %TIME%] WATCHDOG: Campus agent start requested through its own task >> "%LOGFILE%"
+) else (
+    start "" /B wscript.exe "%~dp0run_hidden.vbs"
+    set "START_ROUTE=this watchdog"
+    echo [%DATE% %TIME%] WATCHDOG: Campus agent restart triggered >> "%LOGFILE%"
+)
+REM ping, not timeout: timeout needs a console and fails with nobody logged on.
+ping -n 21 127.0.0.1 >nul 2>&1
+call :agent_is_running
+if !ERRORLEVEL! EQU 0 (
+    call :note_start "!START_ROUTE!" "running"
+    exit /b 0
+)
+if "!START_ROUTE!"=="own task" (
+    echo [%DATE% %TIME%] WATCHDOG: Own-task start did not hold; starting the agent from here instead >> "%LOGFILE%"
+    start "" /B wscript.exe "%~dp0run_hidden.vbs"
+    ping -n 21 127.0.0.1 >nul 2>&1
+    call :agent_is_running
+    if !ERRORLEVEL! EQU 0 (
+        call :note_start "this watchdog after its own task failed" "running"
+        exit /b 0
+    )
+)
+call :note_start "!START_ROUTE!" "not running"
+echo [%DATE% %TIME%] WATCHDOG: Campus agent was not running 20s after the start >> "%LOGFILE%"
+exit /b 0
+
+:agent_is_running
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$p = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('python.exe','py.exe','pythonw.exe') }; if ($p | Where-Object { $_.CommandLine -match 'main\.py' }) { exit 0 } else { exit 1 }" >nul 2>&1
+exit /b !ERRORLEVEL!
+
+:note_start
+REM One line per unattended start, read back by pc_recovery.py and carried to
+REM the cloud. No path and no account name, because it is reported publicly.
+set "STARTS=%~dp0.locks\unattended_starts.log"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$f='%STARTS%'; $line=('{0}|started by {1}|{2} 20s later' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), '%~1', '%~2'); Add-Content -Path $f -Value $line; $keep=@(Get-Content $f -ErrorAction SilentlyContinue); if ($keep.Count -gt 20) { Set-Content -Path $f -Value $keep[-20..-1] }" >nul 2>&1
 exit /b 0
 
 :recover_stale_wrapper

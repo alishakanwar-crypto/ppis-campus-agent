@@ -26,12 +26,12 @@ set TASK_OK=0
 set WATCHDOG_OK=0
 
 REM Kill any existing agent processes
-echo [1/6] Stopping any running agent instances...
+echo [1/8] Stopping any running agent instances...
 taskkill /F /IM python.exe /FI "WINDOWTITLE eq PPIS*" >nul 2>&1
 
 REM ── Task 1: Main startup task via XML ──────────────────────────
 
-echo [2/6] Creating startup task...
+echo [2/8] Creating startup task...
 schtasks /delete /tn "PPIS Campus Agent" /f >nul 2>&1
 
 REM Generate XML task definition (most reliable method)
@@ -100,7 +100,7 @@ del "%XMLFILE%" >nul 2>&1
 
 REM ── Task 2: Watchdog (every 5 minutes) via XML ────────────────
 
-echo [3/6] Creating watchdog task (every 5 minutes)...
+echo [3/8] Creating watchdog task (every 5 minutes)...
 schtasks /delete /tn "PPIS Campus Agent Watchdog" /f >nul 2>&1
 
 set XMLFILE2=%TEMP%\ppis_watchdog_task.xml
@@ -168,7 +168,7 @@ REM This copy runs as SYSTEM, needs no logon, and starts only the campus
 REM agent, because TrueFace needs a Chrome window and the gate counter needs
 REM native CP Plus, neither of which works outside a logged-on desktop.
 
-echo [4/7] Creating logon-free watchdog for parent photos...
+echo [4/8] Creating logon-free watchdog for parent photos...
 schtasks /delete /tn "PPIS Campus Agent Watchdog (System)" /f >nul 2>&1
 schtasks /create /tn "PPIS Campus Agent Watchdog (System)" /tr "wscript.exe \"%AGENT_DIR%run_watchdog_agent_only_hidden.vbs\"" /sc minute /mo 5 /ru SYSTEM /rl highest /f >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
@@ -177,9 +177,24 @@ if !ERRORLEVEL! EQU 0 (
     echo       WARNING: Could not create the logon-free watchdog
 )
 
+REM ── Task 4: the campus agent's own SYSTEM task ────────────────
+REM A restart triggered by the watchdog must outlive the watchdog run that
+REM triggered it. Started as its child, the agent belongs to the job object
+REM Task Scheduler closes when that run ends. Registered from Python, which
+REM writes the task definition with no execution time limit - something the
+REM schtasks command line cannot express, and 72 hours is its default.
+
+echo [5/8] Registering the campus agent's own logon-free task...
+py -3.12 -c "import pc_recovery, sys; sys.exit(0 if pc_recovery.install_system_agent_task() else 1)" >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo       Agent task created - survives the watchdog run that starts it
+) else (
+    echo       WARNING: Could not register the agent's own task
+)
+
 REM ── Remove the legacy startup-folder launcher ──────────────────
 
-echo [5/7] Creating nightly refresh task (03:00 IST)...
+echo [6/8] Creating nightly refresh task (03:00 IST)...
 schtasks /delete /tn "PPIS Nightly Restart" /f >nul 2>&1
 REM Runs as SYSTEM so the refresh happens whether or not anyone is logged on.
 schtasks /create /tn "PPIS Nightly Restart" /tr "cmd.exe /c \"%AGENT_DIR%nightly_restart.bat\"" /sc daily /st 03:00 /ru SYSTEM /rl highest /f >nul 2>&1
@@ -199,7 +214,7 @@ echo       Legacy launchers removed
 
 REM ── Verify tasks ───────────────────────────────────────────────
 
-echo [6/7] Verifying installation...
+echo [7/8] Verifying installation...
 echo.
 
 schtasks /query /tn "PPIS Campus Agent" >nul 2>&1
@@ -223,6 +238,13 @@ if !ERRORLEVEL! EQU 0 (
     echo       [!!] Logon-free watchdog: NOT INSTALLED
 )
 
+schtasks /query /tn "PPIS Campus Agent (System)" >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo       [OK] Logon-free agent task: INSTALLED
+) else (
+    echo       [!!] Logon-free agent task: NOT INSTALLED
+)
+
 echo       [OK] Startup folder:  DISABLED (single scheduled launcher)
 
 REM Print the real triggers so a botched task definition is visible here.
@@ -231,7 +253,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "foreach ($t in 'PPIS
 REM ── Start the agent NOW ───────────────────────────────────────
 
 echo.
-echo [7/7] Starting the agents now...
+echo [8/8] Starting the agents now...
 REM The watchdog starts every missing process, not just the campus agent, so
 REM boot/logon brings up TrueFace and the gate counter too.
 start "" wscript.exe "%AGENT_DIR%run_watchdog_hidden.vbs"
@@ -248,6 +270,7 @@ echo   Stop:      taskkill /F /IM python.exe
 echo   Uninstall: schtasks /delete /tn "PPIS Campus Agent" /f
 echo              schtasks /delete /tn "PPIS Campus Agent Watchdog" /f
 echo              schtasks /delete /tn "PPIS Campus Agent Watchdog (System)" /f
+echo              schtasks /delete /tn "PPIS Campus Agent (System)" /f
 echo              del "%STARTUP_DIR%\PPIS Agent.vbs" (already removed)
 echo.
 
