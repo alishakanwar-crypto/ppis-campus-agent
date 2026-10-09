@@ -21,6 +21,10 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+REM An elevated right-click starts this in C:\Windows\System32, where the
+REM Python step below would find none of this folder's modules to import.
+cd /d "%~dp0"
+
 set AGENT_DIR=%~dp0
 set TASK_OK=0
 set WATCHDOG_OK=0

@@ -64,6 +64,15 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertNotIn("run_hidden.vbs", script)
         self.assertEqual(script.count("run_watchdog_hidden.vbs"), 5)
 
+    def test_installer_runs_from_its_own_folder(self):
+        # Elevated, the installer starts in System32, and the agent's own task
+        # is registered by importing pc_recovery from the checkout.
+        script = _read("install_autostart.bat")
+        self.assertIn('cd /d "%~dp0"', script)
+        self.assertLess(
+            script.index('cd /d "%~dp0"'), script.index("import pc_recovery")
+        )
+
     def test_installer_echoes_inside_blocks_cannot_close_the_block(self):
         # An unescaped ')' in `echo ... (XML method)` ended the if-block early,
         # so the fallback ran too and overwrote the XML-defined task.
