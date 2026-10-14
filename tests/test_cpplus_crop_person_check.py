@@ -16,7 +16,9 @@ class FakeDetector:
     def detect(self, frame, confidence_threshold=None):
         self.calls += 1
         if self.found:
-            return [((0, 0, 10, 20), 0.9)]
+            # A person filling most of the crop, as a real visitor does.
+            h, w = frame.shape[:2]
+            return [((0, 0, w, h), 0.9)]
         return []
 
 

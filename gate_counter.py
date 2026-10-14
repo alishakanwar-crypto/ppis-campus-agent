@@ -161,6 +161,11 @@ CPPLUS_CONFIDENCE_THRESHOLD = float(
     os.environ.get("CPPLUS_CONFIDENCE_THRESHOLD", "0.25")
 )
 CPPLUS_LINE_HYSTERESIS = float(os.environ.get("CPPLUS_LINE_HYSTERESIS", "0.04"))
+# Share of a snapshot crop a person detection must fill for the crop to count
+# as showing somebody; a sliver at the edge of bare ground does not.
+CPPLUS_CROP_MIN_PERSON_AREA = float(
+    os.environ.get("CPPLUS_CROP_MIN_PERSON_AREA", "0.15")
+)
 CPPLUS_TRACK_MAX_GAP_SECONDS = float(
     os.environ.get("CPPLUS_TRACK_MAX_GAP_SECONDS", "5")
 )
@@ -2747,16 +2752,27 @@ def crop_person_jpeg(frame: np.ndarray, bbox: tuple[int, int, int, int]) -> str:
 
 
 def _crop_has_person(detector, crop: np.ndarray) -> bool:
-    """True if the PersonDetector still finds a person inside the crop."""
+    """True if the crop still shows a person rather than a patch of ground.
+
+    A person who has walked on leaves a crop of bare ground with, at most, a
+    sliver of somebody at its edge. So the crop counts as holding a person
+    only when a detection fills at least CPPLUS_CROP_MIN_PERSON_AREA of it.
+    """
     try:
-        return bool(
-            detector.detect(
-                crop, confidence_threshold=CPPLUS_CONFIDENCE_THRESHOLD
-            )
+        detections = detector.detect(
+            crop, confidence_threshold=CPPLUS_CONFIDENCE_THRESHOLD
         )
     except Exception as e:  # noqa: BLE001 - never lose a crop to a check
         logger.debug("CP Plus crop person check failed (%s); keeping crop", e)
         return True
+
+    ch, cw = crop.shape[:2]
+    crop_area = max(1, ch * cw)
+    for (x1, y1, x2, y2), _conf in detections:
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+        if area / crop_area >= CPPLUS_CROP_MIN_PERSON_AREA:
+            return True
+    return False
 
 
 def crop_person_hires_cpplus(
