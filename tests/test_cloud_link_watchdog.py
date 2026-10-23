@@ -237,3 +237,19 @@ class FrameConfirmsLinkTests(unittest.IsolatedAsyncioTestCase):
         main._ws_offline_since = main.time.monotonic() - 600
         main._note_ws_activity(clears_outage=False)
         self.assertNotEqual(main._ws_offline_since, 0.0)
+
+
+class StaleWindowPerConnectionTests(unittest.IsolatedAsyncioTestCase):
+    """A fresh connection is judged on its own silence, not the last outage."""
+
+    def tearDown(self):
+        main.ws_connection = None
+        main._ws_disconnected_since = 0.0
+        main._ws_offline_since = 0.0
+
+    def test_a_handshake_starts_the_stale_window_again(self):
+        main._ws_disconnected_since = main.time.monotonic() - 600
+        main._ws_offline_since = main.time.monotonic() - 600
+        main._note_ws_activity(clears_outage=False)
+        self.assertEqual(main._ws_disconnected_since, 0.0)
+        self.assertNotEqual(main._ws_offline_since, 0.0)

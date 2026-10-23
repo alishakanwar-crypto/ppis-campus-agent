@@ -4004,8 +4004,10 @@ def _note_ws_activity(clears_outage: bool = True) -> None:
     """
     global _ws_last_activity, _ws_disconnected_since, _ws_offline_since
     _ws_last_activity = time.monotonic()
+    # Each connection gets its own stale window: a socket that drops again
+    # before its first frame must not be judged on the previous outage.
+    _ws_disconnected_since = 0.0
     if clears_outage:
-        _ws_disconnected_since = 0.0
         _ws_offline_since = 0.0
 
 
