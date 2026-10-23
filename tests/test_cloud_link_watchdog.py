@@ -203,3 +203,37 @@ class UnconfirmedLinkTests(unittest.IsolatedAsyncioTestCase):
 
         recycle.assert_not_awaited()
         self.assertLess(main._link_unconfirmed_for(), 5)
+
+
+class FrameConfirmsLinkTests(unittest.IsolatedAsyncioTestCase):
+    """Only a frame the cloud sent proves parent requests are arriving."""
+
+    class UnreadableSocket:
+        pass
+
+    def setUp(self):
+        main.ws_connection = self.UnreadableSocket()
+        main._ws_disconnected_since = 0.0
+        main._ws_offline_since = 0.0
+        main._ws_last_confirmed = (
+            main.time.monotonic() - main._WS_UNCONFIRMED_SECONDS - 1
+        )
+
+    def tearDown(self):
+        main.ws_connection = None
+        main._ws_last_confirmed = 0.0
+        main._ws_offline_since = 0.0
+
+    async def test_a_cloud_frame_keeps_an_opaque_link(self):
+        main._note_cloud_frame()
+        with patch.object(
+            main, "_cloud_says_we_are_connected", AsyncMock(return_value=None)
+        ), patch.object(main, "_recycle_websocket", AsyncMock()) as recycle:
+            await main._repair_cloud_link_if_needed()
+
+        recycle.assert_not_awaited()
+
+    def test_a_handshake_alone_does_not_end_an_outage(self):
+        main._ws_offline_since = main.time.monotonic() - 600
+        main._note_ws_activity(clears_outage=False)
+        self.assertNotEqual(main._ws_offline_since, 0.0)

@@ -3995,11 +3995,18 @@ def _snapshot_task_done(task: asyncio.Task) -> None:
         )
 
 
-def _note_ws_activity() -> None:
+def _note_ws_activity(clears_outage: bool = True) -> None:
+    """Stamp the link as busy; only a cloud frame ends an outage.
+
+    A rebuilt socket handshakes happily while the cloud routes parent
+    requests to a process it replaced, so clearing the outage on a handshake
+    would keep resetting the clock the hard restart runs on.
+    """
     global _ws_last_activity, _ws_disconnected_since, _ws_offline_since
     _ws_last_activity = time.monotonic()
-    _ws_disconnected_since = 0.0
-    _ws_offline_since = 0.0
+    if clears_outage:
+        _ws_disconnected_since = 0.0
+        _ws_offline_since = 0.0
 
 
 def _note_cloud_frame() -> None:
@@ -4015,6 +4022,7 @@ def _note_cloud_frame() -> None:
     restart itself, and only the watchdog is then left to notice.
     """
     _note_ws_activity()
+    _note_link_confirmed()
     link_alive.note_link_alive()
 
 
@@ -4270,7 +4278,7 @@ async def websocket_client():
             ) as ws:
                 ws_connection = ws
                 ws_backoff = 5  # Reset backoff on successful connect
-                _note_ws_activity()
+                _note_ws_activity(clears_outage=False)
                 logger.info("Connected to cloud bot WebSocket")
 
                 # Send hello
