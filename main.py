@@ -3941,6 +3941,13 @@ _WS_RECYCLE_MIN_GAP_SECONDS = max(
 _WS_HARD_RESTART_SECONDS = max(
     120.0, float(os.environ.get("WS_HARD_RESTART_SECONDS", "300"))
 )
+# A socket this library cannot read, while the cloud cannot be asked either,
+# says nothing about whether parent requests are arriving. After this long
+# with no confirmation from either side the link is rebuilt anyway.
+_WS_UNCONFIRMED_SECONDS = max(
+    120.0, float(os.environ.get("WS_UNCONFIRMED_SECONDS", "300"))
+)
+_ws_last_confirmed = 0.0
 _snapshot_tasks: set[asyncio.Task] = set()
 _live_requests_in_flight = 0
 # One family's classroom must not sit in a queue behind another family's:
@@ -4185,6 +4192,22 @@ def _restart_if_the_link_never_returns() -> None:
     os._exit(0)
 
 
+def _note_link_confirmed() -> None:
+    global _ws_last_confirmed
+    _ws_last_confirmed = time.monotonic()
+
+
+def _link_unconfirmed_for() -> float:
+    """How long since anything confirmed this link is really carrying work."""
+    global _ws_last_confirmed
+    if not _ws_last_confirmed:
+        # Nothing has confirmed the link yet, so start counting from here
+        # rather than from a zero that would never come due.
+        _ws_last_confirmed = time.monotonic()
+        return 0.0
+    return time.monotonic() - _ws_last_confirmed
+
+
 async def _repair_cloud_link_if_needed() -> None:
     """Force a reconnect when the cloud cannot see us any more."""
     global _ws_disconnected_since
@@ -4198,11 +4221,30 @@ async def _repair_cloud_link_if_needed() -> None:
             )
         _restart_if_the_link_never_returns()
         return
-    if await _cloud_says_we_are_connected() is False:
+    cloud_view = await _cloud_says_we_are_connected()
+    if cloud_view is False:
         # Our socket looks fine but the cloud has stopped seeing us, so the
         # connection is half-open and every parent request is being lost.
         _note_ws_offline()
         await _recycle_websocket("cloud reports the agent as offline")
+        _restart_if_the_link_never_returns()
+        return
+    if cloud_view is True:
+        _note_link_confirmed()
+        return
+    # The cloud's view could not be read and this socket cannot be read
+    # either. Holding such a link on faith once cost parents three hours of
+    # silence, so uncertainty that lasts is treated as an outage.
+    live, _basis = _link_liveness(ws_connection)
+    if live is True:
+        _note_link_confirmed()
+        return
+    unconfirmed = _link_unconfirmed_for()
+    if unconfirmed > _WS_UNCONFIRMED_SECONDS:
+        _note_ws_offline()
+        await _recycle_websocket(
+            f"nothing has confirmed the cloud link for {unconfirmed:.0f}s"
+        )
         _restart_if_the_link_never_returns()
 
 

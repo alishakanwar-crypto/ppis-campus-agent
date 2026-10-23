@@ -156,3 +156,50 @@ class CloudLinkWatchdogTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnconfirmedLinkTests(unittest.IsolatedAsyncioTestCase):
+    """A socket nobody can read is not evidence that parents are being served."""
+
+    class UnreadableSocket:
+        pass
+
+    def setUp(self):
+        main.ws_connection = self.UnreadableSocket()
+        main._ws_disconnected_since = 0.0
+        main._ws_last_confirmed = 0.0
+
+    def tearDown(self):
+        main.ws_connection = None
+        main._ws_last_confirmed = 0.0
+
+    async def test_an_unreadable_link_is_given_time_before_it_is_rebuilt(self):
+        with patch.object(
+            main, "_cloud_says_we_are_connected", AsyncMock(return_value=None)
+        ), patch.object(main, "_recycle_websocket", AsyncMock()) as recycle:
+            await main._repair_cloud_link_if_needed()
+
+        recycle.assert_not_awaited()
+
+    async def test_an_unreadable_link_nothing_confirms_is_rebuilt(self):
+        main._ws_last_confirmed = (
+            main.time.monotonic() - main._WS_UNCONFIRMED_SECONDS - 1
+        )
+        with patch.object(
+            main, "_cloud_says_we_are_connected", AsyncMock(return_value=None)
+        ), patch.object(main, "_recycle_websocket", AsyncMock()) as recycle:
+            await main._repair_cloud_link_if_needed()
+
+        recycle.assert_awaited_once()
+
+    async def test_a_cloud_that_sees_us_clears_the_doubt(self):
+        main._ws_last_confirmed = (
+            main.time.monotonic() - main._WS_UNCONFIRMED_SECONDS - 1
+        )
+        with patch.object(
+            main, "_cloud_says_we_are_connected", AsyncMock(return_value=True)
+        ), patch.object(main, "_recycle_websocket", AsyncMock()) as recycle:
+            await main._repair_cloud_link_if_needed()
+
+        recycle.assert_not_awaited()
+        self.assertLess(main._link_unconfirmed_for(), 5)
