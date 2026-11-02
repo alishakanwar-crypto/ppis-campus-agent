@@ -607,6 +607,8 @@ def _extract_events(driver) -> list[dict]:
 
     events = []
     rows = driver.find_elements(By.CSS_SELECTOR, "table tr")
+    _diag["table_found"] = bool(driver.find_elements(By.TAG_NAME, "table"))
+    _diag["rows_seen"] = len(rows)
 
     for row in rows:
         cells = row.find_elements(By.TAG_NAME, "td")
@@ -874,6 +876,28 @@ def _reset_daily():
 
 _last_heartbeat_at = 0.0
 _last_liveness_log_at = 0.0
+
+# A poller whose browser session has died still runs, still writes its liveness
+# line and still heartbeats, so both the watchdog and the cloud called it
+# healthy while it read nothing all morning. These say what the last poll
+# actually saw, and they travel with the heartbeat.
+_diag: dict[str, object] = {
+    "login_ok": None,
+    "records_page_ok": None,
+    "query_ok": None,
+    "table_found": None,
+    "rows_seen": 0,
+    "polls_without_table": 0,
+    "session_recycles": 0,
+    "last_event_ist": "",
+}
+
+# How many consecutive polls may find no records table before the session is
+# treated as dead. An empty table is normal before the first scan of the day;
+# a missing table means the page is no longer the records page.
+BLIND_POLLS_BEFORE_RECYCLE = max(
+    1, int(os.environ.get("TRUEFACE_BLIND_POLLS_BEFORE_RECYCLE", "20"))
+)
 # The watchdog treats a log with no new line for a while as a wedged poller,
 # so the loop leaves a periodic mark even when nobody is scanning.
 LIVENESS_LOG_INTERVAL_SECONDS = max(
@@ -881,7 +905,7 @@ LIVENESS_LOG_INTERVAL_SECONDS = max(
 )
 
 
-def _send_heartbeat() -> None:
+def _send_heartbeat(force: bool = False) -> None:
     """Tell the cloud the poller is alive, even when no faces are scanned."""
     global _last_heartbeat_at, _last_liveness_log_at
 
@@ -895,11 +919,19 @@ def _send_heartbeat() -> None:
 
     if not HEARTBEAT_INTERVAL_SECONDS or not HEARTBEAT_API:
         return
-    if _last_heartbeat_at and now - _last_heartbeat_at < HEARTBEAT_INTERVAL_SECONDS:
+    if (
+        not force
+        and _last_heartbeat_at
+        and now - _last_heartbeat_at < HEARTBEAT_INTERVAL_SECONDS
+    ):
         return
     _last_heartbeat_at = now
     try:
-        httpx.post(HEARTBEAT_API, timeout=CLOUD_POST_TIMEOUT_SECONDS)
+        httpx.post(
+            HEARTBEAT_API,
+            json=dict(_diag),
+            timeout=CLOUD_POST_TIMEOUT_SECONDS,
+        )
     except Exception as e:
         logger.warning("Heartbeat post failed: %s", e)
 
@@ -955,7 +987,9 @@ def run_poller():
                 logger.info(
                     "Headless Chrome ready in %.1fs", time.monotonic() - browser_start
                 )
-                if not _login(driver):
+                login_ok = _login(driver)
+                _diag["login_ok"] = login_ok
+                if not login_ok:
                     logger.error("Login failed — retrying in 30s")
                     try:
                         driver.quit()
@@ -964,7 +998,8 @@ def run_poller():
                     driver = None
                     time.sleep(30)
                     continue
-                _navigate_to_search_records(driver)
+                _diag["records_page_ok"] = _navigate_to_search_records(driver)
+                _diag["polls_without_table"] = 0
                 consecutive_errors = 0
                 poll_count = 0
 
@@ -983,6 +1018,7 @@ def run_poller():
 
             # Click Query to refresh
             query_ok = _click_query(driver)
+            _diag["query_ok"] = query_ok
             if poll_count <= 3:
                 logger.info("Poll #%d: Query click %s", poll_count, "OK" if query_ok else "FAILED")
             if not query_ok:
@@ -994,6 +1030,29 @@ def run_poller():
 
             # Extract events
             events = _extract_events(driver)
+
+            # A records page that no longer has a table is a dead session, not
+            # a quiet morning: rebuild it instead of polling a blank page until
+            # someone notices the attendance never arrived.
+            if _diag["table_found"]:
+                _diag["polls_without_table"] = 0
+            else:
+                _diag["polls_without_table"] = int(_diag["polls_without_table"]) + 1
+                if int(_diag["polls_without_table"]) >= BLIND_POLLS_BEFORE_RECYCLE:
+                    _diag["session_recycles"] = int(_diag["session_recycles"]) + 1
+                    logger.error(
+                        "No records table for %d polls — rebuilding the browser "
+                        "session (recycle #%s)",
+                        _diag["polls_without_table"], _diag["session_recycles"],
+                    )
+                    _diag["polls_without_table"] = 0
+                    _send_heartbeat(force=True)
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    driver = None
+                    continue
 
             # Log first poll and then only periodically
             if poll_count == 1:
@@ -1012,6 +1071,9 @@ def run_poller():
                     detected_at[key] = time.monotonic()
 
             if new_events:
+                _diag["last_event_ist"] = datetime.now(IST).strftime(
+                    "%d-%m-%Y %H:%M:%S IST"
+                )
                 photo_elapsed = _attach_photos(driver, new_events)
                 logger.info("Sending %d new event(s) to cloud...", len(new_events))
                 result = _send_to_cloud(new_events)

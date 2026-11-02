@@ -72,6 +72,36 @@ class TrueFaceHeartbeatTests(unittest.TestCase):
             trueface_poller._send_heartbeat()
             self.assertEqual(info.call_count, 2)
 
+    def test_heartbeat_carries_what_the_last_poll_saw(self):
+        post = Mock(return_value=Mock(status_code=200))
+
+        with (
+            patch.dict(
+                trueface_poller._diag,
+                {"login_ok": True, "table_found": False, "rows_seen": 0},
+            ),
+            patch.object(trueface_poller.httpx, "post", post),
+        ):
+            trueface_poller._send_heartbeat()
+
+        sent = post.call_args.kwargs["json"]
+        self.assertIs(sent["login_ok"], True)
+        self.assertIs(sent["table_found"], False)
+        self.assertEqual(sent["rows_seen"], 0)
+
+    def test_forced_heartbeat_ignores_the_throttle(self):
+        post = Mock(return_value=Mock(status_code=200))
+        clock = [1000.0]
+
+        with (
+            patch.object(trueface_poller.httpx, "post", post),
+            patch.object(trueface_poller.time, "monotonic", lambda: clock[0]),
+        ):
+            trueface_poller._send_heartbeat()
+            trueface_poller._send_heartbeat(force=True)
+
+        self.assertEqual(post.call_count, 2)
+
     def test_liveness_line_is_logged_even_when_heartbeat_is_disabled(self):
         info = Mock()
 
