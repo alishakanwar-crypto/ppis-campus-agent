@@ -1018,35 +1018,39 @@ def run_poller():
 
             # Click Query to refresh
             query_ok = _click_query(driver)
-            _diag["query_ok"] = query_ok
             if poll_count <= 3:
                 logger.info("Poll #%d: Query click %s", poll_count, "OK" if query_ok else "FAILED")
             if not query_ok:
                 logger.warning("Query button not found — refreshing page")
-                _navigate_to_search_records(driver)
+                _diag["records_page_ok"] = _navigate_to_search_records(driver)
                 time.sleep(2)
-                _click_query(driver)
+                query_ok = _click_query(driver)
+            _diag["query_ok"] = query_ok
             time.sleep(SCAN_DELAY)
 
             # Extract events
             events = _extract_events(driver)
 
-            # A records page that no longer has a table is a dead session, not
-            # a quiet morning: rebuild it instead of polling a blank page until
-            # someone notices the attendance never arrived.
-            if _diag["table_found"]:
+            # A session that no longer shows the records page is dead, not a
+            # quiet morning: rebuild it instead of polling blind all morning.
+            # A table alone proves nothing — a logged-out session can land on
+            # another page that also has one — so the Query button must be
+            # there too for the read to count.
+            if _diag["table_found"] and query_ok:
                 _diag["polls_without_table"] = 0
             else:
                 _diag["polls_without_table"] = int(_diag["polls_without_table"]) + 1
                 if int(_diag["polls_without_table"]) >= BLIND_POLLS_BEFORE_RECYCLE:
                     _diag["session_recycles"] = int(_diag["session_recycles"]) + 1
                     logger.error(
-                        "No records table for %d polls — rebuilding the browser "
+                        "No records page for %d polls — rebuilding the browser "
                         "session (recycle #%s)",
                         _diag["polls_without_table"], _diag["session_recycles"],
                     )
-                    _diag["polls_without_table"] = 0
+                    # Report the blind run before clearing it, so the cloud
+                    # alert can say how long the session read nothing.
                     _send_heartbeat(force=True)
+                    _diag["polls_without_table"] = 0
                     try:
                         driver.quit()
                     except Exception:
