@@ -80,3 +80,22 @@ class TrueFaceLoginRetryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TrueFacePageLoadTimeoutTests(unittest.TestCase):
+    def test_page_load_is_allowed_to_take_as_long_as_the_form_wait(self):
+        # Chrome aborts a load that outlives its page-load timeout, so a 30s
+        # cap would kill the load before the 60s form wait ever started.
+        self.assertGreaterEqual(
+            trueface_poller.PAGE_LOAD_TIMEOUT_SECONDS,
+            trueface_poller.LOGIN_FORM_WAIT_SECONDS,
+        )
+
+    def test_driver_applies_the_page_load_timeout_it_configures(self):
+        driver = Mock()
+        with patch("selenium.webdriver.Chrome", Mock(return_value=driver)):
+            self.assertIs(trueface_poller._create_driver(), driver)
+
+        driver.set_page_load_timeout.assert_called_once_with(
+            trueface_poller.PAGE_LOAD_TIMEOUT_SECONDS
+        )

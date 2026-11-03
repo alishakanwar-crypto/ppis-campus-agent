@@ -61,6 +61,10 @@ LOGIN_FORM_ATTEMPTS = max(
     1, int(os.environ.get("TRUEFACE_LOGIN_FORM_ATTEMPTS", "3"))
 )
 
+# A page load that outlives its timeout is aborted, so the login's longer wait
+# only helps if loading the device page is allowed to take that long too.
+PAGE_LOAD_TIMEOUT_SECONDS = max(SELENIUM_TIMEOUT_SECONDS, LOGIN_FORM_WAIT_SECONDS)
+
 # Chrome's profile is kept so the device's JS bundle stays cached between
 # sessions instead of being parsed from scratch on every login.
 CHROME_PROFILE_DIR = os.environ.get(
@@ -195,11 +199,13 @@ def _create_driver():
                 exc.__class__.__name__,
             )
 
-    driver.set_page_load_timeout(SELENIUM_TIMEOUT_SECONDS)
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT_SECONDS)
     driver.set_script_timeout(SELENIUM_TIMEOUT_SECONDS)
     client_config = getattr(driver.command_executor, "_client_config", None)
     if client_config is not None and hasattr(client_config, "timeout"):
-        client_config.timeout = SELENIUM_TIMEOUT_SECONDS
+        # The HTTP call carrying driver.get() stays open for the whole load, so
+        # it has to outlast the page-load timeout rather than cut it short.
+        client_config.timeout = PAGE_LOAD_TIMEOUT_SECONDS + 10
     return driver
 
 
