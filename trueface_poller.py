@@ -50,6 +50,23 @@ CLOUD_API = os.environ.get(
 POLL_INTERVAL = int(os.environ.get("TRUEFACE_POLL_SECONDS", "3"))
 SCAN_DELAY = 1.5  # seconds to wait after clicking Query before reading table
 SELENIUM_TIMEOUT_SECONDS = 30
+
+# The device UI is a single-page app; on the campus PC its bundle has taken
+# over a minute to render the login form, which the old 15s wait read as a
+# dead device and retried forever.
+LOGIN_FORM_WAIT_SECONDS = max(
+    15, int(os.environ.get("TRUEFACE_LOGIN_FORM_WAIT_SECONDS", "60"))
+)
+LOGIN_FORM_ATTEMPTS = max(
+    1, int(os.environ.get("TRUEFACE_LOGIN_FORM_ATTEMPTS", "3"))
+)
+
+# Chrome's profile is kept so the device's JS bundle stays cached between
+# sessions instead of being parsed from scratch on every login.
+CHROME_PROFILE_DIR = os.environ.get(
+    "TRUEFACE_CHROME_PROFILE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_profile_trueface"),
+)
 CLOUD_POST_TIMEOUT_SECONDS = max(
     0.1, float(os.environ.get("TRUEFACE_CLOUD_TIMEOUT_SECONDS", "8"))
 )
@@ -109,22 +126,41 @@ signal.signal(signal.SIGTERM, _handle_signal)
 # Selenium helpers
 # ---------------------------------------------------------------------------
 
+def _current_url(driver) -> str:
+    """The page the driver is on, for logs — never raising over a dead session."""
+    try:
+        return driver.current_url
+    except Exception:
+        return "<unavailable>"
+
+
 def _create_driver():
-    """Create a headless Chrome WebDriver."""
+    """Create a headless Chrome WebDriver.
+
+    The device serves its UI as a single-page app whose bundle takes tens of
+    seconds to parse on the campus PC. A throwaway profile makes every login
+    pay that cost again, so the profile lives on disk between sessions; if
+    Chrome cannot take it (a leaked instance still holds the lock) the session
+    falls back to a fresh one rather than failing outright.
+    """
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
 
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1280,720")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-logging")
-    opts.add_argument("--log-level=3")
-    opts.add_argument("--ignore-certificate-errors")
+    def _options(profile_dir: str | None):
+        opts = Options()
+        opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1280,720")
+        opts.add_argument("--disable-extensions")
+        opts.add_argument("--disable-logging")
+        opts.add_argument("--log-level=3")
+        opts.add_argument("--ignore-certificate-errors")
+        if profile_dir:
+            opts.add_argument(f"--user-data-dir={profile_dir}")
+        return opts
 
     # Try to find chromedriver
     driver_path = None
@@ -137,12 +173,27 @@ def _create_driver():
             driver_path = candidate
             break
 
-    if driver_path:
-        service = Service(executable_path=driver_path)
-        driver = webdriver.Chrome(service=service, options=opts)
-    else:
-        # Let Selenium find it automatically
-        driver = webdriver.Chrome(options=opts)
+    service = Service(executable_path=driver_path) if driver_path else None
+
+    driver = None
+    for profile_dir in (CHROME_PROFILE_DIR, None):
+        try:
+            opts = _options(profile_dir)
+            if service is not None:
+                driver = webdriver.Chrome(
+                    service=Service(executable_path=driver_path), options=opts
+                )
+            else:
+                driver = webdriver.Chrome(options=opts)
+            break
+        except Exception as exc:
+            if profile_dir is None:
+                raise
+            logger.warning(
+                "Chrome refused the cached profile %s (%s) — using a fresh one",
+                profile_dir,
+                exc.__class__.__name__,
+            )
 
     driver.set_page_load_timeout(SELENIUM_TIMEOUT_SECONDS)
     driver.set_script_timeout(SELENIUM_TIMEOUT_SECONDS)
@@ -160,17 +211,36 @@ def _login(driver):
 
     try:
         logger.info("Logging in to %s ...", DEVICE_URL)
-        driver.get(DEVICE_URL)
-        time.sleep(5)  # Allow page to fully render before interacting
 
-        # Wait for username field to be clickable (not just present)
-        user_input = WebDriverWait(driver, 15).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='text'], input[name='username'], input[placeholder*='user' i]"))
-        )
-        # Wait for password field to be clickable
-        pass_input = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='password']"))
-        )
+        # The login form is drawn by the device's JS bundle, which on a cold
+        # cache can take longer than a single wait allows. Reloading the page
+        # costs nothing and recovers a bundle that stalled midway, so give the
+        # form several attempts before calling the login failed.
+        user_input = None
+        pass_input = None
+        last_error: Exception | None = None
+        for attempt in range(1, LOGIN_FORM_ATTEMPTS + 1):
+            try:
+                driver.get(DEVICE_URL)
+                user_input = WebDriverWait(driver, LOGIN_FORM_WAIT_SECONDS).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='text'], input[name='username'], input[placeholder*='user' i]"))
+                )
+                pass_input = WebDriverWait(driver, LOGIN_FORM_WAIT_SECONDS).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='password']"))
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Login form not ready after %ss (attempt %d/%d, %s) — reloading",
+                    LOGIN_FORM_WAIT_SECONDS,
+                    attempt,
+                    LOGIN_FORM_ATTEMPTS,
+                    exc.__class__.__name__,
+                )
+
+        if user_input is None or pass_input is None:
+            raise last_error or RuntimeError("login form never rendered")
 
         user_input.clear()
         user_input.send_keys(DEVICE_USER)
@@ -202,7 +272,12 @@ def _login(driver):
         return True
 
     except Exception as e:
-        logger.error("Login failed: %s", e)
+        logger.error(
+            "Login failed: %s: %s (url=%s)",
+            e.__class__.__name__,
+            str(e).strip() or "<no message>",
+            _current_url(driver),
+        )
         return False
 
 
