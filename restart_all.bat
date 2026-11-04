@@ -193,6 +193,10 @@ exit /b 0
 REM --- Fetch and hard-reset to origin/main, reporting git's own errors ---
 :git_update
 set "GIT_OK=1"
+REM A repository cloned by another administrator account counts as
+REM dubious ownership here and every git command refuses it, which no
+REM fresh clone can repair, so trust this folder before giving up on it.
+git config --global --add safe.directory "%CD%" >nul 2>&1
 git fetch origin main || set "GIT_OK=0"
 if !GIT_OK! EQU 1 git checkout main || set "GIT_OK=0"
 if !GIT_OK! EQU 1 git reset --hard origin/main || set "GIT_OK=0"
@@ -205,6 +209,12 @@ REM .git.broken in case it is ever needed.
 :git_repair
 set "FRESH=%TEMP%\ppis_campus_agent_fresh"
 if exist "!FRESH!" rmdir /s /q "!FRESH!" 2>nul
+REM A leftover directory here would be taken for this run's clone and could
+REM reset the agents to whatever repository it came from.
+if exist "!FRESH!" (
+    echo   Could not clear !FRESH! - repair skipped.
+    exit /b 0
+)
 REM Clone the URL this PC is already authenticated for, if it can still be
 REM read, so a private repository does not start asking for a login.
 set "ORIGIN_URL=https://github.com/alishakanwar-crypto/ppis-campus-agent.git"
@@ -214,15 +224,18 @@ if not exist "!FRESH!\.git" (
     echo   Fresh clone failed - check this PC's internet access or GitHub login.
     exit /b 0
 )
-if exist ".git.broken" rmdir /s /q ".git.broken" 2>nul
-if exist ".git" move /y ".git" ".git.broken" >nul 2>&1
+REM Park the old repository under its own name: a second repair must not
+REM throw away the first backup, which may hold refs kept nowhere else.
+set "BROKEN=.git.broken"
+if exist "!BROKEN!" set "BROKEN=.git.broken.%RANDOM%"
+if exist ".git" move /y ".git" "!BROKEN!" >nul 2>&1
 move /y "!FRESH!\.git" ".git" >nul 2>&1
 rmdir /s /q "!FRESH!" 2>nul
 if exist ".git" (
-    echo   Repository replaced with a fresh clone.
+    echo   Repository replaced with a fresh clone; the old one is !BROKEN!.
 ) else (
     echo   Could not install the fresh clone; restoring the old repository.
-    if exist ".git.broken" move /y ".git.broken" ".git" >nul 2>&1
+    if exist "!BROKEN!" move /y "!BROKEN!" ".git" >nul 2>&1
 )
 exit /b 0
 
