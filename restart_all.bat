@@ -198,7 +198,10 @@ REM dubious ownership here and every git command refuses it, which no
 REM fresh clone can repair, so trust this folder before giving up on it.
 git config --global --add safe.directory "%CD%" >nul 2>&1
 git fetch origin main || set "GIT_OK=0"
-if !GIT_OK! EQU 1 git checkout main || set "GIT_OK=0"
+REM -f -B: after a repair the files are already on disk and untracked, and a
+REM plain checkout refuses to overwrite them. The remote is the source of
+REM truth for code here, so point main at it and take its files.
+if !GIT_OK! EQU 1 git checkout -f -B main origin/main || set "GIT_OK=0"
 if !GIT_OK! EQU 1 git reset --hard origin/main || set "GIT_OK=0"
 exit /b 0
 
@@ -228,14 +231,24 @@ REM Park the old repository under its own name: a second repair must not
 REM throw away the first backup, which may hold refs kept nowhere else.
 set "BROKEN=.git.broken"
 if exist "!BROKEN!" set "BROKEN=.git.broken.%RANDOM%"
-if exist ".git" move /y ".git" "!BROKEN!" >nul 2>&1
-move /y "!FRESH!\.git" ".git" >nul 2>&1
+REM git marks .git hidden, and cmd's move refuses hidden or read-only items
+REM without saying so, which left the dead .git in place while the lines
+REM below reported a successful repair. Move both ends with PowerShell and
+REM clear the attributes first.
+attrib -h -r -s ".git" >nul 2>&1
+if exist ".git" powershell -NoProfile -Command "Move-Item -LiteralPath '.git' -Destination '!BROKEN!' -Force" >nul 2>&1
+attrib -h -r -s "!FRESH!\.git" >nul 2>&1
+powershell -NoProfile -Command "Move-Item -LiteralPath '!FRESH!\.git' -Destination '.git' -Force" >nul 2>&1
 rmdir /s /q "!FRESH!" 2>nul
-if exist ".git" (
+REM Ask git whether it can read the repository now; a .git that merely
+REM exists is what made the old check lie.
+git rev-parse --git-dir >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
     echo   Repository replaced with a fresh clone; the old one is !BROKEN!.
 ) else (
     echo   Could not install the fresh clone; restoring the old repository.
-    if exist "!BROKEN!" move /y "!BROKEN!" ".git" >nul 2>&1
+    if exist ".git" powershell -NoProfile -Command "Remove-Item -LiteralPath '.git' -Recurse -Force" >nul 2>&1
+    if exist "!BROKEN!" powershell -NoProfile -Command "Move-Item -LiteralPath '!BROKEN!' -Destination '.git' -Force" >nul 2>&1
 )
 exit /b 0
 
