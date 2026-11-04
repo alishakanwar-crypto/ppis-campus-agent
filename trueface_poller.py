@@ -262,6 +262,41 @@ def _log_login_page_state(driver, attempt: int) -> None:
         )
 
 
+def _type_into(driver, box, value: str) -> None:
+    """Fill a login box, by keyboard if it takes one and by script if not."""
+    try:
+        box.clear()
+        box.send_keys(value)
+        return
+    except Exception as exc:
+        logger.warning(
+            "Login box refused keystrokes (%s) — setting it from the page",
+            exc.__class__.__name__,
+        )
+    # The device's framework only sees a value it was told about, so raise
+    # the event it listens for rather than assigning the property alone.
+    driver.execute_script(
+        "arguments[0].value = arguments[1];"
+        "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
+        "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+        box,
+        value,
+    )
+
+
+def _click(driver, element) -> None:
+    """Click an element, by script when the browser calls it unclickable."""
+    try:
+        element.click()
+        return
+    except Exception as exc:
+        logger.warning(
+            "Login button refused a click (%s) — clicking it from the page",
+            exc.__class__.__name__,
+        )
+    driver.execute_script("arguments[0].click();", element)
+
+
 def _login(driver):
     """Login to the TrueFace web UI."""
     from selenium.webdriver.common.by import By
@@ -281,12 +316,24 @@ def _login(driver):
         for attempt in range(1, LOGIN_FORM_ATTEMPTS + 1):
             try:
                 driver.get(DEVICE_URL)
-                user_input = WebDriverWait(driver, LOGIN_FORM_WAIT_SECONDS).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='text'], input[name='username'], input[placeholder*='user' i]"))
-                )
+                # The device's own markup decides what the boxes look like —
+                # some firmwares ship no type, a Chinese placeholder, or a
+                # wrapper that keeps them from counting as clickable. Waiting
+                # for the password box and taking the box above it works on
+                # any of them, where a selector list only works on ours.
                 pass_input = WebDriverWait(driver, LOGIN_FORM_WAIT_SECONDS).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='password']"))
+                    EC.presence_of_element_located(
+                        (By.CSS_SELECTOR, "input[type='password']")
+                    )
                 )
+                boxes = [
+                    box
+                    for box in driver.find_elements(By.CSS_SELECTOR, "input")
+                    if (box.get_attribute("type") or "text").lower() != "password"
+                ]
+                if not boxes:
+                    raise RuntimeError("password box but no username box")
+                user_input = boxes[0]
                 break
             except Exception as exc:
                 last_error = exc
@@ -313,25 +360,24 @@ def _login(driver):
         if user_input is None or pass_input is None:
             raise last_error or RuntimeError("login form never rendered")
 
-        user_input.clear()
-        user_input.send_keys(DEVICE_USER)
-        pass_input.clear()
-        pass_input.send_keys(DEVICE_PASS)
+        _type_into(driver, user_input, DEVICE_USER)
+        _type_into(driver, pass_input, DEVICE_PASS)
         time.sleep(1)  # Brief pause after typing credentials
 
-        # Click login button — wait for it to be clickable
+        # Click login button
         login_btns = driver.find_elements(By.CSS_SELECTOR, "button[type='submit'], button.login-btn, .login-btn, button")
         for btn in login_btns:
             text = btn.text.strip().lower()
             if text in ("login", "log in", "sign in", "ok", "submit", "\u767b\u5f55"):
-                WebDriverWait(driver, 5).until(EC.element_to_be_clickable(btn))
-                btn.click()
+                _click(driver, btn)
                 break
         else:
             # Click the first button
             if login_btns:
-                WebDriverWait(driver, 5).until(EC.element_to_be_clickable(login_btns[0]))
-                login_btns[0].click()
+                _click(driver, login_btns[0])
+            else:
+                # No button at all: the form still submits on Enter.
+                pass_input.send_keys("\n")
 
         time.sleep(4)  # Allow login to complete
 
