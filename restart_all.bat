@@ -196,7 +196,10 @@ set "GIT_OK=1"
 REM A repository cloned by another administrator account counts as
 REM dubious ownership here and every git command refuses it, which no
 REM fresh clone can repair, so trust this folder before giving up on it.
-git config --global --add safe.directory "%CD%" >nul 2>&1
+REM Added once, not on every restart, or the global config grows an
+REM identical line each time this runs.
+git config --global --get-all safe.directory 2>nul | findstr /x /c:"%CD%" >nul 2>&1
+if errorlevel 1 git config --global --add safe.directory "%CD%" >nul 2>&1
 git fetch origin main || set "GIT_OK=0"
 REM -f -B: after a repair the files are already on disk and untracked, and a
 REM plain checkout refuses to overwrite them. The remote is the source of
