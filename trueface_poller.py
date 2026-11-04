@@ -219,14 +219,16 @@ def _already_signed_in(driver) -> bool:
         url = _current_url(driver)
         if "login" in url.lower():
             return False
-        return bool(
-            driver.find_elements(
-                "xpath",
-                "//*[contains(text(),'Search Records')"
-                " or contains(text(),'System Log')"
-                " or contains(text(),'User Mgmt')]",
-            )
+        # The device ships English or Chinese menus, so look for both.
+        labels = (
+            "Search Records",
+            "System Log",
+            "User Mgmt",
+            "\u67e5\u8be2\u8bb0\u5f55",
+            "\u7cfb\u7edf\u65e5\u5fd7",
         )
+        query = " or ".join(f"contains(text(),'{label}')" for label in labels)
+        return bool(driver.find_elements("xpath", f"//*[{query}]"))
     except Exception:
         return False
 
@@ -253,7 +255,7 @@ def _log_login_page_state(driver, attempt: int) -> None:
             os.path.dirname(os.path.abspath(__file__)), "trueface_login_page.html"
         )
         with open(dump, "w", encoding="utf-8") as fh:
-            fh.write(html[:8000].replace(DEVICE_PASS, "***"))
+            fh.write(html[:8000].replace(DEVICE_PASS, "***") if DEVICE_PASS else html[:8000])
     except Exception as exc:
         logger.warning(
             "Could not read the login page state: %s", exc.__class__.__name__
@@ -296,16 +298,19 @@ def _login(driver):
                     exc.__class__.__name__,
                 )
                 _log_login_page_state(driver, attempt)
+                # No form can also mean the device kept the session and
+                # dropped straight into the app, which is a logged-in page,
+                # not a failure — so stop reloading rather than spend the
+                # remaining attempts waiting for a form that will never come.
+                if _already_signed_in(driver):
+                    logger.info(
+                        "No login form, but the device is already signed in "
+                        "(url=%s)",
+                        _current_url(driver),
+                    )
+                    return True
 
         if user_input is None or pass_input is None:
-            # No form can also mean the device kept the session and dropped
-            # straight into the app, which is a logged-in page, not a failure.
-            if _already_signed_in(driver):
-                logger.info(
-                    "No login form, but the device is already signed in (url=%s)",
-                    _current_url(driver),
-                )
-                return True
             raise last_error or RuntimeError("login form never rendered")
 
         user_input.clear()
