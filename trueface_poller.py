@@ -55,7 +55,7 @@ SELENIUM_TIMEOUT_SECONDS = 30
 # over a minute to render the login form, which the old 15s wait read as a
 # dead device and retried forever.
 LOGIN_FORM_WAIT_SECONDS = max(
-    15, int(os.environ.get("TRUEFACE_LOGIN_FORM_WAIT_SECONDS", "60"))
+    15, int(os.environ.get("TRUEFACE_LOGIN_FORM_WAIT_SECONDS", "120"))
 )
 LOGIN_FORM_ATTEMPTS = max(
     1, int(os.environ.get("TRUEFACE_LOGIN_FORM_ATTEMPTS", "3"))
@@ -180,7 +180,10 @@ def _create_driver():
     service = Service(executable_path=driver_path) if driver_path else None
 
     driver = None
-    for profile_dir in (CHROME_PROFILE_DIR, None):
+    # The cached profile is tried twice: a crashed Chrome leaves its single-
+    # instance locks behind, and Chrome then refuses the directory forever,
+    # which would silently cost the bundle cache on every login from then on.
+    for profile_dir in (CHROME_PROFILE_DIR, CHROME_PROFILE_DIR, None):
         try:
             opts = _options(profile_dir)
             if service is not None:
@@ -193,6 +196,14 @@ def _create_driver():
         except Exception as exc:
             if profile_dir is None:
                 raise
+            if _clear_profile_locks(profile_dir):
+                logger.warning(
+                    "Chrome refused the cached profile %s (%s) — cleared its "
+                    "stale locks and retrying",
+                    profile_dir,
+                    exc.__class__.__name__,
+                )
+                continue
             logger.warning(
                 "Chrome refused the cached profile %s (%s) — using a fresh one",
                 profile_dir,
@@ -207,6 +218,46 @@ def _create_driver():
         # it has to outlast the page-load timeout rather than cut it short.
         client_config.timeout = PAGE_LOAD_TIMEOUT_SECONDS + 10
     return driver
+
+
+def _clear_profile_locks(profile_dir: str) -> bool:
+    """Delete a crashed Chrome's single-instance locks. True if any went."""
+    removed = False
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        path = os.path.join(profile_dir, name)
+        try:
+            if os.path.lexists(path):
+                os.remove(path)
+                removed = True
+        except OSError:
+            pass
+    return removed
+
+
+def _log_login_page_state(driver, attempt: int) -> None:
+    """Say what the device actually served, so a blank page is not read as slow."""
+    try:
+        html = driver.page_source or ""
+        inputs = driver.find_elements("css selector", "input")
+        logger.warning(
+            "Login page state (attempt %d): url=%s title=%r readyState=%s "
+            "html=%d chars inputs=%d",
+            attempt,
+            _current_url(driver),
+            (driver.title or "")[:60],
+            driver.execute_script("return document.readyState"),
+            len(html),
+            len(inputs),
+        )
+        dump = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "trueface_login_page.html"
+        )
+        with open(dump, "w", encoding="utf-8") as fh:
+            fh.write(html)
+    except Exception as exc:
+        logger.warning(
+            "Could not read the login page state: %s", exc.__class__.__name__
+        )
 
 
 def _login(driver):
@@ -244,6 +295,7 @@ def _login(driver):
                     LOGIN_FORM_ATTEMPTS,
                     exc.__class__.__name__,
                 )
+                _log_login_page_state(driver, attempt)
 
         if user_input is None or pass_input is None:
             raise last_error or RuntimeError("login form never rendered")
