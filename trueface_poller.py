@@ -20,6 +20,7 @@ import argparse
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -64,6 +65,10 @@ LOGIN_FORM_ATTEMPTS = max(
 # A page load that outlives its timeout is aborted, so the login's longer wait
 # only helps if loading the device page is allowed to take that long too.
 PAGE_LOAD_TIMEOUT_SECONDS = max(SELENIUM_TIMEOUT_SECONDS, LOGIN_FORM_WAIT_SECONDS)
+
+# Guessing records-page URLs is cheap and usually wrong, so each guess gets a
+# short budget rather than the login's.
+RECORDS_NAV_TIMEOUT_SECONDS = 20
 
 # Chrome's profile is kept so the device's JS bundle stays cached between
 # sessions instead of being parsed from scratch on every login.
@@ -138,6 +143,39 @@ def _current_url(driver) -> str:
         return "<unavailable>"
 
 
+def _reap_leaked_browsers() -> None:
+    """Kill headless browsers left over from an earlier poller.
+
+    The restart script kills Python, not the Chrome those processes started,
+    and a leaked browser keeps both the cached profile and one of the
+    device's few session slots — which is how a login starts being rejected
+    outright. Only processes started with this poller's own profile
+    directories are touched, so a browser the user has open is left alone.
+    """
+    if os.name != "nt":
+        return
+    profile_name = os.path.basename(CHROME_PROFILE_DIR)
+    try:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' "
+                "or Name='chromedriver.exe'\" | Where-Object { "
+                f"$_.CommandLine -like '*{profile_name}*' }} | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+            ],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not clear leaked browsers (%s)", exc.__class__.__name__
+        )
+
+
 def _create_driver():
     """Create a headless Chrome WebDriver.
 
@@ -150,6 +188,8 @@ def _create_driver():
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
+
+    _reap_leaked_browsers()
 
     def _options(profile_dir: str | None):
         opts = Options()
@@ -381,9 +421,18 @@ def _login(driver):
 
         time.sleep(4)  # Allow login to complete
 
-        # Check if login succeeded by looking for the page content
-        if "login" in driver.current_url.lower() or "error" in driver.page_source.lower()[:500]:
-            logger.warning("Login may have failed — checking page content...")
+        # Still on the login route with the password box drawn means the
+        # device rejected the attempt. Reporting success there sent the poll
+        # loop to hunt for menus that signed-out pages do not have, for ten
+        # minutes a cycle, instead of simply logging in again.
+        if "#/login" in driver.current_url.lower() and driver.find_elements(
+            By.CSS_SELECTOR, "input[type='password']"
+        ):
+            logger.error(
+                "Login rejected — still on the login page (url=%s)",
+                driver.current_url,
+            )
+            return False
 
         logger.info("Login completed — current URL: %s", driver.current_url)
         return True
@@ -444,7 +493,13 @@ def _navigate_to_search_records(driver):
         except Exception:
             continue
 
-    # Fallback: try direct URL hash navigation
+    # Fallback: try direct URL hash navigation.
+    # Each of these gets the login's generous page-load budget otherwise, so
+    # five dead guesses stalled the poller — and its heartbeat — for minutes.
+    try:
+        driver.set_page_load_timeout(RECORDS_NAV_TIMEOUT_SECONDS)
+    except Exception:
+        pass
     for path in [
         "#/SearchRecord", "#/searchRecord", "#/Record",
         "#/SystemLog/SearchRecord", "#/systemLog/searchRecord",
@@ -461,6 +516,10 @@ def _navigate_to_search_records(driver):
         except Exception:
             continue
 
+    try:
+        driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT_SECONDS)
+    except Exception:
+        pass
     logger.warning("Could not navigate to Search Records — will try polling from current page")
     return False
 
