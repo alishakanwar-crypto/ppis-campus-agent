@@ -63,12 +63,27 @@ if !PYCOUNT! GTR 0 (
 echo   All Python processes terminated.
 
 REM --- Step 3: Pull latest code ---
+REM Every git command used to be silenced and the script said "Code updated"
+REM regardless, so a broken repository on the PC left the agents on old code
+REM for days while the window reported success. Now git's own errors show,
+REM a damaged .git is replaced with a fresh clone, and the commit the agents
+REM will actually run is printed.
 echo [Step 3/5] Pulling latest code from GitHub...
-git fetch origin 2>nul
 echo   Using branch: main
-git checkout main 2>nul
-git reset --hard origin/main 2>nul
-echo   Code updated.
+call :git_update
+if !GIT_OK! EQU 0 (
+    echo   Git failed above - repairing the repository with a fresh clone...
+    call :git_repair
+    call :git_update
+)
+if !GIT_OK! EQU 1 (
+    for /f "tokens=*" %%c in ('git log -1 --format^="%%h %%s" 2^>nul') do echo   Code updated: %%c
+) else (
+    echo   ************************************************************
+    echo   CODE NOT UPDATED - the agents below will run the OLD code.
+    echo   Send this window to Devin; the agents still start normally.
+    echo   ************************************************************
+)
 
 REM --- Step 4: Clean up lock file ---
 echo [Step 4/5] Cleaning up...
@@ -173,6 +188,42 @@ echo ========================================================
 echo   Done! You can close this window now.
 echo ========================================================
 pause
+exit /b 0
+
+REM --- Fetch and hard-reset to origin/main, reporting git's own errors ---
+:git_update
+set "GIT_OK=1"
+git fetch origin main || set "GIT_OK=0"
+if !GIT_OK! EQU 1 git checkout main || set "GIT_OK=0"
+if !GIT_OK! EQU 1 git reset --hard origin/main || set "GIT_OK=0"
+exit /b 0
+
+REM --- Replace a damaged .git with a fresh clone's, keeping local files ---
+REM Only .git is swapped, so config.json, the databases, the logs and the
+REM chrome profiles stay exactly where they are; the old .git is kept as
+REM .git.broken in case it is ever needed.
+:git_repair
+set "FRESH=%TEMP%\ppis_campus_agent_fresh"
+if exist "!FRESH!" rmdir /s /q "!FRESH!" 2>nul
+REM Clone the URL this PC is already authenticated for, if it can still be
+REM read, so a private repository does not start asking for a login.
+set "ORIGIN_URL=https://github.com/alishakanwar-crypto/ppis-campus-agent.git"
+for /f "tokens=*" %%u in ('git remote get-url origin 2^>nul') do set "ORIGIN_URL=%%u"
+git clone --no-checkout "!ORIGIN_URL!" "!FRESH!"
+if not exist "!FRESH!\.git" (
+    echo   Fresh clone failed - check this PC's internet access or GitHub login.
+    exit /b 0
+)
+if exist ".git.broken" rmdir /s /q ".git.broken" 2>nul
+if exist ".git" move /y ".git" ".git.broken" >nul 2>&1
+move /y "!FRESH!\.git" ".git" >nul 2>&1
+rmdir /s /q "!FRESH!" 2>nul
+if exist ".git" (
+    echo   Repository replaced with a fresh clone.
+) else (
+    echo   Could not install the fresh clone; restoring the old repository.
+    if exist ".git.broken" move /y ".git.broken" ".git" >nul 2>&1
+)
 exit /b 0
 
 REM --- Count every Python process, including launcher-hosted ones ---
