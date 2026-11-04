@@ -180,10 +180,11 @@ def _create_driver():
     service = Service(executable_path=driver_path) if driver_path else None
 
     driver = None
-    # The cached profile is tried twice: a crashed Chrome leaves its single-
-    # instance locks behind, and Chrome then refuses the directory forever,
-    # which would silently cost the bundle cache on every login from then on.
-    for profile_dir in (CHROME_PROFILE_DIR, CHROME_PROFILE_DIR, None):
+    # A leaked Chrome holds the cached profile for as long as it lives, and
+    # Chrome refuses that directory on every login after it, silently costing
+    # the bundle cache. A second cached directory keeps the cache without
+    # taking the profile away from a browser that is still using it.
+    for profile_dir in (CHROME_PROFILE_DIR, f"{CHROME_PROFILE_DIR}_alt", None):
         try:
             opts = _options(profile_dir)
             if service is not None:
@@ -196,16 +197,8 @@ def _create_driver():
         except Exception as exc:
             if profile_dir is None:
                 raise
-            if _clear_profile_locks(profile_dir):
-                logger.warning(
-                    "Chrome refused the cached profile %s (%s) — cleared its "
-                    "stale locks and retrying",
-                    profile_dir,
-                    exc.__class__.__name__,
-                )
-                continue
             logger.warning(
-                "Chrome refused the cached profile %s (%s) — using a fresh one",
+                "Chrome refused the cached profile %s (%s) — trying the next one",
                 profile_dir,
                 exc.__class__.__name__,
             )
@@ -220,18 +213,22 @@ def _create_driver():
     return driver
 
 
-def _clear_profile_locks(profile_dir: str) -> bool:
-    """Delete a crashed Chrome's single-instance locks. True if any went."""
-    removed = False
-    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-        path = os.path.join(profile_dir, name)
-        try:
-            if os.path.lexists(path):
-                os.remove(path)
-                removed = True
-        except OSError:
-            pass
-    return removed
+def _already_signed_in(driver) -> bool:
+    """True when the device skipped the login page and served the app itself."""
+    try:
+        url = _current_url(driver)
+        if "login" in url.lower():
+            return False
+        return bool(
+            driver.find_elements(
+                "xpath",
+                "//*[contains(text(),'Search Records')"
+                " or contains(text(),'System Log')"
+                " or contains(text(),'User Mgmt')]",
+            )
+        )
+    except Exception:
+        return False
 
 
 def _log_login_page_state(driver, attempt: int) -> None:
@@ -249,11 +246,14 @@ def _log_login_page_state(driver, attempt: int) -> None:
             len(html),
             len(inputs),
         )
+        # Enough of the page to tell an error or an empty shell from a slow
+        # bundle, with the device password masked in case the markup carries
+        # it, since the dump outlives the session on disk.
         dump = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "trueface_login_page.html"
         )
         with open(dump, "w", encoding="utf-8") as fh:
-            fh.write(html)
+            fh.write(html[:8000].replace(DEVICE_PASS, "***"))
     except Exception as exc:
         logger.warning(
             "Could not read the login page state: %s", exc.__class__.__name__
@@ -298,6 +298,14 @@ def _login(driver):
                 _log_login_page_state(driver, attempt)
 
         if user_input is None or pass_input is None:
+            # No form can also mean the device kept the session and dropped
+            # straight into the app, which is a logged-in page, not a failure.
+            if _already_signed_in(driver):
+                logger.info(
+                    "No login form, but the device is already signed in (url=%s)",
+                    _current_url(driver),
+                )
+                return True
             raise last_error or RuntimeError("login form never rendered")
 
         user_input.clear()
