@@ -7,6 +7,7 @@ waiting, and a parent's own request is capped at a few seconds.
 import asyncio
 import io
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -57,6 +58,27 @@ class RememberedDoorTests(unittest.TestCase):
         self.assertEqual(main._live_capture_best_pixels.get(key), 704 * 480)
         self.assertEqual(main._live_capture_video_pixels.get(key), 1280 * 720)
         self.assertTrue(main._video_road_is_sharper(*key))
+
+    def test_a_restored_fallback_door_is_due_for_a_retry(self):
+        """Or every restart serves the sub-stream for a whole TTL again."""
+        main._live_capture_preferences[("192.0.2.60", 7)] = ("digest", 2)
+        main._live_capture_preferences[("192.0.2.60", 8)] = ("digest", 0)
+        with patch.object(main, "_LIVE_CAPTURE_DOORS_FILE", self._file()):
+            main._save_capture_doors()
+            main._live_capture_preferences.clear()
+            main._load_capture_doors()
+        fallback_age = (
+            time.monotonic()
+            - main._live_capture_preference_age[("192.0.2.60", 7)]
+        )
+        main_age = (
+            time.monotonic()
+            - main._live_capture_preference_age[("192.0.2.60", 8)]
+        )
+        self.assertGreaterEqual(
+            fallback_age, main._LIVE_CAPTURE_FALLBACK_TTL_SECONDS
+        )
+        self.assertLess(main_age, main._LIVE_CAPTURE_FALLBACK_TTL_SECONDS)
 
     def test_a_damaged_file_does_not_stop_the_agent(self):
         path = self._file()
