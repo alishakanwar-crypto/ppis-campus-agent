@@ -759,7 +759,14 @@ def _load_capture_doors() -> None:
             # channel at a URL that does not exist.
             continue
         _live_capture_preferences[key] = (scheme, variant)
-        _live_capture_preference_age[key] = time.monotonic()
+        # A fallback door is remembered to save relearning, not to be trusted:
+        # dating it from the restart gave it a fresh full TTL, so a channel
+        # whose sub-stream (704x480) answered once kept serving that soft
+        # picture after every restart. Restored as already expired, the first
+        # capture retries the sharp main door and only falls back if it must.
+        _live_capture_preference_age[key] = time.monotonic() - (
+            0.0 if variant == 0 else _LIVE_CAPTURE_FALLBACK_TTL_SECONDS
+        )
         # The sizes are remembered with the door: without them a restart puts
         # every channel whose door serves 704x480 back on that picture until a
         # background measurement has run again.
