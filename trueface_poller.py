@@ -217,31 +217,49 @@ def _create_driver():
             driver_path = candidate
             break
 
-    service = Service(executable_path=driver_path) if driver_path else None
-
     driver = None
+    last_exc: Exception | None = None
+    # Chrome updates itself on that PC while the bundled chromedriver stays
+    # where it was, and a mismatched pair refuses every session — attendance
+    # then stops with the process still alive. So the bundled driver is only
+    # the first choice: Selenium Manager fetches a driver matching the Chrome
+    # actually installed, which heals the next update without a visit.
+    driver_sources = [driver_path, None] if driver_path else [None]
     # A leaked Chrome holds the cached profile for as long as it lives, and
     # Chrome refuses that directory on every login after it, silently costing
     # the bundle cache. A second cached directory keeps the cache without
     # taking the profile away from a browser that is still using it.
-    for profile_dir in (CHROME_PROFILE_DIR, f"{CHROME_PROFILE_DIR}_alt", None):
-        try:
-            opts = _options(profile_dir)
-            if service is not None:
-                driver = webdriver.Chrome(
-                    service=Service(executable_path=driver_path), options=opts
+    for source in driver_sources:
+        for profile_dir in (CHROME_PROFILE_DIR, f"{CHROME_PROFILE_DIR}_alt", None):
+            try:
+                opts = _options(profile_dir)
+                if source is not None:
+                    driver = webdriver.Chrome(
+                        service=Service(executable_path=source), options=opts
+                    )
+                else:
+                    driver = webdriver.Chrome(options=opts)
+                break
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "Chrome refused profile %s with driver %s (%s: %s)",
+                    profile_dir,
+                    source or "auto-resolved",
+                    exc.__class__.__name__,
+                    str(exc).splitlines()[0][:200] if str(exc) else "",
                 )
-            else:
-                driver = webdriver.Chrome(options=opts)
+        if driver is not None:
             break
-        except Exception as exc:
-            if profile_dir is None:
-                raise
-            logger.warning(
-                "Chrome refused the cached profile %s (%s) — trying the next one",
-                profile_dir,
-                exc.__class__.__name__,
+        if source is not None:
+            logger.error(
+                "Bundled chromedriver %s would not drive the installed Chrome "
+                "— letting Selenium fetch a matching one",
+                source,
             )
+
+    if driver is None:
+        raise last_exc or RuntimeError("Chrome would not start")
 
     driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT_SECONDS)
     driver.set_script_timeout(SELENIUM_TIMEOUT_SECONDS)
@@ -1141,6 +1159,10 @@ _diag: dict[str, object] = {
     "polls_without_table": 0,
     "session_recycles": 0,
     "last_event_ist": "",
+    # Why the browser would not start, when that is what stopped attendance:
+    # without it the cloud only sees unset flags and cannot tell a browser
+    # that never opened from a device with nothing to report.
+    "browser_error": "",
 }
 
 # How many consecutive polls may find no records table before the session is
@@ -1232,9 +1254,15 @@ def run_poller():
                         "Chrome startup failed after %.1fs: %s — retrying in 30s",
                         time.monotonic() - browser_start, e,
                     )
+                    _diag["browser_error"] = (
+                        f"{e.__class__.__name__}: "
+                        f"{(str(e).splitlines() or [''])[0]}"
+                    )
                     driver = None
+                    _send_heartbeat(force=True)
                     time.sleep(30)
                     continue
+                _diag["browser_error"] = ""
                 logger.info(
                     "Headless Chrome ready in %.1fs", time.monotonic() - browser_start
                 )
