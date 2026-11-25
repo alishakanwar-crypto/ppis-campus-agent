@@ -120,6 +120,62 @@ class RememberedDoorTests(unittest.TestCase):
         return Path(tempfile.mkdtemp()) / name
 
 
+class WarmUpAfterStartTests(unittest.TestCase):
+    """A restart must not leave the next parent of each room as the probe."""
+
+    def setUp(self):
+        self._was = main._last_camera_warmup_at
+
+    def tearDown(self):
+        main._last_camera_warmup_at = self._was
+
+    def test_a_warm_up_is_due_when_none_was_ever_run(self):
+        main._last_camera_warmup_at = 0.0
+        self.assertTrue(main._warmup_is_stale())
+
+    def test_a_warm_up_from_last_night_is_still_due_this_morning(self):
+        main._last_camera_warmup_at = (
+            time.time() - main._WARMUP_STALE_SECONDS - 60
+        )
+        self.assertTrue(main._warmup_is_stale())
+
+    def test_a_restart_minutes_after_a_warm_up_does_not_repeat_it(self):
+        main._last_camera_warmup_at = time.time() - 300
+        self.assertFalse(main._warmup_is_stale())
+
+    def test_a_clock_that_moved_backwards_warms_up_rather_than_waiting(self):
+        main._last_camera_warmup_at = time.time() + 86400
+        self.assertTrue(main._warmup_is_stale())
+
+    def test_the_warm_up_time_survives_a_restart(self):
+        path = Path(tempfile.mkdtemp()) / "doors.json"
+        with patch.object(main, "_LIVE_CAPTURE_DOORS_FILE", path):
+            main._last_camera_warmup_at = time.time() - 120
+            main._save_capture_doors()
+            main._last_camera_warmup_at = 0.0
+            main._load_capture_doors()
+        self.assertFalse(main._warmup_is_stale())
+
+    def test_the_loop_warms_up_before_waiting_for_the_night(self):
+        main._last_camera_warmup_at = 0.0
+        warmed = AsyncMock(return_value={})
+
+        async def run():
+            with patch.object(main, "_warm_up_every_camera", warmed), \
+                    patch.object(main, "_WARMUP_START_DELAY_SECONDS", 0):
+                task = asyncio.ensure_future(main._camera_warmup_loop())
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(run())
+        warmed.assert_awaited()
+
+
 class ParentWaitTests(unittest.TestCase):
     def test_a_parent_is_never_asked_to_wait_out_a_dead_camera(self):
         self.assertLessEqual(main._SNAPSHOT_CAMERA_TIMEOUT_SECONDS, 8.0)

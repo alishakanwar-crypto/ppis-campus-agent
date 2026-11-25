@@ -729,6 +729,10 @@ _LIVE_CAPTURE_DOORS_FILE = Path(__file__).parent / "snapshot_doors.json"
 # How many snapshot URLs a channel has; a remembered door outside this range
 # belongs to an older layout and is discarded rather than used.
 _LIVE_CAPTURE_DOOR_COUNT = 4
+# Wall-clock time of the last warm-up, kept beside the doors: a restart in the
+# middle of the school day otherwise leaves the first parent of each classroom
+# paying for the probe, which is how a soft 704x480 photo reaches them.
+_last_camera_warmup_at: float = 0.0
 
 
 def _load_capture_doors() -> None:
@@ -740,6 +744,12 @@ def _load_capture_doors() -> None:
     except Exception as exc:  # noqa: BLE001 - a bad file must not stop the agent
         logger.warning("Could not read remembered snapshot doors: %s", exc)
         return
+    if isinstance(stored, dict):
+        global _last_camera_warmup_at
+        try:
+            _last_camera_warmup_at = float(stored.get("warmed_at") or 0.0)
+        except Exception:  # noqa: BLE001 - a bad number only costs a warm-up
+            _last_camera_warmup_at = 0.0
     doors = stored.get("doors") if isinstance(stored, dict) else None
     if not isinstance(doors, dict):
         if doors is not None:
@@ -797,7 +807,11 @@ def _save_capture_doors() -> None:
                 door[field] = pixels
         doors[f"{ip}|{channel}"] = door
     try:
-        _LIVE_CAPTURE_DOORS_FILE.write_text(json.dumps({"doors": doors}, indent=1))
+        _LIVE_CAPTURE_DOORS_FILE.write_text(
+            json.dumps(
+                {"doors": doors, "warmed_at": _last_camera_warmup_at}, indent=1
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not save remembered snapshot doors: %s", exc)
 
@@ -1927,6 +1941,14 @@ async def _unlock_watch_loop() -> None:
 
 
 _WARMUP_HOUR_IST = max(0, min(23, int(os.environ.get("SNAPSHOT_WARMUP_HOUR", "3"))))
+# How old the last warm-up may be before a start warms the cameras again, and
+# how long to let the agent settle (cloud link, channel discovery) first.
+_WARMUP_STALE_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_WARMUP_STALE_SECONDS", "21600"))
+)
+_WARMUP_START_DELAY_SECONDS = max(
+    0.0, float(os.environ.get("SNAPSHOT_WARMUP_START_DELAY_SECONDS", "30"))
+)
 
 
 async def _warm_up_every_camera() -> dict[str, float]:
@@ -1944,6 +1966,9 @@ async def _warm_up_every_camera() -> dict[str, float]:
         # Measuring relaxes the probe limits; leaking that into a parent's
         # request would put the waiting back that this whole change removes.
         _measuring_cameras.reset(token)
+    global _last_camera_warmup_at
+    _last_camera_warmup_at = time.time()
+    _save_capture_doors()
     served = [seconds for seconds in results.values() if seconds >= 0]
     logger.info(
         "Camera warm-up finished at %s: %d of %d cameras served a picture, "
@@ -1979,8 +2004,28 @@ async def _measure_every_camera(results: dict[str, float]) -> None:
             await asyncio.sleep(0.2)
 
 
+def _warmup_is_stale() -> bool:
+    """Whether the learned doors are too old to answer a parent sharply."""
+    if not _last_camera_warmup_at:
+        return True
+    age = time.time() - _last_camera_warmup_at
+    # A clock that moved backwards must mean "warm up", never "skip for days".
+    return age < 0 or age > _WARMUP_STALE_SECONDS
+
+
 async def _camera_warmup_loop() -> None:
     """Warm every camera up once a night, so the first parent is not the probe."""
+    if _warmup_is_stale():
+        # A restart drops the sub-stream doors it had remembered, so without
+        # this the next request per classroom is the one that relearns the
+        # sharp door, and that parent gets the soft picture.
+        await asyncio.sleep(_WARMUP_START_DELAY_SECONDS)
+        try:
+            await _warm_up_every_camera()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Warm-up after start failed (non-fatal): %s", exc)
     while True:
         now = datetime.now(_IST)
         next_run = now.replace(
